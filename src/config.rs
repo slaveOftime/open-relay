@@ -8,6 +8,18 @@ use crate::error::Result;
 /// Default for [`AppConfig::screen_scrollback_rows`].
 pub const DEFAULT_SCREEN_SCROLLBACK_ROWS: usize = 5000;
 
+/// Default free-space floor (1 GiB) below which `disk_guard_enabled` refuses
+/// new sessions. Chosen from the real-disk capacity baseline
+/// (PERFORMANCE.md): a 10-session state used ~16 MiB, so 1 GiB leaves ~60x
+/// headroom while catching a volume that is genuinely out of room. It is a
+/// refusal threshold, not a quota.
+pub const DEFAULT_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default free-space warning threshold (2 GiB): warn (log + status) before
+/// the guard's refusal floor is reached. Alerts are always on; the guard
+/// itself is opt-in.
+pub const DEFAULT_DISK_WARN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Minimum number of scrolled-off rows a fresh attach seeds into the client
 /// terminal's scrollback, regardless of the client's own screen height.
 /// Without this floor a reattach only restores one screenful of history,
@@ -150,6 +162,21 @@ pub struct LimitsConfig {
     /// sessions older than this cap. 0 = disabled; running sessions
     /// are unaffected by this knob.
     pub journal_retention_days: u32,
+    /// Disk guard for new sessions: refuse to start when the state
+    /// volume's free space is below `disk_min_free_bytes`. Explicit
+    /// opt-in (default off); existing sessions are never killed by it.
+    pub disk_guard_enabled: bool,
+    /// Free-space floor for admitting new sessions, in bytes.
+    pub disk_min_free_bytes: u64,
+    /// Free-space warning threshold (logged and surfaced in status), in
+    /// bytes. Must be >= `disk_min_free_bytes`.
+    pub disk_warn_free_bytes: u64,
+    /// Background sampling cadence for the state volume, in seconds
+    /// (clamped to >= 5).
+    pub disk_sample_interval_seconds: u64,
+    /// Maximum age of a disk sample the guard still trusts, in seconds.
+    /// Unknown or older samples refuse new sessions while the guard is on.
+    pub disk_sample_max_age_seconds: u64,
 }
 
 /// VAPID keys + optional proxy for browser push subscriptions. Hot-reloadable
@@ -184,6 +211,11 @@ impl_config_diff!(LimitsConfig {
     silence_seconds,
     stop_grace_seconds,
     journal_retention_days,
+    disk_guard_enabled,
+    disk_min_free_bytes,
+    disk_warn_free_bytes,
+    disk_sample_interval_seconds,
+    disk_sample_max_age_seconds,
 });
 impl_config_diff!(WebPushConfig {
     subject,
@@ -323,6 +355,16 @@ struct LimitsOverrides {
     /// Wall-clock retention for stopped sessions. 0 = disabled (keep
     /// everything, the pre-cap behaviour).
     journal_retention_days: Option<u32>,
+    /// Disk guard for new sessions; explicit opt-in.
+    disk_guard_enabled: Option<bool>,
+    /// Free-space floor for new sessions, in bytes.
+    disk_min_free_bytes: Option<u64>,
+    /// Free-space warning threshold, in bytes.
+    disk_warn_free_bytes: Option<u64>,
+    /// State-volume sampling cadence, in seconds.
+    disk_sample_interval_seconds: Option<u64>,
+    /// Maximum age of a sample the guard still trusts, in seconds.
+    disk_sample_max_age_seconds: Option<u64>,
 }
 
 impl AppConfig {
@@ -394,6 +436,25 @@ impl AppConfig {
             silence_seconds: overrides.limits.silence_seconds.unwrap_or(10).max(1),
             stop_grace_seconds: overrides.limits.stop_grace_seconds.unwrap_or(5).max(1),
             journal_retention_days: overrides.limits.journal_retention_days.unwrap_or(0),
+            disk_guard_enabled: overrides.limits.disk_guard_enabled.unwrap_or(false),
+            disk_min_free_bytes: overrides
+                .limits
+                .disk_min_free_bytes
+                .unwrap_or(DEFAULT_DISK_MIN_FREE_BYTES),
+            disk_warn_free_bytes: overrides
+                .limits
+                .disk_warn_free_bytes
+                .unwrap_or(DEFAULT_DISK_WARN_FREE_BYTES),
+            disk_sample_interval_seconds: overrides
+                .limits
+                .disk_sample_interval_seconds
+                .unwrap_or(30)
+                .max(5),
+            disk_sample_max_age_seconds: overrides
+                .limits
+                .disk_sample_max_age_seconds
+                .unwrap_or(120)
+                .max(5),
         };
         let web_push = WebPushConfig {
             subject: overrides
@@ -481,6 +542,23 @@ impl AppConfig {
         }
         if self.limits.journal_retention_days > 36_500 {
             return Err("journal_retention_days must be 0..36500".into());
+        }
+        if self.limits.disk_warn_free_bytes < self.limits.disk_min_free_bytes {
+            return Err(
+                "disk_warn_free_bytes must be >= disk_min_free_bytes (warn before refusing)".into(),
+            );
+        }
+        if self.limits.disk_sample_max_age_seconds < self.limits.disk_sample_interval_seconds {
+            return Err(
+                "disk_sample_max_age_seconds must be >= disk_sample_interval_seconds \
+                 (a fresh sample must survive at least one sampling interval)"
+                    .into(),
+            );
+        }
+        if self.limits.disk_sample_interval_seconds > 86_400
+            || self.limits.disk_sample_max_age_seconds > 86_400
+        {
+            return Err("disk sample interval/max age must not exceed 86400 seconds".into());
         }
         for (index, pattern) in self.notify.prompt_patterns.iter().enumerate() {
             regex::Regex::new(pattern)
@@ -754,6 +832,11 @@ mod tests {
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
                 journal_retention_days: 0,
+                disk_guard_enabled: false,
+                disk_min_free_bytes: super::DEFAULT_DISK_MIN_FREE_BYTES,
+                disk_warn_free_bytes: super::DEFAULT_DISK_WARN_FREE_BYTES,
+                disk_sample_interval_seconds: 30,
+                disk_sample_max_age_seconds: 120,
             },
             web_push: super::WebPushConfig {
                 subject: None,

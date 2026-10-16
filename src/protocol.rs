@@ -209,6 +209,12 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
     Health,
+    /// Read-only diagnostic summary of this daemon (also proxyable to a
+    /// secondary via `NodeProxy`): version, liveness vs readiness,
+    /// supervised-component states, disk capacity, failure-record
+    /// locations, and affected sessions. Never carries terminal content,
+    /// input, environment, or secrets.
+    DaemonStatus,
     DaemonStop {
         grace_seconds: u64,
     },
@@ -420,6 +426,7 @@ impl RpcRequest {
     pub fn name(&self) -> &'static str {
         match self {
             RpcRequest::Health => "health",
+            RpcRequest::DaemonStatus => "daemon_status",
             RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
@@ -485,6 +492,13 @@ pub enum RpcResponse {
     Empty,
     Health {
         daemon_pid: u32,
+    },
+    /// Read-only diagnostic summary: liveness vs readiness, supervised
+    /// component states, disk capacity, failure-record locations, and
+    /// affected sessions. Never carries terminal content, input, or
+    /// secrets.
+    DaemonStatus {
+        status: DaemonStatusReport,
     },
     DaemonStop {
         stopped: bool,
@@ -1113,6 +1127,101 @@ pub struct ListQuery {
     pub offset: usize,
     pub sort: ListSortField,
     pub order: SortOrder,
+}
+
+/// One supervised daemon component, as reported by [`DaemonStatusReport`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComponentStatus {
+    pub name: String,
+    /// `starting` | `running` | `restarting` | `failed` | `disabled`.
+    pub state: String,
+    /// Whether a non-running state degrades daemon readiness.
+    pub ready_critical: bool,
+    /// Failed/stopped episodes observed since the daemon started.
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+}
+
+/// Disk capacity and admission-guard view, from the daemon's cached sample.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskStatus {
+    /// Free bytes on the state volume; `None` = unknown (see reason), never 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_unknown_reason: Option<String>,
+    /// When the cached sample was taken; `None` = never sampled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at: Option<DateTime<Utc>>,
+    /// `None` until the first sample exists; never a plausible zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploads_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_bytes: Option<u64>,
+    /// Set when the size scan was capped or partially failed; sizes are a
+    /// lower bound then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_partial_reason: Option<String>,
+    /// `disk_guard_enabled` as currently configured (opt-in).
+    pub guard_enabled: bool,
+    /// `disabled` | `allowed` | `unknown` | `stale` | `below_minimum`.
+    pub guard_decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_refusal_reason: Option<String>,
+    /// Always-on warning threshold; `warning_active` is set when the
+    /// latest sample is below it (independent of the guard).
+    pub warn_below_bytes: u64,
+    #[serde(default)]
+    pub warning_active: bool,
+}
+
+/// A session the diagnostic summary wants to point at, with why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AffectedSession {
+    pub id: String,
+    /// Session status or, for uncommitted starts, `starting`.
+    pub status: String,
+    pub reason: String,
+}
+
+/// Read-only diagnostic summary. Assembled from the live component
+/// registry, the cached disk sample, the daemon's own info, and bounded
+/// session queries. Deliberately excludes terminal content, input,
+/// environment, identity seeds, and credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStatusReport {
+    pub daemon_pid: u32,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Liveness: this report itself proves the daemon answered.
+    pub alive: bool,
+    /// Readiness: every ready-critical supervised component is running.
+    pub ready: bool,
+    #[serde(default)]
+    pub unready_reasons: Vec<String>,
+    #[serde(default)]
+    pub components: Vec<ComponentStatus>,
+    pub disk: DiskStatus,
+    /// Paths where failures are recorded on the owning machine (log dir,
+    /// crash record, raw stderr capture).
+    #[serde(default)]
+    pub failure_records: Vec<String>,
+    /// Suspicious sessions (uncommitted starts, sessions that ended in
+    /// `failed`), newest first, capped.
+    #[serde(default)]
+    pub affected_sessions: Vec<AffectedSession>,
+    /// Total affected sessions before the cap.
+    pub affected_sessions_total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

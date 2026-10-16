@@ -119,37 +119,44 @@ pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent 
 /// On `Lagged`, the encoder publishes a `resync_required` event so
 /// subscribers learn the stream diverged. The relay-side uses the same
 /// `ResyncRequired` to surface relay losses to its peers.
-pub fn run_event_encoder(
-    event_tx: broadcast::Sender<SessionEvent>,
+///
+/// Runs until `event_tx` is closed (daemon shutdown) and returns: callers
+/// supervise this as a daemon component, so a return also means the
+/// event channel vanished while the daemon was still running.
+///
+/// The receiver must be subscribed by the caller **before** this component
+/// is spawned: the broadcast channel drops events published while no receiver
+/// exists, so subscription at wiring time (not at first poll) is part of the
+/// contract. A restart subscribes anew, which is why the factory, not this
+/// function, owns `event_tx`.
+pub async fn run_event_encoder(
+    mut rx: broadcast::Receiver<SessionEvent>,
     event_bytes_tx: broadcast::Sender<EncodedSessionEvent>,
 ) {
-    let mut rx = event_tx.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let delivered = event.for_delivery(None);
-                    let encoded = encode_session_event(&delivered);
-                    // No browsers connected is normal. Keep draining raw events
-                    // so future subscribers still receive live activity.
-                    let _ = event_bytes_tx.send(encoded);
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "session event broadcast lagged; emitting resync");
-                    let payload = EncodedSessionEvent {
-                        event_name: EVT_RESYNC,
-                        data: serde_json::to_string(&serde_json::json!({
-                            "node": Option::<String>::None,
-                            "reason": "sender_lagged",
-                        }))
-                        .unwrap_or_default(),
-                    };
-                    let _ = event_bytes_tx.send(payload);
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let delivered = event.for_delivery(None);
+                let encoded = encode_session_event(&delivered);
+                // No browsers connected is normal. Keep draining raw events
+                // so future subscribers still receive live activity.
+                let _ = event_bytes_tx.send(encoded);
             }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "session event broadcast lagged; emitting resync");
+                let payload = EncodedSessionEvent {
+                    event_name: EVT_RESYNC,
+                    data: serde_json::to_string(&serde_json::json!({
+                        "node": Option::<String>::None,
+                        "reason": "sender_lagged",
+                    }))
+                    .unwrap_or_default(),
+                };
+                let _ = event_bytes_tx.send(payload);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
-    });
+    }
 }
 
 /// A lagged client receives an explicit gap marker, then EOF so it reconnects.
@@ -325,7 +332,10 @@ mod tests {
     async fn encoder_survives_periods_without_sse_clients() {
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let (encoded_tx, _) = tokio::sync::broadcast::channel(16);
-        run_event_encoder(event_tx.clone(), encoded_tx.clone());
+        // Subscribe before spawning, exactly like the daemon wiring does:
+        // events published while no receiver exists are dropped.
+        let rx = event_tx.subscribe();
+        tokio::spawn(run_event_encoder(rx, encoded_tx.clone()));
 
         // Output before the first browser connects must not kill the encoder.
         event_tx

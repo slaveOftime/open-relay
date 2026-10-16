@@ -8,7 +8,7 @@ pub mod sse;
 pub mod ws;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::ws::rejection::WebSocketUpgradeRejection,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
@@ -59,6 +59,10 @@ pub struct AppState {
     /// Persisted Ed25519 node identity. Disabled identities refuse federation;
     /// HTTP `--no-auth` never bypasses identity verification or encryption.
     pub node_identity: NodeIdentity,
+    /// Supervised-component registry + disk observer behind `/api/ready`.
+    /// `None` only in states built without a daemon (tests); readiness then
+    /// reports alive-only.
+    pub(crate) daemon: Option<crate::daemon::health::DaemonHealth>,
 }
 
 /// Node identity key pair (Ed25519): every daemon auto-generates one of
@@ -133,14 +137,17 @@ impl NodeIdentity {
 #[allow_missing = true]
 struct WebAssets;
 
-pub async fn serve(state: AppState) {
+/// Liveness and readiness are separate answers: this endpoint starts the
+/// HTTP server and returns a reason instead of exiting silently, so a bind
+/// failure (port already taken) shows up as a failed `http` component in
+/// `oly daemon status` instead of a process that looks healthy.
+pub async fn serve(state: AppState) -> Result<(), String> {
     let bind = state.config.get().http.bind.clone();
     let port = state.config.get().http.port;
     let ip = match bind.parse::<std::net::IpAddr>() {
         Ok(ip) => ip,
         Err(err) => {
-            error!(%err, bind = %bind, "failed to parse HTTP bind address");
-            return;
+            return Err(format!("invalid HTTP bind address {bind:?}: {err}"));
         }
     };
     let addr = std::net::SocketAddr::new(ip, port);
@@ -148,12 +155,10 @@ pub async fn serve(state: AppState) {
     let wwwroot_dir = match apps::ensure_wwwroot(&state.config.get()) {
         Ok(path) => path,
         Err(err) => {
-            error!(
-                %err,
-                "failed to initialize HTTP wwwroot at {}",
+            return Err(format!(
+                "failed to initialize HTTP wwwroot at {}: {err}",
                 state.config.get().wwwroot_dir().display()
-            );
-            return;
+            ));
         }
     };
 
@@ -170,6 +175,7 @@ pub async fn serve(state: AppState) {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/health", get(sessions::health))
+        .route("/api/ready", get(ready))
         .route("/api/push/public-key", get(sessions::push_public_key))
         .route(
             "/api/push/subscriptions",
@@ -248,8 +254,7 @@ pub async fn serve(state: AppState) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) => {
-            error!(%err, "failed to bind HTTP server on port {}", port);
-            return;
+            return Err(format!("failed to bind HTTP server at {addr}: {err}"));
         }
     };
 
@@ -261,8 +266,9 @@ pub async fn serve(state: AppState) {
     )
     .await
     {
-        error!(%err, "HTTP server error");
+        return Err(format!("HTTP server error: {err}"));
     }
+    Err("HTTP server exited unexpectedly".to_string())
 }
 
 async fn serve_static_or_proxy(
@@ -549,6 +555,36 @@ fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::respons
         .into_response()
 }
 
+/// `GET /api/ready` — readiness probe: 200 only while every
+/// ready-critical supervised component is running; 503 lists the reasons.
+/// Liveness (`/api/health`) stays a plain "the daemon answered" signal, so
+/// one degraded background component never reads as a dead process.
+async fn ready(State(state): State<AppState>) -> Response {
+    let Some(daemon) = &state.daemon else {
+        // No supervised components in this state (tests): nothing is known
+        // to be degraded, and liveness alone is the honest answer.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ready": true, "unready_reasons": [] })),
+        )
+            .into_response();
+    };
+    let readiness = daemon.components.readiness();
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": readiness.ready,
+            "unready_reasons": readiness.reasons,
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /api/metrics` — Prometheus text exposition of the always-on
 /// in-daemon metrics registry (see `src/metrics.rs` and PERFORMANCE.md).
 /// Sits behind the normal auth layer on purpose: timings and volumes are
@@ -569,6 +605,7 @@ async fn metrics_endpoint() -> Response {
 /// label cardinality.
 const METRIC_ROUTES: &[&str] = &[
     "/api/health",
+    "/api/ready",
     "/api/metrics",
     "/api/auth/status",
     "/api/auth/login",

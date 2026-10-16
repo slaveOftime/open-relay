@@ -41,6 +41,8 @@ pub enum AppError {
     NodeNotConnected(String),
     #[error("max running sessions limit reached ({0})")]
     MaxSessionsReached(usize),
+    #[error("disk guard refused new session: {0}")]
+    DiskGuard(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

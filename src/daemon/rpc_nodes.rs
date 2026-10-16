@@ -491,6 +491,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
     matches!(
         request,
         RpcRequest::Health
+            | RpcRequest::DaemonStatus
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
             | RpcRequest::SessionInfo { .. }
@@ -613,14 +614,23 @@ async fn relay_streaming_rpc(
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        // The nested IPC connection ended before a completion
+                        // frame was forwarded (owning daemon stopped, nested
+                        // stream aborted, read failure). Report the
+                        // interruption to the primary; fabricating
+                        // `AttachStreamDone { exit_code: None,
+                        // final_offset: 0 }` would present an unknown cursor
+                        // as a confirmed end.
+                        warn!(
+                            %err,
+                            id = %rpc_id,
+                            "relay stream interrupted before completion"
+                        );
                         let _ = frame_tx
                             .send((
                                 rpc_id.to_string(),
-                                RpcResponse::AttachStreamDone {
-                                    exit_code: None,
-                                    final_offset: 0,
-                                },
+                                relay_stream_interrupted_response(&err),
                                 true,
                             ))
                             .await;
@@ -632,6 +642,24 @@ async fn relay_streaming_rpc(
     }
 
     Ok(())
+}
+
+/// Response forwarded to the primary when a relayed stream's nested IPC
+/// connection ends before a completion frame. Never fabricate
+/// `AttachStreamDone` with unknown values: an interruption must stay loud.
+fn relay_stream_interrupted_response(err: &dyn std::fmt::Display) -> RpcResponse {
+    RpcResponse::Error {
+        message: format!("relay stream interrupted: {err}"),
+    }
+}
+
+/// Response written to the local client when the owning node's stream
+/// channel is dropped without a completion frame (node disconnected, relay
+/// task ended abnormally). Never fabricate `AttachStreamDone` here either.
+fn node_stream_interrupted_response(node: &str) -> RpcResponse {
+    RpcResponse::Error {
+        message: format!("node '{node}' stream closed before completion"),
+    }
 }
 
 pub(super) async fn handle_node_proxy(
@@ -780,10 +808,12 @@ pub(super) async fn handle_node_proxy_streaming(
                         break;
                     }
                     None => {
-                        let resp = RpcResponse::AttachStreamDone {
-                            exit_code: None,
-                            final_offset: 0,
-                        };
+                        // The node stream channel was dropped without a
+                        // completion or error frame: the owning node
+                        // disconnected or its relay task ended abnormally.
+                        // Report the interruption instead of fabricating a
+                        // completion with `final_offset: 0`.
+                        let resp = node_stream_interrupted_response(&node);
                         let _ = if stream_binary {
                             ipc::write_attach_control_frame(&mut writer, &resp).await
                         } else {
@@ -829,8 +859,31 @@ pub(super) async fn handle_node_proxy_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stream_message_relayable, is_supported_proxied_rpc};
-    use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
+    use super::{
+        is_stream_message_relayable, is_supported_proxied_rpc, node_stream_interrupted_response,
+        relay_stream_interrupted_response,
+    };
+    use crate::protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
+
+    #[test]
+    fn interrupted_relay_streams_report_errors_never_fabricated_completions() {
+        let relay = relay_stream_interrupted_response(&"daemon closed the connection");
+        match relay {
+            RpcResponse::Error { message } => {
+                assert!(message.contains("relay stream interrupted"));
+                assert!(message.contains("daemon closed the connection"));
+            }
+            other => panic!("relay interruption must be an error, got {other:?}"),
+        }
+        let node = node_stream_interrupted_response("worker1");
+        match node {
+            RpcResponse::Error { message } => {
+                assert!(message.contains("worker1"));
+                assert!(message.contains("closed before completion"));
+            }
+            other => panic!("node stream interruption must be an error, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn lagged_relays_emit_gap_markers_without_feeding_the_source_ring() {

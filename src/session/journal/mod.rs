@@ -1965,6 +1965,141 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Cross-platform companion of the `/dev/full` test above: an
+    /// injected append failure must preserve the last confirmed prefix and
+    /// report an explicit capture failure instead of a silent hole. The
+    /// injection lives in the writer, so no operator disk is involved and
+    /// the same test runs on Windows.
+    #[test]
+    fn injected_append_failure_keeps_the_confirmed_prefix() {
+        let dir = test_session_dir("injected_append_fail");
+        let opened = open(&dir).unwrap();
+        let mut writer = RollingSegmentWriter::new(
+            opened.journal_dir.clone(),
+            opened.incarnation,
+            opened.writer,
+            DEFAULT_SEGMENT_MAX_BYTES,
+        );
+        writer.fail_append_after_records = Some(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let (ack_tx, acks) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let space = std::sync::Arc::new(QueueSpace::default());
+        let worker = std::thread::spawn(move || {
+            appender_loop(
+                writer,
+                rx,
+                ack_tx,
+                queued,
+                space,
+                // Long cadence: only explicit syncs run here.
+                std::time::Duration::from_secs(3600),
+            )
+        });
+
+        tx.send(AppenderMsg::Record(Box::new(event(1, b"confirmed"))))
+            .unwrap();
+        assert_eq!(recv_ack(&acks), JournalAck::Journaled(1));
+        tx.send(AppenderMsg::Sync).unwrap();
+        assert_eq!(recv_ack(&acks), JournalAck::Durable(1));
+
+        tx.send(AppenderMsg::Record(Box::new(event(2, b"must-not-land"))))
+            .unwrap();
+        match recv_ack(&acks) {
+            JournalAck::Failed(reason) => {
+                assert!(
+                    reason.contains("append failed") && reason.contains("injected"),
+                    "unexpected failure: {reason}"
+                );
+            }
+            other => panic!("expected append failure, got {other:?}"),
+        }
+        // The dead appender refuses later records: no writing past the
+        // failure point.
+        tx.send(AppenderMsg::Record(Box::new(event(3, b"after"))))
+            .unwrap();
+        assert!(matches!(recv_ack(&acks), JournalAck::Failed(_)));
+        tx.send(AppenderMsg::Shutdown).unwrap();
+        worker.join().unwrap();
+
+        // The reader sees exactly the last confirmed prefix: the confirmed
+        // record is readable, the failed one never landed.
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn")).unwrap();
+        assert_eq!(
+            outcome.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1],
+            "only the confirmed prefix may be written"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An injected sync failure must be loud: no fabricated durable
+    /// ack, no attempt to keep appending past unproven durability. The
+    /// bytes already accepted for capture stay on disk.
+    #[test]
+    fn injected_sync_failure_never_fabricates_durability() {
+        let dir = test_session_dir("injected_sync_fail");
+        let opened = open(&dir).unwrap();
+        let mut writer = RollingSegmentWriter::new(
+            opened.journal_dir.clone(),
+            opened.incarnation,
+            opened.writer,
+            DEFAULT_SEGMENT_MAX_BYTES,
+        );
+        writer.fail_next_sync = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let (ack_tx, acks) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let space = std::sync::Arc::new(QueueSpace::default());
+        let worker = std::thread::spawn(move || {
+            appender_loop(
+                writer,
+                rx,
+                ack_tx,
+                queued,
+                space,
+                // Long cadence: only explicit syncs run here.
+                std::time::Duration::from_secs(3600),
+            )
+        });
+
+        tx.send(AppenderMsg::Record(Box::new(event(
+            1,
+            b"written-not-durable",
+        ))))
+        .unwrap();
+        assert_eq!(recv_ack(&acks), JournalAck::Journaled(1));
+        tx.send(AppenderMsg::Sync).unwrap();
+        match recv_ack(&acks) {
+            JournalAck::Failed(reason) => {
+                assert!(
+                    reason.contains("sync failed") && reason.contains("injected"),
+                    "unexpected failure: {reason}"
+                );
+            }
+            other => panic!("a failed sync must not ack durability, got {other:?}"),
+        }
+        // Fail-fast afterwards: unproven durability refuses new capture.
+        tx.send(AppenderMsg::Record(Box::new(event(2, b"after"))))
+            .unwrap();
+        assert!(matches!(recv_ack(&acks), JournalAck::Failed(_)));
+        tx.send(AppenderMsg::Shutdown).unwrap();
+        worker.join().unwrap();
+
+        // The accepted record's bytes are on disk (the append succeeded);
+        // what failed was proving durability, and no Durable ack was sent.
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn")).unwrap();
+        assert_eq!(
+            outcome.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Regression for the `recv_timeout` starvation bug: with an absolute
     /// sync deadline, a producer that never lets the queue go idle must
     /// still see `durable_seq` advance within roughly one cadence.

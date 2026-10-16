@@ -519,12 +519,50 @@ async fn serve_attach(
                         cleanup_source(&state, &id, &node, &source).await;
                         return;
                     }
+                    Some(AttachStreamEvent::Failed { message }) => {
+                        warn!(
+                            session_id = %id,
+                            attach_path = init_metrics_label,
+                            %message,
+                            "WebSocket session stream interrupted"
+                        );
+                        let _ = send_server_message(
+                            &mut socket,
+                            &ServerMessage::Error { message },
+                        )
+                        .await;
+                        cleanup_source(&state, &id, &node, &source).await;
+                        return;
+                    }
                     Some(AttachStreamEvent::Closed) | None => {
-                        let final_offset = pump_current_offset(&source);
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
-                            exit_code: None,
-                            final_offset,
-                        }).await;
+                        // The local pump closed without a completion record
+                        // (e.g. daemon shutting down while attached). The
+                        // relayed arm reports `Failed` instead of `Closed`, so
+                        // this path only needs the local source's confirmed
+                        // offset — an unknown cursor must never become 0.
+                        let _ = match &source {
+                            AttachSource::Local(local) => {
+                                send_server_message(
+                                    &mut socket,
+                                    &ServerMessage::SessionEnded {
+                                        exit_code: None,
+                                        final_offset: local.pump.current_offset(),
+                                    },
+                                )
+                                .await
+                            }
+                            AttachSource::Relayed(relayed) => {
+                                let message = format!(
+                                    "relay stream to node '{}' closed before completion",
+                                    relayed.node
+                                );
+                                send_server_message(
+                                    &mut socket,
+                                    &ServerMessage::Error { message },
+                                )
+                                .await
+                            }
+                        };
                         cleanup_source(&state, &id, &node, &source).await;
                         return;
                     }
@@ -559,15 +597,6 @@ async fn source_source(source: &mut AttachSource) -> Option<AttachStreamEvent> {
     match source {
         AttachSource::Local(local) => local.next_event().await,
         AttachSource::Relayed(relayed) => relayed.next_event().await,
-    }
-}
-
-/// Resolves the pump's `current_offset` for the local arm; the relayed arm
-/// has no concept of a live offset, so this returns `0` for it.
-fn pump_current_offset(source: &AttachSource) -> u64 {
-    match source {
-        AttachSource::Local(local) => local.pump.current_offset(),
-        AttachSource::Relayed(_) => 0,
     }
 }
 

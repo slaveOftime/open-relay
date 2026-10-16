@@ -368,6 +368,110 @@ fn failed_channel_fails_pending_rpc_and_removes_owned_registry_entry() {
     });
 }
 
+/// Trust boundary: a relayed attach whose owning node disappears
+/// mid-stream must fail loudly with the interruption reason — never a
+/// fabricated completion (`final_offset: 0` / "has ended").
+#[test]
+fn relayed_attach_reports_interruption_instead_of_fabricated_completion() {
+    let tmp = make_tmp_dir("security_relay_interrupt");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+    let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
+    register(&tmp, "worker", &key);
+    let primary = id_pub_key(&tmp);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (mut socket, mut channel, proof) = introduced(port, &key, "worker", &primary).await;
+        prove(&mut socket, &mut channel, &proof).await;
+        ready(&mut socket, &mut channel).await;
+        channel
+            .decode(
+                &receive(&mut socket).await,
+                crypto::decode_handshake::<Value>,
+            )
+            .unwrap();
+
+        let child = oly_cmd(&tmp)
+            .args(["attach", "abc1234", "--node", "worker"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Answer the relayed subscribe with an init frame, then make the
+        // owning node unreachable mid-stream.
+        let rpc_id = loop {
+            let payload = channel
+                .decode(&receive(&mut socket).await, |bytes| {
+                    use std::io::Read;
+                    let json = if bytes.starts_with(b"ONW1") {
+                        let mut json = Vec::new();
+                        flate2::read::GzDecoder::new(&bytes[4..]).read_to_end(&mut json)?;
+                        json
+                    } else {
+                        bytes.to_vec()
+                    };
+                    Ok(serde_json::from_slice::<Value>(&json)?)
+                })
+                .unwrap();
+            match payload["type"].as_str().unwrap() {
+                "rpc" => {
+                    assert_eq!(payload["request"]["type"], "attach_subscribe");
+                    break payload["id"].as_str().unwrap().to_string();
+                }
+                "ping" => continue,
+                other => panic!("unexpected relayed frame: {other}"),
+            }
+        };
+        let init = json!({
+            "type": "attach_stream_init",
+            "data": "",
+            "end_offset": 0,
+            "running": true,
+            "bracketed_paste_mode": false,
+        });
+        let frame = channel
+            .encode(
+                &serde_json::to_vec(&json!({
+                    "type": "rpc_stream_frame",
+                    "id": rpc_id,
+                    "response": init,
+                    "done": false,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        socket.send(Message::Binary(frame.into())).await.unwrap();
+
+        // Let the init frame reach the CLI, then drop the node connection.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(socket);
+
+        let output = timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+        )
+        .await
+        .expect("relayed attach hung after the owning node vanished")
+        .unwrap();
+        assert!(
+            !output.status.success(),
+            "an interrupted attach must fail loudly"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stdout.contains("has ended"),
+            "fabricated completion printed to stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("not connected") || stderr.contains("closed before completion"),
+            "interruption reason missing; stderr: {stderr}"
+        );
+        assert!(wait_for_no_nodes(port, 3).await);
+    });
+}
+
 #[test]
 fn browser_sessions_still_work_and_machine_bearers_do_not() {
     let tmp = make_tmp_dir("security_browser_auth");

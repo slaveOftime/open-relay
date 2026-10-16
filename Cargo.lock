@@ -5106,6 +5106,7 @@ dependencies = [
  "hmac 0.13.0",
  "image",
  "interprocess",
+ "libc",
  "libmimalloc-sys",
  "memchr",
  "mimalloc",

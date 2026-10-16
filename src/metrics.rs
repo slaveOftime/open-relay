@@ -80,6 +80,7 @@ impl Histogram {
 struct Registry {
     histograms: BTreeMap<String, Histogram>,
     counters: BTreeMap<String, u64>,
+    gauges: BTreeMap<String, f64>,
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -117,6 +118,25 @@ pub fn add(name: &'static str, label: Option<&str>, delta: u64) {
 /// Bump a counter by one.
 pub fn count(name: &'static str, label: Option<&str>) {
     add(name, label, 1);
+}
+
+/// Set a gauge to `value` (last write wins), e.g. cached disk capacity.
+/// Gauge names carry their unit (`..._bytes`, `..._seconds`) and are
+/// rendered without the counter `_total` suffix. Unknown values must not
+/// be exported as a plausible number: callers write nothing and surface
+/// the reason through diagnostics instead of writing 0.
+pub fn set_gauge(name: &'static str, label: Option<&str>, value: f64) {
+    let mut reg = registry().lock();
+    reg.gauges.insert(key(name, label), value);
+}
+
+/// Remove a gauge so its series disappears from the exposition. Used when
+/// a previously known value becomes unknown again: a lingering plausible
+/// number reads as a live measurement, which is exactly the dishonesty the
+/// gauge contract forbids.
+pub fn clear_gauge(name: &'static str, label: Option<&str>) {
+    let mut reg = registry().lock();
+    reg.gauges.remove(&key(name, label));
 }
 
 /// A start/stop guard that observes its lifetime when dropped.
@@ -198,6 +218,17 @@ pub fn render_prometheus() -> String {
         }
         let suffix = labels_suffix(label);
         out.push_str(&format!("oly_{base}_total{suffix} {v}\n"));
+    }
+    let mut gauges: Vec<(&String, &f64)> = reg.gauges.iter().collect();
+    gauges.sort_unstable_by_key(|(k, _)| k.as_str());
+    let mut emitted_gauge_type = std::collections::HashSet::new();
+    for (k, v) in gauges {
+        let (base, label) = split_key(k);
+        if emitted_gauge_type.insert(base.to_string()) {
+            out.push_str(&format!("# TYPE oly_{base} gauge\n"));
+        }
+        let suffix = labels_suffix(label);
+        out.push_str(&format!("oly_{base}{suffix} {v}\n"));
     }
     out
 }
@@ -292,5 +323,36 @@ mod tests {
         count("counter_test", Some("x"));
         let reg = registry().lock();
         assert_eq!(reg.counters["counter_test|x"], 3);
+    }
+
+    #[test]
+    fn gauges_render_without_total_suffix_and_last_write_wins() {
+        set_gauge("test_disk_free_bytes_gauge", None, 1024.0);
+        set_gauge("test_disk_free_bytes_gauge", None, 2048.0);
+        set_gauge("test_disk_breakdown_bytes_gauge", Some("journal"), 9.0);
+        let text = render_prometheus();
+        assert!(
+            text.contains("# TYPE oly_test_disk_free_bytes_gauge gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("oly_test_disk_free_bytes_gauge 2048\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("oly_test_disk_breakdown_bytes_gauge,label=\"journal\" 9\n"),
+            "{text}"
+        );
+        assert!(!text.contains("oly_test_disk_free_bytes_gauge_total"));
+
+        // A value that becomes unknown again must lose its series: keeping
+        // the last number would read as a live measurement.
+        clear_gauge("test_disk_free_bytes_gauge", None);
+        let text = render_prometheus();
+        assert!(!text.contains("oly_test_disk_free_bytes_gauge"), "{text}");
+        assert!(
+            text.contains("oly_test_disk_breakdown_bytes_gauge,label=\"journal\" 9\n"),
+            "clearing one series must not disturb others: {text}"
+        );
     }
 }
