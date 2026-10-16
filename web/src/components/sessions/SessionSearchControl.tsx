@@ -44,7 +44,7 @@ const POSITION_KEY = 'oly.sessions.searchTrigger.v1'
 
 /** QuickKeysMenu's pop ease: a slight overshoot so the popups feel springy. */
 const SPRING_EASE = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
-const ENTER_DURATION_MS = 200
+const ENTER_DURATION_MS = 100
 /** h-12, the scroll handle's size. The bar is the trigger plus its input zone. */
 const TRIGGER_SIZE_PX = 48
 const BAR_WIDTH_PX = 274
@@ -214,7 +214,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
       >
         <div
           className={cn(
-            'flex h-full w-56 shrink-0 items-center gap-1 pl-3.5 transition-opacity',
+            'flex h-full w-58 shrink-0 items-center gap-1 pl-3.5 transition-opacity',
             open ? 'opacity-100' : 'invisible opacity-0'
           )}
           style={{ transitionDuration: `${duration}ms` }}
