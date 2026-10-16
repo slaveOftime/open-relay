@@ -5,52 +5,34 @@ description: Use when publishing rich HTML output or a web app through the oly d
 
 # Publish a web app through oly
 
-Run `oly daemon status` to discover `ROOT` (state directory) and the effective
-HTTP endpoint. HTTP must be enabled. An app lives under
-`<ROOT>/wwwroot/apps/<app-name>/` and is served at
-`http://127.0.0.1:<PORT>/apps/<app-name>/` with the daemon's HTTP authentication.
-Use the actual bind/port reported by status, not an assumed default.
+## 1) Locate state and enable trusted apps
 
-Custom apps, proxies, and `wwwroot` overrides are **disabled by default**.
-With operator authorization, set the flat config key `"trusted_apps_enabled": true`
-and verify hot reload. This enables **trusted operator code** on the same origin
-as session controls, not a sandbox for untrusted agent output. App routes allow
-inline scripts; the normal control UI keeps its stricter CSP. Do not enable or
-publish arbitrary generated code without reviewing it. App inventory and routes
-require normal HTTP authentication. Disabling hides new app requests but does not
-revoke a document/connection already open; close those or revoke browser sessions
-if immediate access revocation is needed.
+1. Run `oly daemon status` to get `ROOT` (`<STATE_DIR>`) and the live `HTTP` endpoint (HTTP must be enabled).
+2. Apps live at `<ROOT>/wwwroot/apps/<app-name>/` and are served at `http://127.0.0.1:<PORT>/apps/<app-name>/` behind the daemon's HTTP authentication.
+3. Custom apps, proxies, and `wwwroot` overrides are **disabled by default**. With operator authorization, set flat `"trusted_apps_enabled": true` in `<ROOT>/config.json` and confirm hot reload.
+4. **Security boundary:** App routes share the control-plane origin and allow inline scripts. Only publish reviewed, trusted code — never untrusted output.
 
-## Static HTML
+## 2) Choose an app mode
 
-Create `<ROOT>/wwwroot/apps/<app-name>/index.html` and its assets. No manifest
-is required; discovery uses the HTML title and supported metadata. Use a simple
-URL-safe app name and verify both its route and its entry in the browser UI.
+### Static HTML (no manifest needed)
+Create `<ROOT>/wwwroot/apps/<app-name>/index.html` and relative assets (`./` or `/apps/<app-name>/`). Discovery uses the HTML `<title>`.
 
-## Static app / SPA manifest
-
-Create `oly.app.json` in the app folder:
+### Static app / SPA (`oly.app.json`)
+Create `<ROOT>/wwwroot/apps/<app-name>/oly.app.json`:
 
 ```json
 {
   "title": "My App",
   "app_type": "spa",
   "entry": "index.html",
-  "redirect_files": ["../shared-assets"]
+  "redirect_files": ["index.html"]
 }
 ```
 
-`../shared-assets` must already exist. Remove `redirect_files` if not needed;
-a missing redirect path makes the manifest invalid.
+- `app_type: "spa"` is a display hint only; use hash routing or `"redirect_files": ["index.html"]` for history-route fallback (prefer `/apps/<app-name>/` asset paths so deep links resolve assets cleanly).
+- Every path in `redirect_files` must already exist on disk or the manifest is rejected.
 
-Use relative assets with a suitable base (`./` or `/apps/<app-name>/`). For a
-SPA, use hash routing or explicitly provide history fallback: `app_type: "spa"`
-is a display hint, **not** automatic routing. A redirect **file** such as
-`"redirect_files": ["index.html"]` can supply a fallback for unmatched paths;
-it also catches missing assets, so test asset errors and deep links carefully.
-A fixed `/apps/<app-name>/` asset base works better than `./` for deep links.
-
-## Proxy a local service
+### Loopback service proxy (`oly.app.json`)
 
 ```json
 {
@@ -60,39 +42,24 @@ A fixed `/apps/<app-name>/` asset base works better than `./` for deep links.
 }
 ```
 
-The service must already be running on the **daemon's machine**. Proxy entries
-support HTTP(S) and WebSocket upgrades. Do not combine them with `redirect_files`
-(local entries only). Beta accepts **loopback IP literals only** (`127.0.0.1` or
-`[::1]`), with no URL credentials. Hostnames (including `localhost`), public/LAN
-addresses, and origin-changing request paths are rejected; no DNS resolution or
-HTTP redirect following expands the scope. Use a separate reviewed reverse proxy
-for remote services. Manifests remain trusted configuration; loopback services
-are not automatically safe to expose to every authenticated operator.
+- Proxies HTTP(S) and WebSocket upgrades to a service already running on the daemon host.
+- **Loopback IP literals only** (`127.0.0.1` or `[::1]`), with no URL credentials and no `redirect_files`. Hostnames (including `localhost`), LAN/public IPs, and redirects are rejected.
 
-## Manifest schema
+## 3) Manifest schema (`oly.app.json`)
 
 | Field | Type | Meaning |
 |---|---|---|
-| `entry` | required string | Nonempty local relative entry path, or HTTP(S) proxy URL |
-| `title` | optional string | Display title (otherwise HTML title/folder name) |
+| `entry` | required string | Local relative path (no `..` or leading `/`) or loopback HTTP(S) URL |
+| `title` | optional string | Display title (falls back to HTML title or folder name) |
 | `description` | optional string | Short description |
 | `icon_href` | optional string | Icon URL or relative asset path |
 | `app_type` | optional string | `spa` or `single_html` display hint |
-| `redirect_files` | string array | Existing files/directories to try after app-local assets, in order |
+| `redirect_files` | optional string[] | Existing files/dirs tried in order after app-local assets (local `entry` only) |
 
-Local entry paths must not be absolute or contain parent traversal. Redirect
-paths may be relative to the app folder or absolute, and are canonicalized;
-**they can expose files outside the app folder**. Only reference assets intended
-for publication; never add a home directory, credentials, or private state.
+`redirect_files` may resolve outside the app folder after canonicalization — reference only intended static assets, never home directories, credentials, or private state.
 
-## Verify and hand back
+## 4) Verify and report
 
-1. Validate manifest JSON and confirm every local/redirect path exists.
-2. Open the app through oly with normal authentication; confirm content and assets.
-3. For SPAs, test reload on a deep link; for proxies, test the intended interaction
-   and WebSocket behavior, not just an HTTP success code.
-4. Report the app URL, published files, and any untested behavior.
-
-Oly serves/proxies apps; it does not install dependencies, launch a proxy target,
-sandbox app code, or guarantee that arbitrary absolute asset URLs work. Coordinate
-with the operator before exposing an app or starting/stopping its backing service.
+1. Validate `oly.app.json` with `jq .` and confirm all `entry` / `redirect_files` paths exist.
+2. Load `/apps/<app-name>/` with normal HTTP auth and verify assets, deep links (for SPAs), or WebSocket traffic (for proxies).
+3. Report the app URL, files created, and verification results.
