@@ -6,7 +6,7 @@ description: "Use when starting a long-running or interactive CLI command with o
 # Supervise CLI sessions with oly
 
 `oly skill` prints this self-contained guide from the `oly` binary (no local file read or `oly --help` is needed).
-Other embedded skills: `oly skill --subagent` (multi-agent orchestration), `oly skill --daemon` (`config.json` & hot reload), `oly skill --apps` (web apps).
+Other embedded skills: `oly skill --subagent` (multi-agent orchestration), `oly skill --a2a` (agent-to-agent inbox & channel messaging), `oly skill --daemon` (`config.json` & hot reload), `oly skill --apps` (web apps).
 
 ## When to use & prerequisites
 

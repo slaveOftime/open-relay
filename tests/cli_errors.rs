@@ -247,6 +247,23 @@ fn skill_daemon_prints_embedded_markdown() {
 }
 
 #[test]
+fn skill_agent_2_agent_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("a2a_skill_markdown");
+    for flag in ["--agent-2-agent", "--a2a"] {
+        let output = oly_cmd(&tmp)
+            .args(["skill", flag])
+            .output()
+            .expect("failed to run oly skill --agent-2-agent");
+
+        assert!(output.status.success(), "`oly skill {flag}` should exit 0");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            include_str!("../skills/oly-agent-2-agent/SKILL.md")
+        );
+    }
+}
+
+#[test]
 fn skill_daemon_mutually_excludes_other_flags() {
     let tmp = make_tmp_dir("skill_daemon_conflict");
     let combined = oly_cmd(&tmp)
@@ -260,6 +277,12 @@ fn skill_daemon_mutually_excludes_other_flags() {
         .output()
         .expect("compose with apps");
     assert!(!apps.status.success());
+
+    let a2a = oly_cmd(&tmp)
+        .args(["skill", "--a2a", "--subagent"])
+        .output()
+        .expect("compose with a2a");
+    assert!(!a2a.status.success());
 }
 #[test]
 fn skill_subagent_and_apps_are_mutually_exclusive() {
