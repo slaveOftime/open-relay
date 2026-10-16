@@ -3,7 +3,7 @@
 // tiny helpers (is_active_status, session_is_active, sort_sessions,
 // session_search_text, session_key, session_sort_label) used by both the
 // App impl block and the renderer when deriving keys/status words/labels.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::error::Result;
@@ -221,6 +221,9 @@ use super::tree::{
 #[derive(Default)]
 pub struct App {
     pub sessions: Vec<SessionSummary>,
+    /// `session_key` values parallel to `sessions`, rebuilt together with the
+    /// list so per-frame rate lookups never allocate a key string.
+    pub keys: Vec<String>,
     pub rates: HashMap<String, RateState>,
     pub selected: usize,
     pub opened: HashMap<String, OpenedTerminal>,
@@ -247,6 +250,13 @@ pub struct App {
     pub tree: TreeView,
     /// Local session storage root used to place cwd-less sessions in the tree.
     pub session_storage_dir: Option<PathBuf>,
+    /// Node-name / title column maxima for the current session list. Layout
+    /// needs these on every frame; recomputing them scanned every session
+    /// (and measured every rendered title), so they are cached and the
+    /// `valid` flag is dropped whenever the session set changes.
+    pub node_column_max: usize,
+    pub title_column_max: usize,
+    pub column_maxima_valid: bool,
     /// Shader-like visual effects (tachyonfx) processed on every frame.
     pub effects: EffectManager<String>,
     /// Timestamp of the previous frame, used to derive the effect tick delta.
@@ -286,7 +296,12 @@ impl App {
     /// or a refresh reorders them.
     fn tree_focused_session_key(&self) -> Option<String> {
         match self.tree.visible.get(self.tree.cursor)? {
-            TreeEntry::Session { session, .. } => self.sessions.get(*session).map(session_key),
+            TreeEntry::Session { session, .. } => match self.keys.get(*session) {
+                Some(key) => Some(key.clone()),
+                // Callers that populate `sessions` without the parallel key
+                // cache (tests) still get a key.
+                None => self.sessions.get(*session).map(session_key),
+            },
             TreeEntry::Folder { .. } => None,
         }
     }
@@ -298,10 +313,13 @@ impl App {
                 .visible
                 .iter()
                 .position(|entry| match entry {
-                    TreeEntry::Session { session, .. } => self
-                        .sessions
-                        .get(*session)
-                        .is_some_and(|item| session_key(item) == key),
+                    TreeEntry::Session { session, .. } => match self.keys.get(*session) {
+                        Some(cached) => cached == &key,
+                        None => self
+                            .sessions
+                            .get(*session)
+                            .is_some_and(|item| session_key(item) == key),
+                    },
                     TreeEntry::Folder { .. } => false,
                 })
                 .unwrap_or_else(|| cursor.min(self.tree.visible.len().saturating_sub(1)));
@@ -314,38 +332,51 @@ impl App {
         sort_sessions(&mut sessions, self.sort_strategy);
         let selected_key = self.sessions.get(self.selected).map(session_key);
         let now = Instant::now();
-        let session_keys = sessions.iter().map(session_key).collect::<HashSet<_>>();
-        let attach_counts = sessions
-            .iter()
-            .map(|session| (session_key(session), session.attach_count))
-            .collect::<HashMap<_, _>>();
-        for session in &sessions {
-            let key = session_key(session);
-            match self.rates.get_mut(&key) {
+        // Derive one key per session and reuse it for rate sampling, attach
+        // bookkeeping and per-frame lookups. Deriving it at each use site
+        // allocated a fresh string per session per refresh tick.
+        let keys = sessions.iter().map(session_key).collect::<Vec<_>>();
+        for (session, key) in sessions.iter().zip(&keys) {
+            match self.rates.get_mut(key) {
                 Some(rate) => rate.sample(session, now),
                 None => {
-                    self.rates.insert(key, RateState::new(session, now));
+                    self.rates.insert(key.clone(), RateState::new(session, now));
                 }
             }
         }
-        self.rates.retain(|key, _| session_keys.contains(key));
-        self.opened.retain(|key, opened| {
-            let attach_count = attach_counts.get(key).copied();
-            let launch_pending = opened.launched_at.elapsed() < Duration::from_secs(5);
-            let attached = attach_count.is_some_and(|count| count > 0);
-            if opened.marker.exists() && !launch_pending && !attached {
-                let _ = std::fs::remove_file(&opened.marker);
-            }
-            attach_count.is_some() && (launch_pending || opened.marker.exists())
-        });
-        self.search_text = sessions.iter().map(session_search_text).collect();
+        if !self.rates.is_empty() {
+            let known: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            self.rates.retain(|key, _| known.contains(key.as_str()));
+        }
+        // Attach bookkeeping only exists for interactive launches; skipping it
+        // when nothing is open keeps the common headless/refresh path free of
+        // per-session map builds.
+        if !self.opened.is_empty() {
+            let attach_counts = sessions
+                .iter()
+                .zip(&keys)
+                .map(|(session, key)| (key.as_str(), session.attach_count))
+                .collect::<HashMap<_, _>>();
+            self.opened.retain(|key, opened| {
+                let attach_count = attach_counts.get(key.as_str()).copied();
+                let launch_pending = opened.launched_at.elapsed() < Duration::from_secs(5);
+                let attached = attach_count.is_some_and(|count| count > 0);
+                if opened.marker.exists() && !launch_pending && !attached {
+                    let _ = std::fs::remove_file(&opened.marker);
+                }
+                attach_count.is_some() && (launch_pending || opened.marker.exists())
+            });
+        }
+        if self.normalized_filter.is_empty() {
+            self.search_text.clear();
+        } else {
+            self.search_text = sessions.iter().map(session_search_text).collect();
+        }
         self.sessions = sessions;
+        self.keys = keys;
+        self.column_maxima_valid = false;
         self.selected = selected_key
-            .and_then(|key| {
-                self.sessions
-                    .iter()
-                    .position(|item| session_key(item) == key)
-            })
+            .and_then(|key| self.keys.iter().position(|cached| cached == &key))
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
         self.restore_tree_session_focus(tree_focus, tree_cursor);
@@ -398,14 +429,22 @@ impl App {
         self.rates.remove(&removed_key);
         self.opened.remove(&removed_key);
         self.sessions.remove(position);
-        self.search_text = self.sessions.iter().map(session_search_text).collect();
+        if position < self.keys.len() {
+            self.keys.remove(position);
+        } else {
+            self.keys.clear();
+        }
+        if self.normalized_filter.is_empty() {
+            self.search_text.clear();
+        } else if position < self.search_text.len() {
+            self.search_text.remove(position);
+        } else {
+            self.search_text.clear();
+        }
+        self.column_maxima_valid = false;
         self.selected = selected_key
             .filter(|key| key != &removed_key)
-            .and_then(|key| {
-                self.sessions
-                    .iter()
-                    .position(|session| session_key(session) == key)
-            })
+            .and_then(|key| self.keys.iter().position(|cached| cached == &key))
             .unwrap_or_else(|| position.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
         if removed_selected {
@@ -431,17 +470,44 @@ impl App {
             return;
         };
         self.sessions[index] = summary;
-        if let Some(search_text) = self.search_text.get_mut(index) {
-            *search_text = session_search_text(&self.sessions[index]);
+        if let Some(key) = self.keys.get_mut(index) {
+            *key = session_key(&self.sessions[index]);
         } else {
-            self.search_text = self.sessions.iter().map(session_search_text).collect();
+            self.keys.clear();
         }
+        if !self.normalized_filter.is_empty() {
+            if let Some(search_text) = self.search_text.get_mut(index) {
+                *search_text = session_search_text(&self.sessions[index]);
+            } else {
+                self.search_text.clear();
+            }
+        }
+        self.column_maxima_valid = false;
         self.rebuild_visible();
     }
 
-    pub(super) fn rebuild_visible(&mut self) {
+    /// Rebuild the parallel `search_text` index when it is out of sync with
+    /// `sessions`. The index is cleared whenever the list changes without an
+    /// active filter, so any length mismatch after that means a rebuild.
+    fn ensure_search_text(&mut self) {
         if self.search_text.len() != self.sessions.len() {
             self.search_text = self.sessions.iter().map(session_search_text).collect();
+        }
+    }
+
+    /// Rate state for the session at `index`. Uses the parallel key cache so
+    /// rendering thousands of rows never derives a key string per row; the
+    /// fallback covers callers (tests) that populate `sessions` directly.
+    pub(super) fn rate_for(&self, index: usize, session: &SessionSummary) -> Option<&RateState> {
+        self.keys
+            .get(index)
+            .and_then(|key| self.rates.get(key))
+            .or_else(|| self.rates.get(&session_key(session)))
+    }
+
+    pub(super) fn rebuild_visible(&mut self) {
+        if !self.normalized_filter.is_empty() {
+            self.ensure_search_text();
         }
         self.visible.clear();
         self.visible.extend(
@@ -670,6 +736,9 @@ impl App {
     }
 
     pub(super) fn build_tree_nodes(&mut self) {
+        if !self.normalized_filter.is_empty() {
+            self.ensure_search_text();
+        }
         self.tree.nodes.clear();
         self.tree.nodes.push(TreeNode {
             path: PathBuf::new(),
@@ -747,19 +816,19 @@ impl App {
             } else {
                 self.tree.root
             };
-            let group_sessions: Vec<_> = filtered_sessions
+            let group_sessions: Vec<(usize, PathBuf)> = filtered_sessions
                 .iter()
                 .copied()
                 .filter(|(_, session)| session.node == node_name)
+                .map(|(index, session)| (index, self.session_tree_cwd(session)))
                 .collect();
-            let cwds: Vec<PathBuf> = group_sessions
+            let cwds: Vec<&Path> = group_sessions
                 .iter()
-                .map(|(_, session)| self.session_tree_cwd(session))
+                .map(|(_, cwd)| cwd.as_path())
                 .filter(|path| !path.as_os_str().is_empty())
                 .collect();
             let common = common_path_prefix(&cwds);
-            for (index, session) in group_sessions {
-                let cwd = self.session_tree_cwd(session);
+            for (index, cwd) in group_sessions {
                 let cwd_text = cwd.to_string_lossy().into_owned();
                 let effective = if self.tree.auto_expand_all {
                     cwd.clone()
@@ -846,8 +915,11 @@ impl App {
     /// (by cmd + args + title). Both lists are stable-sorted so existing
     /// display ties keep their insertion order.
     pub(super) fn sort_tree_nodes(&mut self) {
+        // Compare pre-lowercased labels: deriving the lowercase form inside
+        // the comparator measured as the dominant cost of this sort with
+        // thousands of sessions.
         let labels: Vec<String> = (0..self.sessions.len())
-            .map(|index| session_sort_label(&self.sessions[index]))
+            .map(|index| session_sort_label(&self.sessions[index]).to_lowercase())
             .collect();
         // Snapshot folder names so the closures can borrow them immutably
         // without re-borrowing the same `nodes` vector being mutated.
@@ -862,7 +934,7 @@ impl App {
             children.sort_by(|&a, &b| folder_names[a].cmp(&folder_names[b]));
             node.subfolders = children;
             let mut sessions = node.direct_sessions.clone();
-            sessions.sort_by(|&a, &b| labels[a].to_lowercase().cmp(&labels[b].to_lowercase()));
+            sessions.sort_by(|&a, &b| labels[a].cmp(&labels[b]));
             node.direct_sessions = sessions;
         }
     }
@@ -1064,15 +1136,17 @@ impl App {
         self.sort_strategy = self.sort_strategy.next();
         let selected_key = self.sessions.get(self.selected).map(session_key);
         sort_sessions(&mut self.sessions, self.sort_strategy);
-        // The search text is indexed parallel to `sessions`, so re-derive it
-        // after reordering.
-        self.search_text = self.sessions.iter().map(session_search_text).collect();
+        // The key and search indexes are parallel to `sessions`, so re-derive
+        // them after reordering. The search index stays dropped while no
+        // filter is active.
+        self.keys = self.sessions.iter().map(session_key).collect();
+        if self.normalized_filter.is_empty() {
+            self.search_text.clear();
+        } else {
+            self.search_text = self.sessions.iter().map(session_search_text).collect();
+        }
         self.selected = selected_key
-            .and_then(|key| {
-                self.sessions
-                    .iter()
-                    .position(|session| session_key(session) == key)
-            })
+            .and_then(|key| self.keys.iter().position(|cached| cached == &key))
             .unwrap_or(0);
         self.rebuild_visible();
         self.set_action_message(Some(format!(

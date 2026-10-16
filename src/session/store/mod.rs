@@ -61,6 +61,16 @@ pub(super) const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_mil
 /// interval costs almost nothing.
 pub(super) const ATTACH_INPUT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
+/// Entry bound for [`StoreMutableState::persisted_stream_len_cache`].
+///
+/// The cache is cleared wholesale when full, so a bound below the number of
+/// offline sessions a `list` call touches makes every list re-decode every
+/// journal past the bound. Large lists are normal (the TUI asks for up to
+/// 5000 sessions every refresh), so the bound is sized for them; each entry
+/// is a short id plus two integers (well under 100 bytes), keeping the
+/// worst-case footprint under ~2 MB.
+pub(super) const PERSISTED_STREAM_LEN_CACHE_ENTRIES: usize = 20_000;
+
 pub(super) type SessionMap = HashMap<String, Arc<SessionHandle>>;
 
 pub(super) struct StoreMutableState {
@@ -70,7 +80,8 @@ pub(super) struct StoreMutableState {
     /// runtime, keyed by session id: `(incarnation, len)`. The incarnation
     /// component invalidates the entry when the journal advances
     /// (keeps `oly wait` polling cheap against
-    /// completed sessions with large journals).
+    /// completed sessions with large journals). The entry bound is
+    /// [`PERSISTED_STREAM_LEN_CACHE_ENTRIES`].
     pub(super) persisted_stream_len_cache: HashMap<String, (u64, u64)>,
 }
 

@@ -92,7 +92,7 @@ pub fn render_tree(
                 );
                 let (line, connector_width) = session_line_with_connector(
                     session_summary,
-                    app.rates.get(&session_key(session_summary)),
+                    app.rate_for(session, session_summary),
                     connector,
                     is_selected,
                     now,
