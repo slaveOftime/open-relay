@@ -245,6 +245,9 @@ SessionsPage data layer remain).
       `use-reduced-motion`, `repeat-controller`, `use-attach-idle-animation`,
       `use-attach-reconnect`, `use-terminal-keyboard-sync`,
       `use-session-table-columns`, `use-session-list-gestures`,
+      `use-tap-gestures`, `use-hold-to-drag`, `use-now`.
+- [x] **Tests.** 428 unit tests across 44 files and 45 Playwright specs
+      (30 Chromium + 15 mobile Safari). Covered directly: the staleness
       `use-tap-gestures`, `use-hold-to-drag`.
 - [x] **Tests.** 433 unit tests across 44 files and 50 Playwright specs
       (32 Chromium + 18 mobile Safari). Covered directly: the staleness

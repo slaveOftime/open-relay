@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseArgString, sessionDisplayName } from './format'
+import { formatAge, parseArgString, sessionDisplayName } from './format'
 
 describe('parseArgString', () => {
   it('preserves backslashes in quoted Windows path arguments', () => {
@@ -26,6 +26,26 @@ describe('parseArgString', () => {
       'hello world',
       'say "hi"',
     ])
+  })
+})
+
+describe('formatAge', () => {
+  const NOW = Date.parse('2026-10-16T12:00:00.000Z')
+  const createdBefore = (seconds: number) => new Date(NOW - seconds * 1000).toISOString()
+
+  it('counts seconds, then minutes, hours and days', () => {
+    expect(formatAge(createdBefore(0), NOW)).toBe('0s ago')
+    expect(formatAge(createdBefore(59), NOW)).toBe('59s ago')
+    expect(formatAge(createdBefore(60), NOW)).toBe('1m ago')
+    expect(formatAge(createdBefore(3599), NOW)).toBe('59m ago')
+    expect(formatAge(createdBefore(3600), NOW)).toBe('1h ago')
+    expect(formatAge(createdBefore(86_399), NOW)).toBe('23h ago')
+    expect(formatAge(createdBefore(86_400), NOW)).toBe('1d ago')
+    expect(formatAge(createdBefore(3 * 86_400), NOW)).toBe('3d ago')
+  })
+
+  it('never counts backwards when a node clock runs ahead of the browser', () => {
+    expect(formatAge(createdBefore(-5), NOW)).toBe('0s ago')
   })
 })
 
