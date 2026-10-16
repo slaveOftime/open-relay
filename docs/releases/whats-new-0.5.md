@@ -24,6 +24,11 @@ See [Logs and continuation](../guides/cli.md#logs-views-waits-and-byte-continuat
   editing, and cloning.
 - Prompt, idle, output, exit, and pattern waits help decide when to inspect work.
   These are signals, not proof of task completion or approval.
+- Agent-reported program status (OSC 7501) is exposed as `program_status` in
+  `oly info`/`oly ls`, as `[state]` labels in `oly ls --follow`, and as badges
+  in the web UI. It is app-reported state, not process status or approval.
+- The session list stays responsive with thousands of sessions. Measurement
+  recipes are in [Performance](../../PERFORMANCE.md).
 - Bundled skills cover session supervision, workers, daemon configuration,
   and trusted apps.
 
@@ -48,7 +53,13 @@ traffic replace the old federation credential paths. Verify public identities
 independently and upgrade nodes together. Federation has **no forward secrecy**
 and, in 0.5.x, no primary-side identity removal.
 
+## Platforms
+
+Bundled binaries cover Linux x64, Linux arm64, macOS Apple Silicon, and
+Windows x64; the npm launcher selects one. Linux arm64 joined the matrix in
+0.5.0-beta.2 and is built on a native arm64 runner.
+
 See [Node setup](../guides/remote-access.md#connect-machines),
 [Compatibility](./compatibility-0.5.md), and
-[0.5.0-beta.1 release notes](./release-notes-0.5.0-beta.1.md) for shipped scope
+[0.5.0-beta.2 release notes](./release-notes-0.5.0-beta.2.md) for shipped scope
 and verification.
