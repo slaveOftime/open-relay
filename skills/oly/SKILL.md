@@ -51,7 +51,9 @@ In the list TUI (`oly ls --follow`), `Ctrl+N` (New Session) and `Ctrl+D`
 inline to the new session on the chosen node. To remain in the list, focus
 **Attach on start** and press `Space` to uncheck it before submitting. Each
 fresh new/duplicate dialog resets it to checked; Resume remains opt-in. This
-is a TUI default only, not a change to `oly start` CLI defaults.
+is a TUI default only, not a change to `oly start` CLI defaults. `Ctrl+G` switches
+between table and tree; the initial tree shows two path-folder levels beneath
+each root/node group. `Enter` expands/collapses the focused tree folder.
 
 ### 2) Monitor
 
@@ -74,7 +76,7 @@ oly logs <ID> --tail-frames 5
   - `match`: `--match <regex>` appeared in NEW output (only after the gate started).
 - `--timeout` accepts `250ms`, `30s`, `5m`, `1h` (default `30s`; `0` waits forever).
 - Exit codes: `0` condition met, `2` timeout, `1` error. Text timeout produces no stdout; JSON timeout emits `outcome: "timeout"` with `cursor: null`. Keep the previous cursor and branch on the exit code.
-- OSC 7501-capable programs expose a separate `program_status` in `oly info <ID> --json` / `oly ls --json`: `blocked` sets `input_needed` immediately (permission/question/auth); `working`, `idle`, `done`, and `error` suppress heuristic input-needed guesses. Idle can notify "Ready for instruction", like done/error notifications, but is not a completion claim. Without retained reports, detection remains heuristic (including silence fallback). All are untrusted hints, not approval authority or proof of task completion. Reports are live-derived and unavailable after runtime eviction/restart. `--wait exit` returns 0 even if the child failed; inspect the child's exit code with `oly info <ID> --json`.
+- OSC 7501-capable programs expose a separate `program_status` in `oly info <ID> --json` / `oly ls --json`. In `oly ls --follow`, table and tree views show only a compact state label beside the session title (`[working]`, `[blocked]`, `[done]`, `[idle]`, or `[error]`), not report app/ID/title/message/progress. Colors are idle blue, working cyan, done green, blocked yellow/amber, and error red; they remain distinct on selected/inactive rows. No report means no label; very narrow views prioritize session identity and may omit a label that cannot fit. This program-state hint is separate from the session process lifecycle. `blocked` sets `input_needed` immediately (permission/question/auth); `working`, `idle`, `done`, and `error` suppress heuristic input-needed guesses. Idle can notify "Ready for instruction", like done/error notifications, but is not a completion claim. Without retained reports, detection remains heuristic (including silence fallback). All are untrusted hints, not approval authority or proof of task completion. Reports are live-derived and unavailable after runtime eviction/restart. `--wait exit` returns 0 even if the child failed; inspect the child's exit code with `oly info <ID> --json`.
 - Windows pi sessions: ConPTY can make OSC 7501 autodetection fail. oly defaults `PI_PROGRAM_STATUS=1` in Windows child environments only when the variable is absent; explicit values (including `0`) are preserved. Existing sessions need a fresh start to inherit this policy. Other agents' detection is unchanged; this is not a general ConPTY negotiation fix.
 - Start with `--tail 40`; increase only when recent context is insufficient. Use `--screen` after sending TUI input; check again after the next redraw.
 

@@ -30,6 +30,16 @@ const badgeVariants = cva(
           'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/40 dark:bg-blue-900/30 dark:text-blue-300',
         'input-needed':
           'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-700/60 dark:bg-amber-900/30 dark:text-amber-300',
+        'program-idle':
+          'border-[hsl(var(--program-status-idle))]/30 bg-[hsl(var(--program-status-idle))]/12 text-[hsl(var(--program-status-idle-foreground))]',
+        'program-working':
+          'border-[hsl(var(--program-status-working))]/30 bg-[hsl(var(--program-status-working))]/12 text-[hsl(var(--program-status-working-foreground))]',
+        'program-done':
+          'border-[hsl(var(--program-status-done))]/30 bg-[hsl(var(--program-status-done))]/12 text-[hsl(var(--program-status-done-foreground))]',
+        'program-blocked':
+          'border-[hsl(var(--program-status-blocked))]/30 bg-[hsl(var(--program-status-blocked))]/12 text-[hsl(var(--program-status-blocked-foreground))]',
+        'program-error':
+          'border-[hsl(var(--program-status-error))]/30 bg-[hsl(var(--program-status-error))]/12 text-[hsl(var(--program-status-error-foreground))]',
         attached:
           'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-700/50 dark:bg-indigo-900/30 dark:text-indigo-300',
       },

@@ -107,7 +107,8 @@ charts when space is limited. The displayed executable basename does not
 change the saved launch command. In tree rows, activity charts precede the
 output byte count, matching the table; byte counts have no `out:` label.
 Inactive session titles stay brighter than their dimmed commands and metadata
-in both views.
+in both views. The initial tree shows two path-folder levels beneath each root
+or node group; `Enter` expands/collapses the focused folder.
 
 ## Full session inspection
 
@@ -136,6 +137,17 @@ for a silence/regex guess. `idle` means ready for the next instruction, not an
 approval request; it can notify you that the agent is **Ready for instruction**,
 just as `done` can notify you about a result. Neither implies verified success.
 `idle`, `working`, `done`, and `error` do not set `input_needed`.
+
+In `oly ls --follow`, both table and tree views show a compact program-state
+label beside the session title when a report is available: `[working]`,
+`[blocked]`, `[done]`, `[idle]`, or `[error]`. Only the state label is shown,
+not the report's app, ID, title, message, or progress. Labels use distinct bright
+terminal colors: idle blue, working cyan, done green, blocked yellow/amber, and
+error red. Their colors remain visible on selected and inactive rows. No report
+means no label.
+Very narrow views prioritize session identity and may omit the label if it
+cannot fit. Like the full report, the label is an untrusted hint, separate from
+the session's process lifecycle.
 
 Reports replace their record completely. oly retains up to 256 hierarchical
 records and presents the most relevant: blocked > error > working > done > idle,

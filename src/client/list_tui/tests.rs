@@ -603,7 +603,7 @@ fn ctrl_g_toggles_view_mode() {
 }
 
 #[test]
-fn switching_to_tree_expands_one_level_and_focuses_the_nearest_folder() {
+fn switching_to_tree_shows_two_levels_and_focuses_the_nearest_folder() {
     let mut app = App::default();
     app.replace_sessions(vec![
         session_at("shallow", Some("/work")),
@@ -629,7 +629,7 @@ fn switching_to_tree_expands_one_level_and_focuses_the_nearest_folder() {
     let focused = app.tree.visible.get(app.tree.cursor).copied();
     assert!(matches!(focused,
         Some(super::TreeEntry::Folder { node, .. })
-            if app.tree.nodes[node].path == std::path::Path::new("work")));
+            if app.tree.nodes[node].path == std::path::Path::new("work/a")));
 }
 #[test]
 fn absolute_tree_paths_do_not_create_empty_root_folders() {
@@ -774,7 +774,7 @@ fn tree_refresh_tick_preserves_focused_folder() {
 #[test]
 fn tree_walks_through_empty_middleman_folders() {
     let mut app = App::default();
-    assert_eq!(super::TREE_AUTO_DEPTH, 1);
+    assert_eq!(super::TREE_AUTO_DEPTH, 2);
     app.replace_sessions(vec![session_at("lint", Some("/a/b/c/something"))]);
     let ids = tree_visible_ids(&app);
     let has_folder = |path: &str| {
@@ -788,8 +788,8 @@ fn tree_walks_through_empty_middleman_folders() {
         "first folder level should be visible: {ids:?}"
     );
     assert!(
-        !has_folder("a/b"),
-        "second folder level should require an explicit drill: {ids:?}"
+        has_folder("a/b"),
+        "second folder level should be visible by default: {ids:?}"
     );
     assert!(!has_folder("a/b/c"), "ids={ids:?}");
     assert!(!has_folder("a/b/c/something"), "ids={ids:?}");
@@ -821,19 +821,7 @@ fn folder_with_only_sessions_can_toggle_its_direct_session_rows() {
     app.replace_sessions(vec![session_at("only", Some("/work/project"))]);
     app.toggle_view_mode();
 
-    let work = app
-        .tree
-        .visible
-        .iter()
-        .position(|entry| {
-            matches!(entry,
-            super::TreeEntry::Folder { node, .. }
-                if app.tree.nodes[*node].path == std::path::Path::new("work"))
-        })
-        .expect("first cwd folder is visible");
-    app.tree.cursor = work;
-    route_key(&mut app, key(KeyCode::Enter), None);
-
+    // The first folder is expanded by default; its child is already visible.
     let project = app
         .tree
         .visible
@@ -900,14 +888,12 @@ fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
     app.rebuild_tree();
 
     assert!(tree_has_folder(&app, "a"));
-    assert!(!tree_has_folder(&app, "a/b"));
+    assert!(tree_has_folder(&app, "a/b"));
+    assert!(!tree_has_folder(&app, "a/b/c"));
     assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
         super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
 
-    for (step, path) in ["a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"]
-        .iter()
-        .enumerate()
-    {
+    for (step, path) in ["a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"].iter().enumerate() {
         let position = app
             .tree
             .visible
@@ -924,7 +910,7 @@ fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
             AppAction::None
         );
         assert!(tree_has_folder(&app, path));
-        if step < 4 {
+        if step < 3 {
             assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
                 super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
         }
@@ -1342,19 +1328,6 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
         Some(super::TreeEntry::Folder { node, .. })
             if app.tree.nodes[node].node.as_deref() == Some("worker")));
 
-    let remote_work = app
-        .tree
-        .visible
-        .iter()
-        .position(|entry| {
-            matches!(entry,
-            super::TreeEntry::Folder { node, .. }
-                if app.tree.nodes[*node].node.as_deref() == Some("worker")
-                    && app.tree.nodes[*node].path == std::path::Path::new("work"))
-        })
-        .expect("remote work folder is initially visible");
-    app.tree.cursor = remote_work;
-    route_key(&mut app, key(KeyCode::Enter), None);
     let remote_app = app
         .tree
         .visible
@@ -1365,7 +1338,7 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
                 if app.tree.nodes[*node].node.as_deref() == Some("worker")
                     && app.tree.nodes[*node].path == std::path::Path::new("work/app"))
         })
-        .expect("remote app folder appears after expanding work");
+        .expect("remote app folder is visible beneath the auto-expanded work folder");
     app.tree.cursor = remote_app;
     route_key(&mut app, key(KeyCode::Enter), None);
     let drilled_ids = tree_visible_ids(&app);
@@ -1499,7 +1472,7 @@ fn drilling_a_remote_path_does_not_open_the_same_local_path() {
     remote.node = Some("worker".into());
     app.replace_sessions(vec![local, remote]);
 
-    for path in ["a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"] {
+    for path in ["a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"] {
         let target = app
             .tree
             .visible
@@ -4416,5 +4389,303 @@ fn inactive_titles_are_brighter_than_commands_in_both_views() {
                 assert_eq!(buffer[(title_x as u16, y as u16)].fg, Color::White);
             }
         }
+    }
+}
+
+fn program_report(
+    state: crate::session::program_status::ProgramState,
+) -> crate::session::program_status::ProgramStatus {
+    crate::session::program_status::ProgramStatus {
+        state,
+        id: Some("private-record".into()),
+        kind: Some(crate::session::program_status::BlockedKind::Permission),
+        progress: Some(42),
+        app: Some("private-app".into()),
+        title: Some("private-label".into()),
+        msg: Some("private-message".into()),
+    }
+}
+
+#[test]
+fn program_state_labels_stay_beside_titles_and_keep_semantic_colors_in_both_views() {
+    use crate::session::program_status::ProgramState;
+    use ratatui::style::{Color, Modifier};
+    for (state, label, color) in [
+        (ProgramState::Idle, "[idle]", Color::LightBlue),
+        (ProgramState::Working, "[working]", Color::LightCyan),
+        (ProgramState::Done, "[done]", Color::LightGreen),
+        (ProgramState::Blocked, "[blocked]", Color::LightYellow),
+        (ProgramState::Error, "[error]", Color::LightRed),
+    ] {
+        for view in [super::ViewMode::List, super::ViewMode::Tree] {
+            for lifecycle in ["running", "stopped"] {
+                for selected in [false, true] {
+                    for width in [50, 80, 120] {
+                        let mut app = App::default();
+                        let mut item = session("ident42");
+                        item.title = Some("Notes".into());
+                        item.command = "worker-cli".into();
+                        item.args = vec!["--long-config".repeat(8)];
+                        item.status = lifecycle.into();
+                        item.input_needed = state == ProgramState::Blocked;
+                        item.notifications_enabled = false;
+                        item.program_status = Some(program_report(state));
+                        item.foreground_color = Some("#ffff00".into());
+                        item.background_color = Some("#1e1e1e".into());
+                        app.replace_sessions(vec![session("focused"), item]);
+                        app.view_mode = view;
+                        app.selected = usize::from(selected);
+                        if view == super::ViewMode::Tree {
+                            app.tree.visible = vec![
+                                super::TreeEntry::Session {
+                                    session: 0,
+                                    depth: 1,
+                                },
+                                super::TreeEntry::Session {
+                                    session: 1,
+                                    depth: 1,
+                                },
+                            ];
+                            app.tree.cursor = usize::from(selected);
+                        }
+                        let buffer = render_app_buffer(&mut app, width, 10);
+                        let lines = buffer_symbols(&buffer, 10);
+                        let y = lines
+                            .iter()
+                            .position(|row| row.contains("Notes"))
+                            .expect("title visible");
+                        let row = &lines[y];
+                        assert!(
+                            row.contains(&format!("Notes {label}")),
+                            "{view:?}/{width}/{lifecycle}: {row}"
+                        );
+                        let badge_byte = row.find(label).unwrap();
+                        let badge_x = unicode_width::UnicodeWidthStr::width(&row[..badge_byte]);
+                        assert_eq!(buffer[(badge_x as u16, y as u16)].fg, color);
+                        if matches!(state, ProgramState::Blocked | ProgramState::Error) {
+                            assert!(
+                                buffer[(badge_x as u16, y as u16)]
+                                    .modifier
+                                    .contains(Modifier::BOLD)
+                            );
+                        }
+                        for private in [
+                            "private-app",
+                            "private-record",
+                            "private-label",
+                            "private-message",
+                            "42%",
+                        ] {
+                            assert!(
+                                !row.contains(private),
+                                "only the state label belongs in compact rows: {row}"
+                            );
+                        }
+                        if view == super::ViewMode::Tree && state == ProgramState::Blocked {
+                            assert!(
+                                !row.contains(" wait"),
+                                "do not repeat the blocked label with heuristic wait: {row}"
+                            );
+                        }
+                        assert_eq!(app.sessions[1].status, lifecycle);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn program_state_labels_update_and_clear_without_other_session_changes() {
+    use crate::session::program_status::ProgramState;
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        let mut app = App::default();
+        let mut item = session("ident42");
+        item.title = Some("Notes".into());
+        item.command = "worker-cli".into();
+        item.notifications_enabled = false;
+        app.replace_sessions(vec![item.clone()]);
+        app.view_mode = view;
+        let focus_tree = |app: &mut App| {
+            if view == super::ViewMode::Tree {
+                app.tree.visible = vec![super::TreeEntry::Session {
+                    session: 0,
+                    depth: 1,
+                }];
+                app.tree.cursor = 0;
+            }
+        };
+        focus_tree(&mut app);
+        let original = render_app(&mut app, 120, 10);
+        for (state, label) in [
+            (ProgramState::Working, "[working]"),
+            (ProgramState::Idle, "[idle]"),
+            (ProgramState::Done, "[done]"),
+            (ProgramState::Error, "[error]"),
+        ] {
+            item.program_status = Some(program_report(state));
+            app.replace_sessions(vec![item.clone()]);
+            focus_tree(&mut app);
+            assert!(render_app(&mut app, 120, 10).contains(&format!("Notes {label}")));
+        }
+        item.program_status = None;
+        app.replace_sessions(vec![item]);
+        focus_tree(&mut app);
+        assert_eq!(
+            render_app(&mut app, 120, 10),
+            original,
+            "no report must preserve the original compact layout"
+        );
+    }
+}
+
+#[test]
+fn compact_title_badges_are_bounded_unicode_safe_and_never_partial_states() {
+    use crate::session::program_status::ProgramState;
+    let mut item = session("ident42");
+    item.title = Some("部署检查 e\u{301} 🦀 验证结果".repeat(8));
+    for state in [
+        ProgramState::Idle,
+        ProgramState::Working,
+        ProgramState::Done,
+        ProgramState::Blocked,
+        ProgramState::Error,
+    ] {
+        item.program_status = Some(program_report(state));
+        let badge = super::table::session_program_status_span(&item).unwrap();
+        for width in 0..=80 {
+            let spans = super::table::session_title_spans(&item, width);
+            let line = ratatui::text::Line::from(spans);
+            assert!(line.width() <= width, "{width}: {line}");
+            let row = line.to_string();
+            assert_eq!(
+                row.contains(badge.content.as_ref()),
+                width >= badge.width() + 2
+            );
+            if width < badge.width() + 2 {
+                assert!(!row.contains('['));
+            }
+        }
+    }
+}
+
+#[test]
+fn program_status_does_not_replace_process_lifecycle_or_guess_missing_reports() {
+    use crate::session::program_status::ProgramState;
+    let mut item = session("ident42");
+    item.title = Some("Notes".into());
+    let no_report = render_session_row(&item);
+    assert_eq!(no_report[(0, 0)].symbol(), "●");
+    for label in ["[idle]", "[working]", "[done]", "[blocked]", "[error]"] {
+        assert!(find_text(&no_report, label).is_none());
+    }
+    for state in [ProgramState::Idle, ProgramState::Done, ProgramState::Error] {
+        item.program_status = Some(program_report(state));
+        let buffer = render_session_row(&item);
+        assert_eq!(
+            buffer[(0, 0)].symbol(),
+            "●",
+            "a task report must not change a live process icon"
+        );
+    }
+}
+
+#[test]
+fn first_tree_switch_opens_one_more_folder_level_for_each_node() {
+    let mut sessions = Vec::new();
+    for node in [None, Some("WSL-DEBIAN")] {
+        for folder in ["Dev", "Notes"] {
+            let mut item = session_at(
+                &format!("{}-{folder}", node.unwrap_or("local")),
+                Some(&format!("/home/binwenw/{folder}/project")),
+            );
+            item.node = node.map(str::to_string);
+            sessions.push(item);
+        }
+    }
+    let mut app = App::default();
+    app.replace_sessions(sessions);
+    assert!(app.tree.drilled.is_empty());
+    assert!(app.tree.collapsed.is_empty());
+    route_key(&mut app, ctrl(KeyCode::Char('g')), None);
+    let initial = render_app(&mut app, 100, 18);
+    assert!(initial.contains("▾ binwenw/"), "{initial}");
+    assert!(initial.contains("▸ Dev/"), "{initial}");
+    assert!(initial.contains("▸ Notes/"), "{initial}");
+    for owner in [None, Some("WSL-DEBIAN")] {
+        let (index, node, depth) = app
+            .tree
+            .visible
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                if let super::TreeEntry::Folder { node, depth } = *entry {
+                    let folder = &app.tree.nodes[node];
+                    if folder.node.as_deref() == owner && folder.name == "binwenw" {
+                        return Some((index, node, depth));
+                    }
+                }
+                None
+            })
+            .expect("user folder must be visible in each node group");
+        assert!(
+            app.tree.is_expanded(node, depth),
+            "first path folder is expanded automatically"
+        );
+        for name in ["Dev", "Notes"] {
+            assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+                super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].node.as_deref() == owner
+                    && app.tree.nodes[*node].name == name)));
+        }
+        assert!(
+            !app.tree.visible.iter().any(|entry| matches!(entry,
+            super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].node.as_deref() == owner
+                && app.tree.nodes[*node].name == "project")),
+            "deeper levels still require a drill"
+        );
+        // A manual collapse must survive refresh and switching views.
+        app.tree.cursor = index;
+        route_key(&mut app, key(KeyCode::Enter), None);
+        let refreshed = app.sessions.clone();
+        app.replace_sessions(refreshed);
+        route_key(&mut app, ctrl(KeyCode::Char('g')), None);
+        route_key(&mut app, ctrl(KeyCode::Char('g')), None);
+        assert!(
+            !app.tree.visible.iter().any(|entry| matches!(entry,
+            super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].node.as_deref() == owner
+                && app.tree.nodes[*node].name == "Dev")),
+            "explicit collapse must not be undone"
+        );
+    }
+    let rendered = render_app(&mut app, 100, 15);
+    assert!(rendered.contains("local (node)"));
+    assert!(rendered.contains("WSL-DEBIAN (node)"));
+}
+
+#[test]
+fn program_status_palette_uses_five_distinct_non_neutral_colors() {
+    use crate::session::program_status::ProgramState;
+    use ratatui::style::Color;
+    let mut item = session("ident42");
+    let mut colors = Vec::new();
+    for state in [
+        ProgramState::Idle,
+        ProgramState::Working,
+        ProgramState::Done,
+        ProgramState::Blocked,
+        ProgramState::Error,
+    ] {
+        item.program_status = Some(program_report(state));
+        let color = super::table::session_program_status_span(&item)
+            .unwrap()
+            .style
+            .fg
+            .unwrap();
+        assert!(![Color::Gray, Color::DarkGray, Color::White, Color::Reset].contains(&color));
+        assert!(
+            !colors.contains(&color),
+            "different program states must not share a color"
+        );
+        colors.push(color);
     }
 }

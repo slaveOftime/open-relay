@@ -5,7 +5,8 @@ use super::app::{App, RateState, is_active_status, session_key};
 use super::constants::{SELECTED_ROW_BG, SPARKLINE_WIDTH};
 use super::table::{
     LayoutMode, SESSION_ID_WIDTH, format_bytes, rate_color, session_command_label,
-    session_status_style, session_title, sparkline, truncate,
+    session_program_status_span, session_status_style, session_title, session_title_spans,
+    sparkline, truncate,
 };
 use super::tree::{TreeEntry, TreeNode, TreeView};
 use crate::protocol::SessionSummary;
@@ -435,7 +436,10 @@ fn session_line_with_connector(
         .unwrap_or_default();
     let mut metrics = vec![(age, dim)];
     let title = session_title(session);
-    let min_title = UnicodeWidthStr::width(title.as_str()).min(TREE_MIN_TITLE_WIDTH);
+    let badge_width = session_program_status_span(session).map_or(0, |span| span.width() + 1);
+    let min_title = (UnicodeWidthStr::width(title.as_str()).min(TREE_MIN_TITLE_WIDTH)
+        + badge_width)
+        .min(remaining.saturating_sub(metrics[0].0.len() + 2));
     // Metrics are packed beside the title, not pinned across the terminal.
     // Preserve a recognizable title and age, then add output and rate.
     let mut metric_width = metrics[0].0.len();
@@ -465,7 +469,7 @@ fn session_line_with_connector(
             }),
         );
     }
-    if session.input_needed {
+    if session.input_needed && session.program_status.is_none() {
         add_metric("wait".into(), status_style);
     } else if !active {
         add_metric(session.status.clone(), dim);
@@ -482,12 +486,12 @@ fn session_line_with_connector(
     } else {
         title_budget
     };
-    let title = truncate(&title, title_width);
+    let title = session_title_spans(session, title_width);
     // Plan the optional chart against the complete row, then place it before
     // output bytes, matching the table's age / activity / output ordering.
     let used = spans.iter().map(Span::width).sum::<usize>()
         + 1
-        + UnicodeWidthStr::width(title.as_str())
+        + title.iter().map(Span::width).sum::<usize>()
         + 1
         + metric_width;
     let has_activity =
@@ -502,7 +506,10 @@ fn session_line_with_connector(
         );
     }
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(title, title_style));
+    spans.extend(title.into_iter().map(|mut span| {
+        span.style = title_style.patch(span.style);
+        span
+    }));
     for (text, style) in metrics {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(text, style));

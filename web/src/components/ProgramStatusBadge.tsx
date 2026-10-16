@@ -14,11 +14,11 @@ const blockedLabels = {
   auth: 'Authentication Required',
 }
 const variants: Record<ProgramStatus['state'], BadgeProps['variant']> = {
-  idle: 'stopped',
-  working: 'running',
-  done: 'accent',
-  blocked: 'input-needed',
-  error: 'failed',
+  idle: 'program-idle',
+  working: 'program-working',
+  done: 'program-done',
+  blocked: 'program-blocked',
+  error: 'program-error',
 }
 
 export default function ProgramStatusBadge({ report }: { report: ProgramStatus }) {
@@ -32,7 +32,7 @@ export default function ProgramStatusBadge({ report }: { report: ProgramStatus }
   return (
     <Badge
       variant={variants[report.state]}
-      className="whitespace-nowrap text-xs font-light"
+      className="max-w-full rounded-md px-2 whitespace-normal [overflow-wrap:anywhere] text-xs font-medium leading-4 tabular-nums"
       title={`Agent-reported (OSC 7501)${detail ? `: ${detail}` : ''}`}
     >
       {label}

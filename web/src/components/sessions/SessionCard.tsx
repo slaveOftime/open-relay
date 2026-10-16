@@ -69,10 +69,9 @@ export const SessionCard = memo(function SessionCard({
     ? 'text-[hsl(var(--foreground))]/70'
     : 'text-[hsl(var(--foreground))]'
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
+  // Retained program reports stay readable even after the process exits.
   const opacityClass =
-    session.status === 'stopped' || session.status === 'killed' || session.status === 'failed'
-      ? 'opacity-60'
-      : ''
+    isTerminalStatus(session.status) && !session.program_status ? 'opacity-60' : ''
 
   const deleteButton = (
     <Tooltip>

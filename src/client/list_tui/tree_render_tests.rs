@@ -580,3 +580,44 @@ fn tree_activity_chart_precedes_output_bytes_like_the_table() {
         assert_eq!(buffer[(output_x as u16, 0)].symbol(), "1");
     }
 }
+
+#[test]
+fn program_badges_keep_deep_unicode_tree_rows_bounded() {
+    use crate::session::program_status::{ProgramState, ProgramStatus};
+    let mut item = session();
+    item.title = Some("部署检查 🦀 e\u{301} 验证结果".repeat(12));
+    for state in [
+        ProgramState::Idle,
+        ProgramState::Working,
+        ProgramState::Done,
+        ProgramState::Blocked,
+        ProgramState::Error,
+    ] {
+        item.program_status = Some(ProgramStatus {
+            state,
+            id: None,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        });
+        for width in 0..=160 {
+            for depth in [0, 1, 8, 64] {
+                let (line, icon_x) = session_line_with_connector(
+                    &item,
+                    None,
+                    connector(depth),
+                    false,
+                    Instant::now(),
+                    width,
+                );
+                assert!(line.width() <= width, "{width}/{depth}: {}", text(&line));
+                if width > 0 {
+                    let buffer = render_line(line, width);
+                    assert_eq!(buffer[(icon_x as u16, 0)].symbol(), "●");
+                }
+            }
+        }
+    }
+}
