@@ -3,7 +3,7 @@ name: CI
 # Trigger policy: CI owns what the Rust build, the Rust test suite and the
 # release tooling consume. It deliberately does NOT list README.md or docs/:
 # documentation contracts run in CI-DOCS, so a docs-only PR never pays for the
-# three-OS matrix. It DOES list web/** (see below) because the web bundle is
+# four-target matrix. It DOES list web/** (see below) because the web bundle is
 # compiled into the binary: CI-WEB proves the bundle builds, and this workflow
 # proves the release build still embeds it.
 #
@@ -132,7 +132,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-24.04-arm is the same shipped target as the aarch64 Linux
+        # release artifact, tested natively (no cross toolchain, no qemu), so
+        # an arch-specific regression fails here instead of at tag time. It is
+        # a distinct runner label, not an extra axis: linux x64 and linux arm64
+        # cannot share one matrix entry. Free for public repositories.
+        # Swatinem/rust-cache already folds runner.arch into its cache key, so
+        # the two Linux entries do not share a cache.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 

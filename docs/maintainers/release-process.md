@@ -64,13 +64,19 @@ if using the website, explicitly run Actions → Release with an existing tag.
 
 1. Every platform checks out the exact tag. `scripts/release-version.py` sets
    the root Cargo manifest/lock version from it, without changing dependencies.
-2. Locked tests and release builds run for Linux x64, macOS Apple Silicon,
-   and Windows x64 (Windows tests run serially).
+2. Locked tests and release builds run for Linux x64, Linux arm64, macOS Apple
+   Silicon, and Windows x64 (Windows tests run serially). Linux arm64 builds on
+   a native `ubuntu-24.04-arm` runner, so the artifact is the binary the suite
+   actually exercised; there is no cross toolchain to configure.
 3. `scripts/release-package.py` creates ZIPs and SHA-256 sidecars. The workflow
    uploads them, then attaches `SHA256SUMS.txt`.
-4. npm's version is set from the tag; the three built binaries are bundled and
+4. npm's version is set from the tag; the four built binaries are bundled and
    published to `beta` or `latest`.
 5. Stable tags also publish the crate and commit the Homebrew version/hashes.
+   The formula deliberately covers only macOS Apple Silicon and Linux x64;
+   `npm/bin/oly.js` is the launcher that maps every supported platform, and a
+   release regression asserts the formula never names an asset the matrix does
+   not build.
 
 Cargo/npm version edits happen **only inside release checkouts**, not as version
 commits back to `main`. The stable-only Homebrew job commits only the formula.

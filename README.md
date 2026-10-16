@@ -57,8 +57,9 @@ framework. Use your shell for quick commands; use oly when a job needs a durable
 npm install -g @slaveoftime/oly
 ```
 
-The npm package bundles binaries for **Linux x64, macOS Apple Silicon, and
-Windows x64**. No GitHub asset download is needed during installation.
+The npm package bundles binaries for **Linux x64, Linux arm64, macOS Apple
+Silicon, and Windows x64**. No GitHub asset download is needed during
+installation.
 
 > **0.5.0-beta.1 is available:** a breaking preview, not the stable channel.
 > Stable installs still use the 0.3 line. Try `npm install -g @slaveoftime/oly@beta`

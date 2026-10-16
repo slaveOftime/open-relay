@@ -7,6 +7,7 @@ const { spawnSync } = require("child_process");
 
 const binaryNames = {
   "linux:x64": "oly-linux-x64",
+  "linux:arm64": "oly-linux-arm64",
   "darwin:arm64": "oly-darwin-arm64",
   "win32:x64": "oly-win32-x64.exe",
 };

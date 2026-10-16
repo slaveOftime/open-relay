@@ -49,7 +49,7 @@
 
 ## CI layout
 Workflows are scoped by change area, so a PR only runs what its diff can break:
-- `CI` (`ci.yml`) — Rust: fmt, clippy, the three-OS test matrix, audit, and the release-workflow regressions.
+- `CI` (`ci.yml`) — Rust: fmt, clippy, the four-target test matrix, audit, and the release-workflow regressions.
 - `CI-WEB` (`ci-web.yml`) — `web/**`: lint, vitest, build, Playwright.
 - `CI-DOCS` (`ci-docs.yml`) — Markdown, `docs/`, `skills/`, `src/**`: the offline documentation contracts.
 

@@ -34,6 +34,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: oly
             asset_name: oly-linux-amd64.zip
+          # Native arm64 runner rather than a cross toolchain: the shipped
+          # binary is the one the test suite above actually executed, and
+          # bundled C (libsqlite3-sys) needs no cross sysroot. Tracks the
+          # ubuntu-24.04-arm entry in ci.yml.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: oly
+            asset_name: oly-linux-arm64.zip
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: oly
@@ -196,16 +204,29 @@ jobs:
           LINUX_SHA="$(awk '{print $1}' dist/oly-linux-amd64.zip.sha256)"
           export VERSION MACOS_SHA LINUX_SHA
 
+          # The formula deliberately covers a subset of the release matrix
+          # (macOS arm64 + Linux x64); npm carries the wider set. Every asset
+          # the formula *does* declare must be produced above, or this step
+          # fails instead of publishing a stale checksum.
           ruby <<'RUBY'
           formula_path = "Formula/oly.rb"
           formula = File.read(formula_path)
           version = ENV.fetch("VERSION")
-          macos_sha = ENV.fetch("MACOS_SHA")
-          linux_sha = ENV.fetch("LINUX_SHA")
+
+          # Pair every checksum with the url directly above it. A
+          # "first sha256 after `on_linux do`" regex silently updates only the
+          # first branch the moment a stanza holds two platforms. Comment
+          # lines between the url and its checksum are allowed.
+          def set_sha(formula, asset, sha)
+            pattern = /(url "[^"]+\/#{Regexp.escape(asset)}"\n(?:\s*#[^\n]*\n)*\s*sha256 ")([^"]+)(")/
+            raise "Formula/oly.rb: no url entry for #{asset}" unless formula.match?(pattern)
+
+            formula.sub!(pattern, "\\1#{sha}\\3")
+          end
 
           formula.sub!(/^  version "[^"]+"/, %(  version "#{version}"))
-          formula.sub!(/(on_macos do.*?sha256 ")([^"]+)(")/m, "\\1#{macos_sha}\\3")
-          formula.sub!(/(on_linux do.*?sha256 ")([^"]+)(")/m, "\\1#{linux_sha}\\3")
+          set_sha(formula, "oly-macos-arm64.zip", ENV.fetch("MACOS_SHA"))
+          set_sha(formula, "oly-linux-amd64.zip", ENV.fetch("LINUX_SHA"))
 
           File.write(formula_path, formula)
           RUBY
@@ -334,23 +355,28 @@ jobs:
             trap 'rm -rf "$TMP_DIR"' EXIT
 
             LINUX_ZIP="$(find ../dist -type f -name 'oly-linux-amd64.zip' -print -quit)"
+            LINUX_ARM_ZIP="$(find ../dist -type f -name 'oly-linux-arm64.zip' -print -quit)"
             MACOS_ZIP="$(find ../dist -type f -name 'oly-macos-arm64.zip' -print -quit)"
             WINDOWS_ZIP="$(find ../dist -type f -name 'oly-windows-amd64.zip' -print -quit)"
 
             test -n "$LINUX_ZIP"
+            test -n "$LINUX_ARM_ZIP"
             test -n "$MACOS_ZIP"
             test -n "$WINDOWS_ZIP"
 
             unzip -j "$LINUX_ZIP" oly -d "$TMP_DIR"
             mv "$TMP_DIR/oly" bin/oly-linux-x64
+            unzip -j "$LINUX_ARM_ZIP" oly -d "$TMP_DIR"
+            mv "$TMP_DIR/oly" bin/oly-linux-arm64
             unzip -j "$MACOS_ZIP" oly -d "$TMP_DIR"
             mv "$TMP_DIR/oly" bin/oly-darwin-arm64
             unzip -j "$WINDOWS_ZIP" oly.exe -d "$TMP_DIR"
             mv "$TMP_DIR/oly.exe" bin/oly-win32-x64.exe
-            chmod +x bin/oly-linux-x64 bin/oly-darwin-arm64
+            chmod +x bin/oly-linux-x64 bin/oly-linux-arm64 bin/oly-darwin-arm64
 
             test -f bin/oly.js
             test -f bin/oly-linux-x64
+            test -f bin/oly-linux-arm64
             test -f bin/oly-darwin-arm64
             test -f bin/oly-win32-x64.exe
 

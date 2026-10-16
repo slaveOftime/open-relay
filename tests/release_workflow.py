@@ -159,14 +159,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
             root = Path(tmp)
             dist = root / "dist"
             dist.mkdir()
-            for name in ("linux", "macos", "windows"):
+            for name in ("linux", "macos", "windows", "linux-arm"):
                 (dist / f"oly-{name}.zip.sha256").write_text(f"abc123  oly-{name}.zip\n")
             subprocess.run(["bash", "-c", command], cwd=root, check=True, capture_output=True)
             lines = (root / "SHA256SUMS.txt").read_text().splitlines()
-            self.assertEqual(len(lines), 3)
+            self.assertEqual(len(lines), 4)
             self.assertEqual(
                 set(lines),
-                {f"abc123  oly-{name}.zip" for name in ("linux", "macos", "windows")},
+                {f"abc123  oly-{name}.zip" for name in ("linux", "macos", "windows", "linux-arm")},
             )
 
     def test_npm_retry_runs_from_workspace_root_and_can_repeat(self):
@@ -181,6 +181,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             (root / "README.md").write_text("release fixture\n")
             for platform, entry in (
                 ("linux-amd64", "oly"),
+                ("linux-arm64", "oly"),
                 ("macos-arm64", "oly"),
                 ("windows-amd64", "oly.exe"),
             ):
@@ -214,11 +215,120 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertEqual(len((root / "publish-calls").read_text().splitlines()), 2)
             for name, platform in (
                 ("oly-linux-x64", "linux-amd64"),
+                ("oly-linux-arm64", "linux-arm64"),
                 ("oly-darwin-arm64", "macos-arm64"),
                 ("oly-win32-x64.exe", "windows-amd64"),
             ):
                 self.assertEqual((bin_dir / name).read_text(), f"fixture for {platform}\n")
             self.assertEqual((root / "npm/README.md").read_text(), "release fixture\n")
+
+    def test_npm_bundle_and_launcher_agree_on_supported_platforms(self):
+        """The launcher resolves one file per platform; the publish step must
+        bundle exactly those files. A mismatch ships a package whose launcher
+        exits with 'unsupported platform/arch' on a platform npm accepted."""
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "npm/bin/oly.js").read_text()
+        mapped = set(
+            re.findall(r'^\s*"(?:linux|darwin|win32):(?:x64|arm64)": "([^"]+)"', launcher, re.MULTILINE)
+        )
+        self.assertTrue(mapped, "oly.js declares no platform map")
+
+        command = block(step("Bundle binaries + publish to npm"), "command", 10)
+        bundled = set(re.findall(r"bin/(oly-[A-Za-z0-9._-]+)", command))
+        self.assertEqual(
+            bundled,
+            mapped,
+            f"bundle {sorted(bundled)} != launcher map {sorted(mapped)}",
+        )
+
+    def test_homebrew_formula_declares_only_built_assets(self):
+        """The formula rewrites checksums for assets it names; naming an asset
+        the release matrix does not build would leave a stale checksum."""
+        root = Path(__file__).resolve().parents[1]
+        formula = (root / "Formula/oly.rb").read_text()
+        declared = set(re.findall(r"/(oly-[A-Za-z0-9._-]+\.zip)\"", formula))
+        built = set(re.findall(r"^\s+asset_name: (oly-\S+)$", WORKFLOW, re.MULTILINE))
+        self.assertTrue(declared, "formula declares no download url")
+        self.assertTrue(built, "release matrix declares no asset_name")
+        self.assertEqual(declared - built, set(), "formula names assets the release does not build")
+
+    def formula_update_script(self):
+        script = block(step("Update Formula/oly.rb"), "run", 8)
+        match = re.search(r"ruby <<'RUBY'\n(.*?)\nRUBY", script, re.DOTALL)
+        self.assertIsNotNone(match, "formula updater heredoc missing")
+        return script, match.group(1)
+
+    @unittest.skipUnless(shutil.which("ruby"), "Ruby unavailable")
+    @unittest.skipUnless(shutil.which("bash"), "bash unavailable")
+    def test_homebrew_formula_update_rewrites_every_declared_checksum(self):
+        script, _ = self.formula_update_script()
+        root = Path(__file__).resolve().parents[1]
+        original = (root / "Formula/oly.rb").read_text()
+        shas = {"oly-macos-arm64.zip": "a" * 64, "oly-linux-amd64.zip": "b" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "Formula").mkdir()
+            (work / "Formula/oly.rb").write_text(original)
+            dist = work / "dist"
+            dist.mkdir()
+            for asset, sha in shas.items():
+                (dist / f"{asset}.sha256").write_text(f"{sha}  {asset}\n")
+            subprocess.run(
+                ["bash", "-c", script],
+                cwd=work,
+                env={**os.environ, "VERSION": "v9.9.9"},
+                check=True,
+                capture_output=True,
+            )
+            updated = (work / "Formula/oly.rb").read_text()
+
+        self.assertIn('  version "9.9.9"', updated)
+        declared = set(re.findall(r"/(oly-[A-Za-z0-9._-]+\.zip)\"", original))
+        self.assertEqual(
+            set(shas),
+            declared,
+            "formula platforms and the workflow's checksum variables drifted apart",
+        )
+        for asset, sha in shas.items():
+            with self.subTest(asset=asset):
+                # The checksum is rewritten on the line after the matching url.
+                lines = updated.splitlines()
+                index = next(i for i, line in enumerate(lines) if f"/{asset}\"" in line)
+                self.assertIn(f'sha256 "{sha}"', lines[index + 1])
+        # Exactly the version line plus one checksum line per declared asset.
+        before, after = original.splitlines(), updated.splitlines()
+        self.assertEqual(len(before), len(after))
+        self.assertEqual(
+            len([i for i, (a, b) in enumerate(zip(before, after)) if a != b]), 1 + len(shas)
+        )
+
+    @unittest.skipUnless(shutil.which("ruby"), "Ruby unavailable")
+    @unittest.skipUnless(shutil.which("bash"), "bash unavailable")
+    def test_homebrew_formula_update_rejects_an_undeclared_asset(self):
+        """A formula missing a platform must fail the release loudly rather
+        than silently publish a stale checksum for it."""
+        script, _ = self.formula_update_script()
+        root = Path(__file__).resolve().parents[1]
+        original = (root / "Formula/oly.rb").read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "Formula").mkdir()
+            (work / "Formula/oly.rb").write_text(
+                original.replace('url "https://github.com/slaveOftime/open-relay/releases/download/v#{version}/oly-linux-amd64.zip"\n', "")
+            )
+            dist = work / "dist"
+            dist.mkdir()
+            for asset in ("oly-macos-arm64.zip", "oly-linux-amd64.zip"):
+                (dist / f"{asset}.sha256").write_text(f"{'c' * 64}  {asset}\n")
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=work,
+                env={**os.environ, "VERSION": "v9.9.9"},
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("oly-linux-amd64.zip", result.stderr)
 
 
 if __name__ == "__main__":
