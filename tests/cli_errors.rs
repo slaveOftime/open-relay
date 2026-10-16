@@ -88,10 +88,11 @@ fn list_json_without_daemon_prints_machine_readable_output() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
-    assert_eq!(value["items"], serde_json::json!([]));
-    assert_eq!(value["total"], serde_json::json!(0));
-    assert_eq!(value["offset"], serde_json::json!(0));
-    assert_eq!(value["limit"], serde_json::json!(10));
+    // Frozen empty-list shape: additions must be deliberate.
+    assert_eq!(
+        value,
+        serde_json::json!({"items": [], "total": 0, "offset": 0, "limit": 10})
+    );
     assert!(
         !stdout.contains("No sessions"),
         "json output should not mix table/hint text into stdout: {stdout}"
@@ -386,6 +387,46 @@ fn logs_session_not_found_exits_nonzero() {
     assert!(
         stderr.contains("not found") || stderr.contains("session") || stderr.contains("error"),
         "expected session-not-found message, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly logs – --since cursor tokens are validated client-side
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logs_invalid_since_cursor_tokens_are_rejected_before_ipc() {
+    use base64::Engine as _;
+
+    let tmp = make_tmp_dir("logs_bad_cursor");
+    for token in ["", "nonsense", "djI"] {
+        let output = oly_cmd(&tmp)
+            .args(["logs", "abc1234", "--since", token])
+            .output()
+            .expect("failed to run oly logs --since");
+        assert!(
+            !output.status.success(),
+            "token {token:?} must be rejected before any IPC attempt"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid --since cursor token"),
+            "token {token:?}: {stderr}"
+        );
+    }
+
+    // A well-formed token for a different session names both sides, so a
+    // borrowed cursor cannot silently read the wrong window.
+    let foreign = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode("v1|other-session|1|0");
+    let output = oly_cmd(&tmp)
+        .args(["logs", "abc1234", "--since", &foreign])
+        .output()
+        .expect("failed to run oly logs --since");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("belongs to session other-session") && stderr.contains("not abc1234"),
+        "{stderr}"
     );
 }
 

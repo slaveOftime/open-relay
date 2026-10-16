@@ -50,7 +50,6 @@ expose `oly_<name>_total`. `label=` values come from code, listed below.
 | `http_request_seconds{label=<route>}` | axum `/api/*` middleware | full handled time per route template; SSE/NDJSON skipped on purpose |
 | `attach_snapshot_seconds` | `AttachPump::subscribe` | journal snapshot + engine state build; shared by IPC, WebSocket and relayed attaches |
 | `attach_init_seconds{label=local\|proxied}` | WS handler, init frame sent | browser-side time-to-first-byte; `proxied − attach_snapshot` ≈ federation relay cost |
-| `attach_clients_total{label=local\|proxied}` | WS handler | attach mix across transports |
 | `attach_resyncs_total` | pump | one per client-lag/gap episode (broadcast ring overflow) |
 | `attach_resync_bytes_total` | pump | journal bytes replayed to close gaps; grows ⇒ clients can't keep up |
 | `attach_credit_closes_total` | pump credit gate | clients that stalled and were dropped |
@@ -78,6 +77,75 @@ Scenario: 5 sessions, of which one live session with a 21–28 MB journal
 | journal append | 13.3 µs avg (9.4k records during 28 MB flood) | — | writer path is not the bottleneck |
 | journal fsync | 5.6 µs avg (tmpfs) | — | treat as lower bound only |
 | attach snapshot (idle session) | 36–44 µs | — | `attach_snapshot_seconds` |
+
+## Real-disk capacity and reconnect baseline: 2026-10-16
+
+The 2026-09-21 baseline ran on tmpfs, so its `journal_sync` numbers were a
+lower bound. This is the real-disk counterpart, with the client fleet
+reconnecting under sustained output instead of idling.
+
+- **Platform:** Windows 11 Pro build 10.0.26300, x86_64, Intel Core i7-8700K
+  @ 3.70 GHz, 31.7 GiB RAM, release build (fat LTO, `opt-level = "z"`).
+- **Disk:** `C:` NTFS system volume (the host exposes Samsung 980 PRO 1TB /
+  970 PRO 512GB NVMe drives; the state dir is on the boot drive, not a
+  RAM-backed filesystem). Free before 31,735,304,192 B (29.56 GiB), after
+  31,707,910,144 B (29.53 GiB); 900.7 GiB used.
+- **Sessions:** 10 — `flood` (bulk writer, ~10k lines/s while live),
+  `chatty` (1 line/s), 8 idle `cmd` shells.
+- **Clients:** 2 concurrent `oly attach --observe` observers per phase.
+- **History size:** 16,067,715 B journal on disk when `flood` was stopped
+  (single segment; appender payload 6,739,319 B, ~2.4× framing overhead),
+  produced by ~259k lines in ~25–30 s of live flooding.
+
+Reproduction (PowerShell; isolated daemon, never the real state dir):
+
+```powershell
+$env:OLY_STATE_DIR = "$env:TEMP\oly-bench"; $env:OLY_SOCKET_NAME = 'oly-bench-sock'
+Set-Content "$env:OLY_STATE_DIR\config.json" '{"http_port": 15999}'
+oly daemon start --detach --no-auth-without-ask
+oly start --detach --title flood -- cmd /c '(for /L %i in (1,1,600000) do @echo line %i with padding) & ping -n 601 127.0.0.1 >nul'
+oly start --detach --title chatty -- cmd /c '(for /L %k in (1,1,1000000) do @(echo chatty %k & ping -n 2 127.0.0.1 >nul))'
+# then per phase: 2× `oly attach <id> --observe` in the background, a
+# /api/metrics snapshot, and `OLY_TIMING=1 oly ls --limit 500`; finally
+# `oly stop <flood>` and `oly logs <flood> --tail 40` / `--cursor`.
+```
+
+`oly ls` daemon-side is `ipc: response (list)` minus `ipc: connected
+(list)` from `OLY_TIMING=1`; attach numbers come from
+`attach_snapshot_seconds` snapshots and the observers' `attach:` marks.
+
+| Observation | Value |
+|---|---|
+| list RPC, `flood` live (~10k lines/s) | 38–74 ms (5 runs) |
+| list RPC, `flood` stopped | 23.6–25.3 ms (5 runs) |
+| `oly ls` wall clock, live / stopped | 148–269 ms / 100–103 ms |
+| `logs --tail 40` on the stopped 16 MB journal, wall / daemon `logs_read` | 457 ms / 257 ms |
+| `logs --cursor`, wall / daemon | 76 ms / 23 ms |
+| observer init on live flood (`attach: ipc connected` → `init frame received`) | 35 ms (73.2−38.1) |
+| `attach_snapshot_seconds` | ~60–90 µs (5 attaches, incl. flood) |
+| `attach_resyncs_total` / `attach_resync_bytes_total` | 322 / 4.15 MB (~13 KB per resync) |
+| `attach_credit_closes_total` | 0 (counter never registered) |
+| journal appends | 259,360 records, avg 15.0 µs, max 3.73 ms (99.8% ≤100 µs) |
+| journal fsyncs | 615 calls, avg 7.1 ms, max 397 ms (1 ≤0.5 ms; 479 ≤5 ms; 606 ≤10 ms) |
+
+Notes:
+
+- **fsync is the real-disk story:** avg 7.1 ms vs 5.6 µs on tmpfs, with a
+  397 ms tail spike. `journal_append` stays ~15 µs, so writer-side CPU is
+  still not the bottleneck.
+- **Live observers lag under a 10k-lines/s writer and self-heal by
+  resync:** ~4.15 MB of journal replayed across 322 resyncs in ~30 s
+  (~13 KB each — small ring gaps, not full re-reads). No client was
+  credit-closed; `attach_credit_closes_total` never registered.
+- **`oly ls` stays bounded under load:** ~40–70 ms daemon-side while the
+  flood runs vs ~24 ms after it stops, on 10 live sessions. The remaining
+  gap is live-row work while a session writes ~0.6 MB/s of durable
+  journal.
+- The run consumed ~26 MiB of disk in total (16 MB journal + observer
+  output + db/WAL). The script's final `BENCH-DONE`/`disk-after` lines were
+  lost to a cleanup error after `flood` stopped (`Stop-Process` on an
+  observer that had already exited); disk-after was measured immediately
+  after with the state tree still present.
 
 ## Findings & fixes
 
@@ -227,9 +295,9 @@ logs; dedicated metric counters and latency histograms are not implemented.
   owning node's `attach_snapshot_seconds` is the per-attach relay cost;
   no direct RPC-level relay histogram exists yet (would go in
   `relay_streaming_rpc` / `proxy_rpc_stream`).
-- **journal_sync on real disks**: baseline above is tmpfs; rerun the
-  recipe with `OLY_STATE_DIR` on the actual data volume before trusting
-  append-latency claims.
+- **journal_sync on real disks**: done — see the 2026-10-16 real-disk
+  capacity baseline (avg 7.1 ms / 397 ms max fsync on the boot NVMe), so
+  append-latency claims no longer rest on tmpfs numbers.
 - **Process start**: `oly ls` wall p50 is 4 ms, of which ~2 ms is binary
   startup + config + socket connect; only worth pursuing if attach or
   list ever regresses back toward it.

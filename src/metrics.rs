@@ -21,8 +21,9 @@
 //! - `oly_attach_init_seconds{path}` — time from attach subscribe to the
 //!   init frame being ready (`local` = journal snapshot + engine state +
 //!   scrollback seed; `proxied` = same on the owning node plus relay).
-//! - `oly_attach_resyncs_total`, `oly_attach_clients_total` — stream
-//!   health counters (a healthy system resyncs ~never).
+//! - `oly_attach_resyncs_total`, `oly_attach_resync_bytes_total`,
+//!   `oly_attach_credit_closes_total` — stream health counters (a healthy
+//!   system resyncs ~never and never drops a stalled client).
 //! - `oly_journal_append_seconds`, `oly_journal_sync_seconds` — the
 //!   appender thread's write() and fsync() latencies. These are the
 //!   usual suspects when *everything* gets slow at once: a stalling

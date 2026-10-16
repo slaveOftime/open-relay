@@ -1,17 +1,17 @@
 //! Wall-clock retention sweeper for stopped sessions.
 //!
-//! Companion to the live-session byte-budget retention in
-//! `crate::session::runtime` — that one trims the oldest incarnations
-//! of a running session's journal at every checkpoint; this one
-//! deletes the whole journal + DB row of a stopped session after a
-//! configurable number of days.
+//! The active production lever is **wall-clock retention**: stop the
+//! accumulation of killed/failed/stopped sessions by deleting a whole
+//! session directory + DB row after a configurable number of days.
 //!
-//! Two orthogonal levers for two different problems:
-//!
-//! - **byte budget**: cap on persisted journal size, checked at each
-//!   checkpoint, so a long-running session cannot fill the disk while running.
-//! - **wall-clock retention**: cap on stopped-session age, so killed/failed
-//!   CI runs do not accumulate indefinitely.
+//! A second, byte-budget lever exists only as internal plumbing:
+//! `crate::session::runtime` still runs a checkpoint-gated sweep that
+//! can trim sealed incarnations of a running session's journal. It is
+//! disabled in production — the daemon constructs the store with
+//! budget `0` and removed config keys fail loudly — because a byte cap
+//! cannot bound the *current* incarnation. Do not describe it as a
+//! supported live quota; see the compatibility policy and
+//! `ARCHITECTURE.md` (“Retention”).
 //!
 //! The sweeper runs every [`JOURNAL_RETENTION_SWEEP_INTERVAL`]
 //! (one hour by default) and is intentionally synchronous against

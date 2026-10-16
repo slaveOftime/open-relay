@@ -116,10 +116,12 @@ pub struct SessionStore {
     /// TTL for evicting completed sessions, in seconds. Atomic so the
     /// daemon's config hot-reload can adjust it without a restart.
     pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
-    /// Byte-budget cap on a session's persisted journal, shared with
+    /// Byte budget for a session's persisted journal, shared with
     /// `SessionRuntime` so every retention sweep across the process sees
-    /// the same value (0 = unlimited). Updated on the
-    /// daemon's config hot-reload pass.
+    /// the same value (0 = unlimited). Production passes `0` (live
+    /// deletion disabled); tests set a non-zero budget to exercise the
+    /// checkpoint-gated retention primitives. There is no hot-reload
+    /// setter: changing the cap requires a restart.
     pub(super) journal_byte_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Reloadable rules applied when a completed journal is scanned.
     pub(super) resume_patterns: ArcSwap<Vec<ResumePattern>>,
@@ -187,7 +189,7 @@ impl SessionStore {
             .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Handle to the shared journal byte cap so a retention sweep
+    /// Handle to the shared journal byte budget so a retention sweep
     /// scheduled by one session can read it through the runtime's `Arc`
     /// clone. The handle stays valid for the daemon's lifetime
     /// (the `SessionStore` itself is `Arc`-shared, so this is just a

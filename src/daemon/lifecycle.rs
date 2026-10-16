@@ -612,7 +612,12 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let (store, startup_failed_sessions) = {
         let store = SessionStore::with_journal_byte_cap(
             config.limits.session_eviction_seconds,
-            0, // Live journal deletion is disabled.
+            // Live journal deletion is disabled: a byte cap cannot bound
+            // the current incarnation, so production stores run
+            // "unlimited" and removed config keys fail explicitly instead
+            // of silently doing nothing. Only `journal_retention_days`
+            // (stopped-session age) deletes production state.
+            0,
             db.clone(),
         );
         store.set_resume_patterns(config.resume.patterns.clone());

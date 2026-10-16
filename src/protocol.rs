@@ -252,12 +252,11 @@ pub enum RpcRequest {
         id: String,
         from_byte_offset: Option<u64>,
         /// Whether this stream reports applied-cursor credits and is
-        /// therefore gated on them (credit-gated). Local interactive
-        /// clients set
-        /// `true` and ack; node-relayed subscriptions must set `false`
-        /// because the relay cannot forward mid-stream credits (fail-open
-        /// until direct remote streams land). Defaults to `false`
-        /// (safe: no enforcement) when absent.
+        /// therefore gated on them (credit-gated). The CLI and web clients
+        /// set `true` and ack; node-relayed subscriptions carry the client's
+        /// flag and the relay forwards `AttachAppliedCursor` mid-stream, so
+        /// the owning node gates remote clients too. Defaults to `false`
+        /// (fail-open: no enforcement) when absent.
         #[serde(default)]
         credited: bool,
         /// Incarnation the `from_byte_offset` cursor was issued by. Resume is
@@ -843,6 +842,55 @@ mod tests {
         }
     }
 
+    /// Wire contract for the private JSON protocol: unknown fields are
+    /// ignored (forward-compatible additions), while missing required
+    /// fields, unknown type tags and malformed base64 fail loudly. The
+    /// federation wire is stricter, but per serde rules: field-bearing
+    /// frames reject unknown fields, while the unit `joined` variant has
+    /// no fields to validate and tolerates extra keys. Both behaviors are
+    /// frozen here; the handshake `version` is the compatibility gate.
+    #[test]
+    fn wire_contract_ignores_unknown_fields_and_enforces_required_ones() {
+        // Unknown fields: ignored on both request and response.
+        let request: RpcRequest = serde_json::from_str(
+            r#"{"type":"session_info","id":"s1","future_field":{"nested":true}}"#,
+        )
+        .expect("unknown request field must be ignored");
+        assert!(matches!(request, RpcRequest::SessionInfo { id } if id == "s1"));
+        let response: RpcResponse = serde_json::from_str(r#"{"type":"ack","future_field":1}"#)
+            .expect("unknown response field must be ignored");
+        assert!(matches!(response, RpcResponse::Ack));
+
+        // Missing required fields and unknown tags are hard errors.
+        for json in [
+            r#"{"type":"session_info"}"#,
+            r#"{"type":"attach_input","id":"s1"}"#,
+            r#"{"type":"attach_input","id":"s1","data":"%%%","wait_for_change":false}"#,
+            r#"{"type":"not_a_real_request","id":"s1"}"#,
+            r#"["not","an","object"]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RpcRequest>(json).is_err(),
+                "must be rejected: {json}"
+            );
+        }
+
+        // Federation frames: unknown fields are rejected on field-bearing
+        // variants (the handshake binds versions)...
+        assert!(
+            serde_json::from_str::<NodeWsMessage>(r#"{"type":"error","message":"x","future":1}"#)
+                .is_err(),
+            "unknown federation fields must be rejected on field-bearing frames"
+        );
+        // ...but the unit `joined` variant has no fields to validate, so
+        // serde cannot reject extras there. Freeze the actual behavior.
+        assert!(matches!(
+            serde_json::from_str::<NodeWsMessage>(r#"{"type":"joined","future_field":1}"#)
+                .expect("unit-variant frames tolerate extra keys today"),
+            NodeWsMessage::Joined
+        ));
+    }
+
     #[test]
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
@@ -987,8 +1035,8 @@ pub struct SessionSummary {
     pub background_color: Option<String>,
     /// Bytes currently retained on disk for this session's journal
     /// (sealed parts only). `None` until the first checkpoint-gated
-    /// sweep has run, so the UI can distinguish "cap is happily off"
-    /// from "cap is firing".
+    /// sweep has run. With live deletion disabled in production this
+    /// tracks journal growth, not a cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_bytes_retained: Option<u64>,
     /// Cumulative count of journal retention sweeps run for this session.

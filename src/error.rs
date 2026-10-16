@@ -1,3 +1,20 @@
+//! Application error categories.
+//!
+//! These variants are the branch points for users and scripts:
+//! `DaemonUnavailable` means the local IPC endpoint could not be reached or
+//! answered; `RequestFailed` carries a daemon-side rejection of a request
+//! that *was* delivered (for example `session not running: <id>`);
+//! `Protocol` is a wire-contract violation (malformed frame, unsupported
+//! version, stale cursor); the remaining variants are environment failures.
+//!
+//! Honesty rules:
+//! - A delivered-but-rejected request is never reported as unavailable, and
+//!   an unavailable daemon is never reported as a request failure.
+//! - Unsupported capabilities are explicit refusals, never a success-shaped
+//!   fallback or a silently different behavior. A dedicated
+//!   capability-negotiation error arrives with the planned public interface;
+//!   until then, do not invent success paths for unknown versions.
+
 use std::io;
 
 use thiserror::Error;
