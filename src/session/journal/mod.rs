@@ -1778,6 +1778,32 @@ mod tests {
     /// incarnation or a truthful prefix of it, but never a hole; once
     /// deletion finishes, cursors into it fail loudly
     /// (silent "truncated successfully" would misrepresent the user data).
+    /// Whether a read error is retention winning its race with this reader
+    /// rather than a defect in the reader: the segment vanished (NotFound),
+    /// was caught mid-delete, or was read while only partially written
+    /// (InvalidData).
+    ///
+    /// Windows reports a file in the delete-pending state — what
+    /// `fs::remove_file` leaves behind until the last handle closes — as
+    /// ERROR_ACCESS_DENIED (os error 5). Rust opens segments with
+    /// FILE_SHARE_DELETE, so retention can delete one out from under a reader
+    /// and its next open of that name is denied; that is the same benign
+    /// outcome, not a read defect.
+    fn retention_won_the_race(err: &io::Error) -> bool {
+        matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+        ) || (cfg!(windows) && err.kind() == io::ErrorKind::PermissionDenied)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retention_race_accepts_the_windows_delete_pending_denial() {
+        let denied = io::Error::from_raw_os_error(5);
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert!(retention_won_the_race(&denied));
+    }
+
     #[test]
     fn retention_concurrent_with_readers_never_shows_a_hole() {
         let dir = test_session_dir("retention_race");
@@ -1827,14 +1853,11 @@ mod tests {
                             }
                         }
                     }
-                    // Retention may legitimately win the race.
-                    Err(err) => assert!(
-                        matches!(
-                            err.kind(),
-                            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
-                        ),
-                        "unexpected read error: {err}"
-                    ),
+                    // Retention may legitimately win the race; see
+                    // `retention_won_the_race` for why a Windows denial counts.
+                    Err(err) => {
+                        assert!(retention_won_the_race(&err), "unexpected read error: {err}")
+                    }
                 }
             }
         });
