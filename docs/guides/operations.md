@@ -17,7 +17,7 @@ The size breakdown separates the four things people confuse:
 | `sqlite` | The session database and its `-wal`/`-shm` companions |
 | `logs` | Daemon logs under `<STATE_DIR>/logs` |
 
-A size scan that hits its entry budget reports `partial` and its numbers are a lower bound. The `journal` column is not "all disk usage" — declared uploads, SQLite, and logs are separate.
+A size scan that hits its entry budget or encounters a read/metadata error reports `partial` and its numbers are a lower bound. Symlinks are not followed. The `journal` column is not "all disk usage" — declared uploads, SQLite, and logs are separate.
 
 ### Thresholds
 
@@ -42,23 +42,23 @@ Refusals name the reason and the threshold to change, and are counted as `disk_g
 
 - Existing sessions are never killed, paused, or evicted by a disk sample, low or not.
 - It does not reserve space: writes after the check (including by other processes) can still fill the volume. Use filesystem quotas or OS-level monitoring for hard limits.
-- Concurrent starts reserve a slot under one lock and recheck immediately before the PTY spawn, so a burst of starts cannot all squeeze past one reading.
+- Concurrent starts reserve a session slot under one lock and recheck the sample when their blocking spawn worker begins. This does not reserve disk bytes: multiple starts can pass the same reading, and filesystem/PTY preparation can race later writes.
 - Journal deletion stays a separate, explicit policy: `journal_retention_days` removes stopped/killed/failed sessions on an hourly sweep. Live journals are never auto-deleted. Each sweep validates the session id, deletes files before the database row, and counts failures per stage (`retention_sweep_failures_total{label=unsafe_id|dir|db}`), so a failed sweep is retried rather than silently skipped.
 
-Related metrics: `state_disk_free_bytes` (the series is removed when free space becomes unknown), `state_disk_bytes{label=journal|uploads|sqlite|logs}`, `disk_guard_decisions_total`, `retention_sweep_failures_total`, `retention_sessions_evicted_total`.
+Related metrics: `state_disk_free_bytes` (the series is removed when free space becomes unknown; disk gauges expire at the sampling-time freshness deadline even if the sampler stops), `state_disk_bytes{label=journal|uploads|sqlite|logs}`, `disk_guard_decisions_total`, `retention_sweep_failures_total`, `retention_sessions_evicted_total`.
 
 ## Diagnostics: liveness is not readiness
 
 `oly daemon status` answers liveness and then prints the read-only diagnostic summary: version, `Started at`, readiness, supervised-component states, disk capacity, failure-record paths, and affected sessions.
 
 - **Liveness** — `GET /api/health` (public) is "the daemon answered". A degraded background component never makes the process look dead.
-- **Readiness** — `GET /api/ready` (public) returns `200` only while every ready-critical component runs, otherwise `503` with the reasons. `oly daemon status` shows `DEGRADED` with the same reasons.
+- **Readiness** — `GET /api/ready` (public) returns `200` only while every ready-critical task runs and an enabled disk guard permits new starts, otherwise `503` with component/admission states. Public probes never include private failure text or filesystem paths; use `oly daemon status` for detailed reasons. Task liveness does not prove individual tick progress or a successful free-space probe when the guard is disabled. Detached startup waits for IPC liveness, not readiness, so degraded daemons remain inspectable.
 
 Supervised components are `http`, `sse_encoder`, `activity_sampler`, `notification_monitor`, and `disk_sampler` (ready-critical), plus `config_reloader` and `journal_retention` (supervised and reported, but their failure does not gate readiness). A component that exits or panics is restarted with a bounded budget (three restarts, 1 s/2 s/4 s backoff) and then reported as `failed` with its reason; `disabled` marks intentional absence such as HTTP under `--no-http`. The daemon itself keeps answering IPC throughout.
 
 - **Failure records** — the report lists the exact paths on the owning machine: the log directory, `logs/daemon-crash.log` (Rust panics), and `logs/daemon-stderr.log`.
-- **Affected sessions** — starts reserved but never committed (a crash mid-start) and sessions that ended in `failed`, newest first, capped at 20 with the total reported.
-- **Remote owners** — `oly daemon status --node <NAME>` relays the summary from a secondary's daemon; the primary never substitutes its own disk numbers. `--json` prints the same report for tooling.
+- **Affected sessions** — current in-flight start reservations (id order), then sessions that ended in `failed` (newest first), capped at 20 with the total reported. Reservations are volatile and do not survive a daemon crash. Failed metadata queries produce `diagnostic_errors` and an unknown (`null`) total, never a fabricated empty success.
+- **Remote owners** — `oly daemon status --node <NAME>` relays the summary from a secondary's daemon; the primary never substitutes its own disk numbers or liveness. If the local relay is unavailable, remote status fails explicitly rather than claiming the secondary is stopped. `--json` prints the same report for tooling.
 
 The summary is assembled from metadata only: no terminal content, input, environment, identity seeds, or credentials. `oly export <id>` is a separate, explicit terminal-bytes export and is never part of a diagnostic summary. Even so, treat any diagnostic text as potentially sensitive and review it before sharing.
 

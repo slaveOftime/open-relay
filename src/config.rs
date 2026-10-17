@@ -9,10 +9,9 @@ use crate::error::Result;
 pub const DEFAULT_SCREEN_SCROLLBACK_ROWS: usize = 5000;
 
 /// Default free-space floor (1 GiB) below which `disk_guard_enabled` refuses
-/// new sessions. Chosen from the real-disk capacity baseline
-/// (PERFORMANCE.md): a 10-session state used ~16 MiB, so 1 GiB leaves ~60x
-/// headroom while catching a volume that is genuinely out of room. It is a
-/// refusal threshold, not a quota.
+/// new sessions. This is an operator-tunable safety margin, not a bound
+/// derived from session count: journal growth depends on workload and time.
+/// It is a refusal threshold, not a quota or a capacity guarantee.
 pub const DEFAULT_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default free-space warning threshold (2 GiB): warn (log + status) before

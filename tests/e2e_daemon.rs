@@ -2065,6 +2065,99 @@ fn e2e_daemon_status_reports_not_running() {
     );
 }
 
+#[test]
+fn e2e_public_readiness_and_private_status_agree_on_disk_admission() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_disk_readiness");
+    fs::write(
+        tmp.join("oly").join("config.json"),
+        serde_json::to_vec(&json!({
+            "disk_guard_enabled": true,
+            "disk_min_free_bytes": u64::MAX,
+            "disk_warn_free_bytes": u64::MAX,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = pick_free_port();
+    let _daemon = start_daemon_http_authenticated(&tmp, port, "benign-readiness-fixture");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let health = client
+            .get(format!("http://127.0.0.1:{port}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let ready = client
+            .get(format!("http://127.0.0.1:{port}/api/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let public: serde_json::Value =
+            serde_json::from_slice(&ready.bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            public,
+            json!({"ready": false, "unready_reasons": ["disk guard is below_minimum"]})
+        );
+        let metrics = client
+            .get(format!("http://127.0.0.1:{port}/api/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), reqwest::StatusCode::UNAUTHORIZED);
+    });
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let private: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(private["alive"], true);
+    assert_eq!(private["ready"], false);
+    assert!(private["disk"]["free_bytes"].as_u64().is_some());
+    assert_eq!(private["disk"]["guard_decision"], "below_minimum");
+    let start = oly_cmd(&tmp)
+        .args(["start", "--detach", "--", "sh"])
+        .output()
+        .unwrap();
+    assert!(!start.status.success());
+    assert!(String::from_utf8_lossy(&start.stderr).contains("below the floor"));
+    let list = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(list.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()["total"],
+        0
+    );
+}
+
+#[test]
+fn e2e_remote_daemon_status_without_a_relay_is_unknown_not_stopped() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_remote_status_no_relay");
+    for json in [false, true] {
+        let mut cmd = oly_cmd(&tmp);
+        cmd.args(["daemon", "status", "--node", "worker1"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "must not fabricate remote liveness"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot determine status of node")
+        );
+    }
+}
+
 /// The `oly logs` surface: `--wait` gates a read, `--json` shapes any read,
 /// cursors continue a read without repeats, and meaningless combinations
 /// are usage errors instead of silent misreads.

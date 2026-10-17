@@ -32,7 +32,8 @@ use super::{
 
 /// Every supervised daemon-lifetime component: (name, ready-critical?).
 /// Ready-critical components gate `/api/ready`, the `DaemonStatus` RPC, and
-/// the daemon-start readiness probe. Registered before any spawn so
+/// the diagnostic readiness report. Detached startup still waits for IPC
+/// liveness, so a degraded daemon remains inspectable. Registered before any spawn so
 /// readiness is never trivially true while a component is still starting.
 const SUPERVISED_COMPONENTS: &[(&str, bool)] = &[
     // HTTP is registered here even under `--no-http`, where it is marked
@@ -246,6 +247,11 @@ pub async fn start(
 
 pub async fn status(config: AppConfig, node: Option<String>, json: bool) -> Result<()> {
     if !daemon_is_healthy(&config).await {
+        if let Some(node) = &node {
+            return Err(AppError::DaemonUnavailable(format!(
+                "local relay is unavailable; cannot determine status of node '{node}'"
+            )));
+        }
         if json {
             // Machine-readable "not running" so scripts do not have to parse
             // prose; still exit 0 like the human path (a stopped daemon is
@@ -287,6 +293,9 @@ pub async fn status(config: AppConfig, node: Option<String>, json: bool) -> Resu
         println!("Daemon status for node: {}", node);
         return match ipc::send_request_checked(&config, request).await? {
             RpcResponse::DaemonStatus { status } => {
+                if let Some(started_at) = &status.started_at {
+                    println!("Started at:   {}", format_status_timestamp(started_at));
+                }
                 print_daemon_status_report(&status);
                 Ok(())
             }
@@ -417,13 +426,21 @@ fn print_daemon_status_report(report: &DaemonStatusReport) {
         }
     }
 
+    for err in &report.diagnostic_errors {
+        eprintln!("warning: incomplete diagnostic summary: {err}");
+    }
     if !report.affected_sessions.is_empty() {
-        println!("Affected sessions ({}):", report.affected_sessions_total);
+        let total = report
+            .affected_sessions_total
+            .map(|total| total.to_string())
+            .unwrap_or_else(|| "unknown total".to_string());
+        println!("Affected sessions ({total}):");
         for session in &report.affected_sessions {
             println!("  {} [{}] {}", session.id, session.status, session.reason);
         }
         let hidden = report
             .affected_sessions_total
+            .unwrap_or(report.affected_sessions.len())
             .saturating_sub(report.affected_sessions.len());
         if hidden > 0 {
             println!("  ... and {} more", hidden);

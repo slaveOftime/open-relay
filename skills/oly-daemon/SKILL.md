@@ -56,11 +56,13 @@ The daemon polls `config.json` mtime every **2 seconds**. Duration settings in s
 | `silence_seconds` | `10` | Live silence fallback (`>= 1`) |
 | `stop_grace_seconds` | `5` | Live HTTP stop default when grace is omitted (`>= 1`) |
 | `journal_retention_days` | `0` | Hourly sweep of stopped/killed/failed sessions (`0..=36500`; `0` keeps all) |
-| `disk_guard_enabled` | `false` | Live; opt-in admission guard refuses **new** starts when the state volume is at/below `disk_min_free_bytes` (never kills running sessions) |
+| `disk_guard_enabled` | `false` | Live; opt-in admission guard refuses **new** starts when the state volume is below `disk_min_free_bytes` (never kills running sessions) |
 | `disk_min_free_bytes` | `1073741824` | Live; guard floor; refused when the newest sample is unknown or older than `disk_sample_max_age_seconds` |
 | `disk_warn_free_bytes` | `2147483648` | Live; always-on warning line; must be `>= disk_min_free_bytes` |
 | `disk_sample_interval_seconds` | `30` | Live; bounded background sampling cadence (`5..=86400`) |
 | `disk_sample_max_age_seconds` | `120` | Live; samples older than this refuse starts while the guard is enabled (`5..=86400`, `>= disk_sample_interval_seconds`) |
+
+Readiness checks task liveness and, when enabled, disk admission. Unknown/stale samples stay unknown in status; public `/api/ready` only reports component/admission states, not private failure text. `diagnostic_errors` means a status report is incomplete; an unknown affected-session total is not zero. The guard never reserves bytes: concurrent starts can pass one sample.
 
 Removed keys (`max_journal_bytes_per_session`, `max_output_log_bytes`, `max_journal_bytes_per_session_legacy`) fail explicitly; remove them and use `journal_retention_days` or OS disk quotas.
 

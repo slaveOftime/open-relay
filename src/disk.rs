@@ -223,8 +223,12 @@ impl DiskMonitor {
     /// result. Blocking filesystem work; call off the async hot path.
     pub(crate) fn refresh(&self) -> DiskSample {
         let sample = self.sample();
+        let remaining_age =
+            Duration::from_secs(self.config.get().limits.disk_sample_max_age_seconds)
+                .saturating_sub(sample.age(SystemTime::now()));
+        let expires_at = std::time::Instant::now() + remaining_age;
         if let Some(free) = sample.free_bytes {
-            crate::metrics::set_gauge("state_disk_free_bytes", None, free as f64);
+            crate::metrics::set_gauge("state_disk_free_bytes", None, free as f64, expires_at);
         } else {
             // Unknown free space is intentionally not exported: a missing
             // series is honest, `0` reads as a full disk, and keeping the
@@ -237,11 +241,17 @@ impl DiskMonitor {
             ("sqlite", sample.breakdown.sqlite_bytes),
             ("logs", sample.breakdown.logs_bytes),
         ] {
-            crate::metrics::set_gauge("state_disk_bytes", Some(category), value as f64);
+            crate::metrics::set_gauge("state_disk_bytes", Some(category), value as f64, expires_at);
         }
         self.emit_alerts(&sample);
         *self.latest_guard() = Some(sample.clone());
         sample
+    }
+
+    /// Whether a cached sample is too old, independently of guard opt-in.
+    pub(crate) fn sample_is_stale(&self, sample: &DiskSample) -> bool {
+        sample.age(SystemTime::now())
+            > Duration::from_secs(self.config.get().limits.disk_sample_max_age_seconds)
     }
 
     /// Admission decision for a new session, from the cached sample.
@@ -281,6 +291,9 @@ impl DiskMonitor {
     pub(crate) fn warning(&self) -> Option<u64> {
         let warn_below = self.config.get().limits.disk_warn_free_bytes;
         let sample = self.latest_guard().clone()?;
+        if self.sample_is_stale(&sample) {
+            return None;
+        }
         sample.free_bytes.filter(|free| *free < warn_below)
     }
 
@@ -301,6 +314,9 @@ impl DiskMonitor {
 
     fn sample(&self) -> DiskSample {
         let config = self.config.get();
+        // Free space is observed before the potentially slow breakdown walk.
+        // Timestamping after that walk would make an old reading look fresh.
+        let sampled_at = SystemTime::now();
         let (free_bytes, free_unknown_reason) = match self.probe.free_bytes(&config.paths.state_dir)
         {
             Ok(bytes) => (Some(bytes), None),
@@ -308,7 +324,7 @@ impl DiskMonitor {
         };
         let (breakdown, breakdown_partial_reason) = scan_breakdown(&config.paths);
         DiskSample {
-            sampled_at: SystemTime::now(),
+            sampled_at,
             free_bytes,
             free_unknown_reason,
             breakdown,
@@ -330,10 +346,14 @@ impl DiskMonitor {
                 "state volume free space is below the warning threshold; \
                  enable disk_guard_enabled to refuse new sessions at the floor"
             );
-        } else if !low && *warned {
+        } else if sample.free_bytes.is_some() && !low && *warned {
             info!("state volume free space recovered above the warning threshold");
         }
-        *warned = low;
+        // A probe failure is not evidence of recovery. Keep the previous
+        // warning state until a known observation crosses the threshold.
+        if sample.free_bytes.is_some() {
+            *warned = low;
+        }
         if let Some(reason) = &sample.free_unknown_reason {
             debug!(reason = %reason, "state volume free space is unknown");
         }
@@ -370,59 +390,116 @@ pub(crate) async fn run_disk_sampler(
 // ---------------------------------------------------------------------------
 
 fn scan_breakdown(paths: &crate::config::PathsConfig) -> (DiskBreakdown, Option<String>) {
+    scan_breakdown_with_budget(paths, MAX_BREAKDOWN_ENTRIES)
+}
+
+fn scan_breakdown_with_budget(
+    paths: &crate::config::PathsConfig,
+    mut budget: usize,
+) -> (DiskBreakdown, Option<String>) {
     let mut breakdown = DiskBreakdown::default();
-    let mut budget = MAX_BREAKDOWN_ENTRIES;
     let mut partial: Option<String> = None;
 
     // Journal + uploads live under one directory per session.
-    match std::fs::read_dir(&paths.sessions_dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                if budget == 0 {
-                    partial.get_or_insert_with(|| {
-                        format!("scan capped at {MAX_BREAKDOWN_ENTRIES} entries")
-                    });
-                    break;
-                }
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let session_dir = entry.path();
-                breakdown.journal_bytes = breakdown.journal_bytes.saturating_add(dir_size(
-                    &session_dir.join(crate::session::journal::JOURNAL_DIR_NAME),
-                    &mut budget,
-                    &mut partial,
-                ));
-                breakdown.uploads_bytes = breakdown.uploads_bytes.saturating_add(dir_size(
-                    &session_dir.join("files"),
-                    &mut budget,
-                    &mut partial,
-                ));
+    if let Some(entries) = read_scan_dir(&paths.sessions_dir, &mut partial) {
+        for entry in entries {
+            if !consume_entry(&mut budget, &mut partial) {
+                break;
             }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            partial.get_or_insert_with(|| format!("failed to read sessions dir: {err}"));
+            let Some(entry) = scan_result(entry, &paths.sessions_dir, &mut partial) else {
+                continue;
+            };
+            let Some(file_type) = scan_result(entry.file_type(), &entry.path(), &mut partial)
+            else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let session_dir = entry.path();
+            breakdown.journal_bytes = breakdown.journal_bytes.saturating_add(dir_size(
+                &session_dir.join(crate::session::journal::JOURNAL_DIR_NAME),
+                &mut budget,
+                &mut partial,
+            ));
+            breakdown.uploads_bytes = breakdown.uploads_bytes.saturating_add(dir_size(
+                &session_dir.join("files"),
+                &mut budget,
+                &mut partial,
+            ));
         }
     }
 
     // SQLite database plus WAL companions (missing ones are normal).
-    breakdown.sqlite_bytes = file_size(&paths.db_file)
-        .saturating_add(file_size(&sqlite_companion(&paths.db_file, "-wal")))
-        .saturating_add(file_size(&sqlite_companion(&paths.db_file, "-shm")));
+    breakdown.sqlite_bytes = file_size(&paths.db_file, &mut partial)
+        .saturating_add(file_size(
+            &sqlite_companion(&paths.db_file, "-wal"),
+            &mut partial,
+        ))
+        .saturating_add(file_size(
+            &sqlite_companion(&paths.db_file, "-shm"),
+            &mut partial,
+        ));
 
     breakdown.logs_bytes = dir_size(&paths.state_dir.join("logs"), &mut budget, &mut partial);
 
     (breakdown, partial)
 }
 
-fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|meta| if meta.is_file() { meta.len() } else { 0 })
-        .unwrap_or(0)
+fn scan_result<T>(
+    result: std::io::Result<T>,
+    path: &Path,
+    partial: &mut Option<String>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            partial.get_or_insert_with(|| format!("failed to scan {}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+fn read_scan_dir(path: &Path, partial: &mut Option<String>) -> Option<std::fs::ReadDir> {
+    // Do not follow a category root symlink out of the state tree. Missing
+    // directories are normal (no sessions/uploads/logs yet).
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return None,
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            scan_result::<std::fs::Metadata>(Err(err), path, partial);
+            return None;
+        }
+    }
+    scan_result(std::fs::read_dir(path), path, partial)
+}
+
+fn consume_entry(budget: &mut usize, partial: &mut Option<String>) -> bool {
+    if *budget == 0 {
+        partial.get_or_insert_with(|| "directory entry budget exhausted".to_string());
+        false
+    } else {
+        *budget -= 1;
+        true
+    }
+}
+
+fn file_size(path: &Path, partial: &mut Option<String>) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.is_file() {
+                meta.len()
+            } else {
+                0
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            scan_result::<std::fs::Metadata>(Err(err), path, partial);
+            0
+        }
+    }
 }
 
 /// SQLite companion file path (`<db>-wal` / `<db>-shm`), which is a filename
@@ -434,31 +511,27 @@ fn sqlite_companion(db_file: &Path, suffix: &str) -> PathBuf {
 }
 
 fn dir_size(path: &Path, budget: &mut usize, partial: &mut Option<String>) -> u64 {
-    if *budget == 0 {
-        partial.get_or_insert_with(|| format!("scan capped at {MAX_BREAKDOWN_ENTRIES} entries"));
-        return 0;
-    }
     let mut total: u64 = 0;
     let mut queue: Vec<PathBuf> = vec![path.to_path_buf()];
     while let Some(dir) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(entries) = read_scan_dir(&dir, partial) else {
             continue;
         };
-        for entry in entries.flatten() {
-            if *budget == 0 {
-                partial.get_or_insert_with(|| {
-                    format!("scan capped at {MAX_BREAKDOWN_ENTRIES} entries")
-                });
+        for entry in entries {
+            if !consume_entry(budget, partial) {
                 return total;
             }
-            *budget -= 1;
-            let Ok(file_type) = entry.file_type() else {
+            let Some(entry) = scan_result(entry, &dir, partial) else {
+                continue;
+            };
+            let path = entry.path();
+            let Some(file_type) = scan_result(entry.file_type(), &path, partial) else {
                 continue;
             };
             if file_type.is_dir() {
-                queue.push(entry.path());
+                queue.push(path);
             } else if file_type.is_file()
-                && let Ok(meta) = entry.metadata()
+                && let Some(meta) = scan_result(entry.metadata(), &path, partial)
             {
                 total = total.saturating_add(meta.len());
             }
@@ -706,6 +779,70 @@ mod tests {
             monitor.guard_decision(),
             DiskGuardDecision::Stale { .. }
         ));
+    }
+
+    #[test]
+    fn empty_session_directories_still_consume_the_scan_budget() {
+        let state = temp_dir("entry_budget");
+        for id in ["s1", "s2", "s3"] {
+            std::fs::create_dir_all(state.join("sessions").join(id)).unwrap();
+        }
+        let config = test_config(&state, limits(false, 1, 2, 30, 120));
+        let (_, partial) = scan_breakdown_with_budget(&config.paths, 2);
+        assert!(
+            partial.is_some(),
+            "top-level session entries must count too"
+        );
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn breakdown_does_not_follow_root_symlinks() {
+        let state = temp_dir("symlink");
+        let outside = temp_dir("outside");
+        std::fs::write(outside.join("private"), b"not-state-data").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("logs")).unwrap();
+        let mut budget = 10;
+        let mut partial = None;
+        assert_eq!(dir_size(&state.join("logs"), &mut budget, &mut partial), 0);
+        assert_eq!(budget, 10);
+        // The top-level sessions root uses the same no-follow rule.
+        std::fs::create_dir_all(outside.join("s1").join("journal")).unwrap();
+        std::fs::write(outside.join("s1").join("journal").join("seg"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("sessions")).unwrap();
+        let config = test_config(&state, limits(false, 1, 2, 30, 120));
+        let (breakdown, _) = scan_breakdown(&config.paths);
+        assert_eq!(breakdown, DiskBreakdown::default());
+        std::fs::remove_dir_all(state).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn unreadable_breakdown_is_partial_not_silently_zero() {
+        let state = temp_dir("bad_breakdown");
+        let path = state.join("not-a-directory");
+        std::fs::write(&path, b"obstacle").unwrap();
+        let mut budget = 10;
+        let mut partial = None;
+        assert_eq!(dir_size(&path, &mut budget, &mut partial), 0);
+        assert!(partial.is_some(), "failed scan must be marked partial");
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn stale_samples_do_not_report_an_active_warning() {
+        let state = temp_dir("stale_warning");
+        let monitor = build_monitor(&state, limits(false, 1024, 4096, 30, 120), Ok(2048));
+        monitor.store_sample_for_test(DiskSample {
+            sampled_at: SystemTime::now() - Duration::from_secs(600),
+            free_bytes: Some(2048),
+            free_unknown_reason: None,
+            breakdown: Default::default(),
+            breakdown_partial_reason: None,
+        });
+        assert_eq!(monitor.warning(), None);
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

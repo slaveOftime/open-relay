@@ -60,8 +60,8 @@ pub struct AppState {
     /// HTTP `--no-auth` never bypasses identity verification or encryption.
     pub node_identity: NodeIdentity,
     /// Supervised-component registry + disk observer behind `/api/ready`.
-    /// `None` only in states built without a daemon (tests); readiness then
-    /// reports alive-only.
+    /// `None` only in states built without a daemon (tests); readiness is
+    /// unknown and fails closed.
     pub(crate) daemon: Option<crate::daemon::health::DaemonHealth>,
 }
 
@@ -556,20 +556,22 @@ fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::respons
 }
 
 /// `GET /api/ready` — readiness probe: 200 only while every
-/// ready-critical supervised component is running; 503 lists the reasons.
+/// ready-critical task runs and an enabled disk guard permits admission.
+/// 503 lists redacted states; private failures remain in IPC diagnostics.
 /// Liveness (`/api/health`) stays a plain "the daemon answered" signal, so
 /// one degraded background component never reads as a dead process.
 async fn ready(State(state): State<AppState>) -> Response {
     let Some(daemon) = &state.daemon else {
-        // No supervised components in this state (tests): nothing is known
-        // to be degraded, and liveness alone is the honest answer.
+        // Absence of diagnostic state is not proof of readiness.
         return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ready": true, "unready_reasons": [] })),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({ "ready": false, "unready_reasons": ["readiness unavailable"] }),
+            ),
         )
             .into_response();
     };
-    let readiness = daemon.components.readiness();
+    let readiness = daemon.public_readiness();
     let status = if readiness.ready {
         StatusCode::OK
     } else {

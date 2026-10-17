@@ -1179,7 +1179,7 @@ pub struct ComponentStatus {
 /// Disk capacity and admission-guard view, from the daemon's cached sample.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskStatus {
-    /// Free bytes on the state volume; `None` = unknown (see reason), never 0.
+    /// Free bytes on the state volume; `None` = unknown/stale (see reason), never 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1187,7 +1187,7 @@ pub struct DiskStatus {
     /// When the cached sample was taken; `None` = never sampled yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at: Option<DateTime<Utc>>,
-    /// `None` until the first sample exists; never a plausible zero.
+    /// `None` until a fresh sample exists; stale sizes are not exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1234,7 +1234,8 @@ pub struct DaemonStatusReport {
     pub started_at: Option<String>,
     /// Liveness: this report itself proves the daemon answered.
     pub alive: bool,
-    /// Readiness: every ready-critical supervised component is running.
+    /// Readiness: ready-critical tasks are running and an enabled disk
+    /// guard permits new starts. This is not proof of individual tick progress.
     pub ready: bool,
     #[serde(default)]
     pub unready_reasons: Vec<String>,
@@ -1245,12 +1246,16 @@ pub struct DaemonStatusReport {
     /// crash record, raw stderr capture).
     #[serde(default)]
     pub failure_records: Vec<String>,
-    /// Suspicious sessions (uncommitted starts, sessions that ended in
-    /// `failed`), newest first, capped.
+    /// In-flight start reservations (id order), then failed sessions
+    /// newest first, capped. Reservations do not survive a daemon crash.
     #[serde(default)]
     pub affected_sessions: Vec<AffectedSession>,
-    /// Total affected sessions before the cap.
-    pub affected_sessions_total: usize,
+    /// Total affected sessions before the cap; unknown if the query failed.
+    #[serde(default)]
+    pub affected_sessions_total: Option<usize>,
+    /// Degraded diagnostic inputs, distinct from task/admission readiness.
+    #[serde(default)]
+    pub diagnostic_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

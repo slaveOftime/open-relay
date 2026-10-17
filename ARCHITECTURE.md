@@ -464,16 +464,23 @@ mean "the daemon answered"; `/api/ready` and `RpcRequest::DaemonStatus` mean
 `config_reloader` and `journal_retention` are supervised and reported but do not.
 A component that exits or panics is restarted at most three times (1 s/2 s/4 s
 backoff) and then reported `failed` with its reason; `disabled` marks intentional
-absence such as HTTP under `--no-http`. Registries are populated before the
-daemon loop starts, so readiness is never trivially true.
+absence such as HTTP under `--no-http`. Factory setup panics share the same
+failure boundary as future panics. Registries are populated before the daemon
+loop starts, so readiness is never trivially true. Readiness also gates on an
+enabled disk guard's admission decision. Running describes task liveness, not
+per-tick progress; detached startup still waits for IPC liveness. Public readiness
+only exposes component/admission states, never private error strings.
 
 `src/disk.rs` samples the state volume (free space plus a bounded
 journal/uploads/SQLite/logs breakdown) in the background; no list, health, or
 output path walks the state directory. Unknown and stale samples are explicit
-states with reasons, never `0`. The admission guard is opt-in
+states with reasons, never `0`; disk gauges expire even if the sampler stops.
+Every visited directory entry counts against the scan budget, read errors mark
+partial breakdowns, and symlinks are not followed. The admission guard is opt-in
 (`disk_guard_enabled`), consulted under the start reservation and rechecked
-immediately before the PTY spawn: it refuses **new** sessions on a low, unknown,
-or stale reading and never touches existing ones. It bounds growth; it is not a
+when the blocking spawn worker begins: it refuses **new** sessions on a low, unknown,
+or stale reading and never touches existing ones. It only gates admission;
+multiple starts may pass one sample, and no disk bytes are reserved. It is not a
 quota (filesystem quotas remain the hard limit). Journal deletion stays a
 separate age-based policy that never deletes live sessions.
 
@@ -481,7 +488,8 @@ separate age-based policy that never deletes live sessions.
 component states, capacity, failure-record locations, affected sessions) from
 metadata only — no terminal content, input, environment, identity seeds, or
 credentials. It is shared by local IPC, relayed `daemon status --node`, and the
-CLI; it never mutates daemon state.
+CLI; it never mutates daemon state. Diagnostic query failures are explicit,
+with unknown totals rather than success-shaped empty results.
 
 ## Version axes
 

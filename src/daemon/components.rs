@@ -70,7 +70,8 @@ pub(crate) struct ComponentReport {
     pub(crate) state: ComponentState,
     /// Whether a non-satisfied state degrades daemon readiness.
     pub(crate) ready_critical: bool,
-    /// Last time the component started healthy (initial start or restart).
+    /// Last time a component future was spawned (initial start or restart).
+    /// Running is task liveness, not proof that an individual tick succeeded.
     pub(crate) last_success_at: Option<SystemTime>,
     pub(crate) failures: u32,
     pub(crate) last_failure: Option<ComponentFailure>,
@@ -201,13 +202,23 @@ impl ComponentRegistry {
     /// configuration). Liveness is a separate question and stays true while
     /// this registry reports failures.
     pub(crate) fn readiness(&self) -> Readiness {
+        self.readiness_with_details(true)
+    }
+
+    /// Public probes expose component names/states, not panic strings or
+    /// filesystem paths from private failure records.
+    pub(crate) fn public_readiness(&self) -> Readiness {
+        self.readiness_with_details(false)
+    }
+
+    fn readiness_with_details(&self, include_details: bool) -> Readiness {
         let slots = self.slots();
         let reasons = slots
             .iter()
             .filter(|(_, slot)| slot.ready_critical && !slot.state.satisfied())
             .map(|(name, slot)| {
                 let mut reason = format!("component '{name}' is {}", slot.state.as_str());
-                if let Some(failure) = &slot.last_failure {
+                if include_details && let Some(failure) = &slot.last_failure {
                     reason.push_str(&format!(": {}", failure.reason));
                 }
                 reason
@@ -221,7 +232,7 @@ impl ComponentRegistry {
 }
 
 /// Spawn a daemon-lifetime component under supervision: register it, run
-/// the (re-creatable) future, restart with linear backoff on exit/panic,
+/// the (re-creatable) future, restart with exponential backoff on exit/panic,
 /// and mark it failed with the reason once the restart budget is spent.
 pub(crate) fn spawn_supervised<F, Fut>(
     registry: Arc<ComponentRegistry>,
@@ -238,19 +249,24 @@ pub(crate) fn spawn_supervised<F, Fut>(
     // subscribing to the event broadcast) is then done before the caller
     // continues, so no event published after wiring can be dropped by a
     // not-yet-polled task. Restarts invoke the factory again.
-    let mut next = Some(run());
+    let mut next = Some(create_component_future(&mut run));
     tokio::spawn(async move {
         let mut restarts: u32 = 0;
         loop {
-            registry.mark_running(name);
             let future = match next.take() {
                 Some(future) => future,
-                None => run(),
+                None => create_component_future(&mut run),
             };
-            let reason = match tokio::spawn(future).await {
-                Ok(Ok(())) => "component exited unexpectedly".to_string(),
-                Ok(Err(reason)) => reason,
-                Err(join) => join_failure_reason(join),
+            let reason = match future {
+                Ok(future) => {
+                    registry.mark_running(name);
+                    match tokio::spawn(future).await {
+                        Ok(Ok(())) => "component exited unexpectedly".to_string(),
+                        Ok(Err(reason)) => reason,
+                        Err(join) => join_failure_reason(join),
+                    }
+                }
+                Err(reason) => reason,
             };
             if restarts >= MAX_COMPONENT_RESTARTS {
                 registry.mark_failed(name, reason.clone());
@@ -278,15 +294,29 @@ fn restart_backoff(restarts: u32) -> Duration {
     Duration::from_millis(500 * (1 << restarts.min(3)))
 }
 
+fn create_component_future<F, Fut>(run: &mut F) -> std::result::Result<Fut, String>
+where
+    F: FnMut() -> Fut,
+{
+    // Setup is part of the component's failure boundary too. Keep eager
+    // subscriptions, but don't let an initial/restart factory panic kill
+    // the daemon or its supervisor. A factory must be safe to retry.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .map_err(|payload| format!("factory {}", panic_reason(payload)))
+}
+
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string());
+    format!("panicked: {message}")
+}
+
 fn join_failure_reason(join: tokio::task::JoinError) -> String {
     if join.is_panic() {
-        let payload = join.into_panic();
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic payload".to_string());
-        format!("panicked: {message}")
+        panic_reason(join.into_panic())
     } else {
         "task cancelled".to_string()
     }
@@ -322,6 +352,17 @@ mod tests {
         registry.record_failure("optional", "decorative".to_string());
         registry.mark_running("activity_sampler");
         assert!(registry.readiness().ready);
+    }
+
+    #[test]
+    fn public_readiness_does_not_leak_failure_details() {
+        let registry = ComponentRegistry::new();
+        registry.register("http", true);
+        registry.mark_failed("http", "private/path: sensitive panic text".into());
+        assert!(registry.readiness().reasons[0].contains("sensitive"));
+        let public = registry.public_readiness();
+        assert!(!public.ready);
+        assert_eq!(public.reasons, ["component 'http' is failed"]);
     }
 
     #[test]
@@ -385,6 +426,33 @@ mod tests {
         // `starting` until the supervisor task actually runs it.
         let reports = registry.reports();
         assert_eq!(reports[0].state, ComponentState::Starting);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn factory_panics_are_supervised_including_initial_wiring() {
+        let registry = Arc::new(ComponentRegistry::new());
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+        spawn_supervised(registry.clone(), "factory_panicky", true, move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            panic!("factory setup failed");
+            #[allow(unreachable_code)]
+            std::future::pending::<ComponentRun>()
+        });
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_COMPONENT_RESTARTS + 1);
+        let report = &registry.reports()[0];
+        assert_eq!(report.state, ComponentState::Failed);
+        assert_eq!(report.failures, MAX_COMPONENT_RESTARTS + 1);
+        assert!(report.last_success_at.is_none());
+        assert!(
+            report
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("factory setup failed")
+        );
     }
 
     #[tokio::test(start_paused = true)]

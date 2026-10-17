@@ -93,13 +93,6 @@ impl SessionStore {
         } = prepared;
         let session_id = meta.id.clone();
 
-        // Recheck the disk guard after the reservation and the DB insert:
-        // the sampler may have refreshed to an unknown/stale/below-floor
-        // reading while this start was in flight.
-        if let Err(err) = store_handle.check_disk_guard() {
-            let _ = store_handle.abort_started_session(&session_id).await;
-            return Err(err);
-        }
         // `spawn_session` performs mkdir + ShadowJournal recovery scan
         // + fsyncs + PATH walks + PTY spawn, all of which block workers.
         // Run it on the blocking pool so a dirty, large journal can't
@@ -113,7 +106,12 @@ impl SessionStore {
         let runtime = match tokio::task::spawn_blocking({
             let meta = Arc::clone(&meta);
             let event_tx = store_handle.event_tx.clone();
+            let store = Arc::clone(store_handle);
             move || {
+                // Recheck after any blocking-pool queue delay, not before
+                // enqueueing. Filesystem/PTY preparation can still race
+                // external writes: this is admission, not a space reservation.
+                store.check_disk_guard()?;
                 let mut meta_guard = meta.lock();
                 spawn_session(
                     &mut meta_guard,
@@ -313,10 +311,9 @@ impl SessionStore {
         }
 
         // Disk admission runs inside the same lock that reserves the
-        // starting slot: concurrent starts each observe the cached sample
-        // (plus the reservation), so two fills cannot both squeeze past a
-        // borderline reading. Advisory by design — it bounds new growth,
-        // it is not a hard quota.
+        // starting slot. Each start checks the cached sample, but no bytes
+        // are reserved: concurrent starts may pass the same fresh reading.
+        // A second check runs when the blocking spawn worker begins.
         self.check_disk_guard()?;
 
         let id = generate_session_id(|candidate| {

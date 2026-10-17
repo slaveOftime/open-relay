@@ -9,9 +9,6 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
-use tracing::warn;
-
 use crate::{
     config::AppConfig,
     db::Database,
@@ -23,8 +20,12 @@ use crate::{
     session::SessionStore,
     storage,
 };
+use chrono::{DateTime, Utc};
 
-use super::{components::ComponentRegistry, crash};
+use super::{
+    components::{ComponentRegistry, Readiness},
+    crash,
+};
 
 /// Maximum number of affected sessions listed in one report.
 pub(crate) const MAX_AFFECTED_SESSIONS: usize = 20;
@@ -42,16 +43,36 @@ impl DaemonHealth {
         Self { components, disk }
     }
 
-    /// Assemble the diagnostic summary. Read-only; never fails — degraded
-    /// inputs (missing info file, broken session query) shrink the report
-    /// and log, they do not turn the status request itself into an error.
+    pub(crate) fn readiness(&self) -> Readiness {
+        self.with_disk_readiness(self.components.readiness(), true)
+    }
+
+    pub(crate) fn public_readiness(&self) -> Readiness {
+        self.with_disk_readiness(self.components.public_readiness(), false)
+    }
+
+    fn with_disk_readiness(&self, mut readiness: Readiness, include_details: bool) -> Readiness {
+        let decision = self.disk.guard_decision();
+        if let Some(reason) = decision.refusal_reason() {
+            readiness.ready = false;
+            readiness.reasons.push(if include_details {
+                format!("disk guard: {reason}")
+            } else {
+                format!("disk guard is {}", decision.label())
+            });
+        }
+        readiness
+    }
+
+    /// Assemble the diagnostic summary. Read-only; degraded inputs are
+    /// reported as diagnostic_errors, never a success-shaped empty result.
     pub(crate) async fn report(
         &self,
         config: &AppConfig,
         store: &SessionStore,
         db: &Database,
     ) -> DaemonStatusReport {
-        let readiness = self.components.readiness();
+        let readiness = self.readiness();
         let components = self
             .components
             .reports()
@@ -59,10 +80,14 @@ impl DaemonHealth {
             .map(component_status)
             .collect();
         let disk = self.disk_status();
-        let started_at = storage::read_daemon_info(&config.paths.info_file)
-            .ok()
-            .flatten()
-            .map(|info| info.started_at);
+        let mut diagnostic_errors = Vec::new();
+        let started_at = match storage::read_daemon_info(&config.paths.info_file) {
+            Ok(info) => info.map(|info| info.started_at),
+            Err(err) => {
+                diagnostic_errors.push(format!("could not read daemon info: {err}"));
+                None
+            }
+        };
         let failure_records = vec![
             config.paths.state_dir.join("logs").display().to_string(),
             crash::crash_log_path(&config.paths.state_dir)
@@ -73,7 +98,13 @@ impl DaemonHealth {
                 .to_string(),
         ];
         let (affected_sessions, affected_sessions_total) =
-            collect_affected_sessions(store, db).await;
+            match collect_affected_sessions(store, db).await {
+                Ok((sessions, total)) => (sessions, Some(total)),
+                Err(err) => {
+                    diagnostic_errors.push(format!("could not query affected sessions: {err}"));
+                    (Vec::new(), None)
+                }
+            };
 
         DaemonStatusReport {
             daemon_pid: std::process::id(),
@@ -87,6 +118,7 @@ impl DaemonHealth {
             failure_records,
             affected_sessions,
             affected_sessions_total,
+            diagnostic_errors,
         }
     }
 
@@ -95,16 +127,24 @@ impl DaemonHealth {
     fn disk_status(&self) -> DiskStatus {
         let sample = self.disk.latest();
         let decision = self.disk.guard_decision();
+        let stale = sample
+            .as_ref()
+            .is_some_and(|sample| self.disk.sample_is_stale(sample));
+        let fresh = sample.as_ref().filter(|_| !stale);
         DiskStatus {
-            free_bytes: sample.as_ref().and_then(|sample| sample.free_bytes),
-            free_unknown_reason: sample
-                .as_ref()
-                .and_then(|sample| sample.free_unknown_reason.clone()),
+            free_bytes: fresh.and_then(|sample| sample.free_bytes),
+            free_unknown_reason: if stale {
+                Some("state volume sample is stale; wait for a fresh sample".to_string())
+            } else {
+                sample
+                    .as_ref()
+                    .and_then(|sample| sample.free_unknown_reason.clone())
+            },
             sampled_at: sample.as_ref().map(|sample| to_utc(sample.sampled_at)),
-            journal_bytes: sample.as_ref().map(|sample| sample.breakdown.journal_bytes),
-            uploads_bytes: sample.as_ref().map(|sample| sample.breakdown.uploads_bytes),
-            sqlite_bytes: sample.as_ref().map(|sample| sample.breakdown.sqlite_bytes),
-            logs_bytes: sample.as_ref().map(|sample| sample.breakdown.logs_bytes),
+            journal_bytes: fresh.map(|sample| sample.breakdown.journal_bytes),
+            uploads_bytes: fresh.map(|sample| sample.breakdown.uploads_bytes),
+            sqlite_bytes: fresh.map(|sample| sample.breakdown.sqlite_bytes),
+            logs_bytes: fresh.map(|sample| sample.breakdown.logs_bytes),
             breakdown_partial_reason: sample
                 .as_ref()
                 .and_then(|sample| sample.breakdown_partial_reason.clone()),
@@ -139,23 +179,28 @@ fn to_utc(time: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(time)
 }
 
-/// Sessions the daemon can point an operator at: starts that were reserved
-/// but never committed (a crash mid-start), and sessions that ended in
-/// `failed`, newest first. Bounded; the total is reported alongside.
+/// In-flight start reservations, then failed sessions newest first.
+/// Reservations are volatile, not evidence that a previous daemon crashed.
+/// Bounded; query failures stay errors rather than becoming a zero total.
 async fn collect_affected_sessions(
     store: &SessionStore,
     db: &Database,
-) -> (Vec<AffectedSession>, usize) {
+) -> crate::error::Result<(Vec<AffectedSession>, usize)> {
     let mut affected = Vec::new();
 
     let mut starting = store.starting_session_ids().await;
     starting.sort();
     let starting_total = starting.len();
-    affected.extend(starting.into_iter().map(|id| AffectedSession {
-        id,
-        status: "starting".to_string(),
-        reason: "start was reserved but never committed".to_string(),
-    }));
+    affected.extend(
+        starting
+            .into_iter()
+            .take(MAX_AFFECTED_SESSIONS)
+            .map(|id| AffectedSession {
+                id,
+                status: "starting".to_string(),
+                reason: "start is in progress (reserved, not yet committed)".to_string(),
+            }),
+    );
 
     let query = ListQuery {
         search: None,
@@ -168,29 +213,17 @@ async fn collect_affected_sessions(
         sort: ListSortField::CreatedAt,
         order: SortOrder::Desc,
     };
-    let mut failed_total = 0usize;
-    match db.list_summaries_without_offsets(&query).await {
-        Ok(summaries) => {
-            affected.extend(summaries.into_iter().map(|summary| AffectedSession {
-                id: summary.id,
-                status: summary.status,
-                reason: "session ended in failure".to_string(),
-            }));
-        }
-        Err(err) => {
-            warn!(%err, "diagnostic summary could not list failed sessions");
-        }
-    }
-    match db.count_sessions_by_status("failed").await {
-        Ok(total) => failed_total = total as usize,
-        Err(err) => {
-            warn!(%err, "diagnostic summary could not count failed sessions");
-        }
-    }
+    let summaries = db.list_summaries_without_offsets(&query).await?;
+    affected.extend(summaries.into_iter().map(|summary| AffectedSession {
+        id: summary.id,
+        status: summary.status,
+        reason: "session ended in failure".to_string(),
+    }));
+    let failed_total = db.count_sessions_by_status("failed").await? as usize;
 
     let total = starting_total + failed_total;
     affected.truncate(MAX_AFFECTED_SESSIONS);
-    (affected, total)
+    Ok((affected, total))
 }
 
 #[cfg(test)]
@@ -380,11 +413,11 @@ mod tests {
         );
 
         let report = health.report(&config, &store, &db).await;
-        assert_eq!(report.affected_sessions_total, 2);
+        assert_eq!(report.affected_sessions_total, Some(2));
         assert!(report.affected_sessions.iter().any(|session| {
             session.id == "stuck56"
                 && session.status == "starting"
-                && session.reason.contains("never committed")
+                && session.reason.contains("not yet committed")
         }));
         assert!(report.affected_sessions.iter().any(|session| {
             session.id == "bad1234"
@@ -426,7 +459,76 @@ mod tests {
 
         let report = health.report(&config, &store, &db).await;
         assert_eq!(report.affected_sessions.len(), MAX_AFFECTED_SESSIONS);
-        assert_eq!(report.affected_sessions_total, MAX_AFFECTED_SESSIONS + 3);
+        assert_eq!(
+            report.affected_sessions_total,
+            Some(MAX_AFFECTED_SESSIONS + 3)
+        );
+    }
+
+    #[test]
+    fn stale_disk_is_unknown_even_with_guard_disabled() {
+        let disk = monitor(test_limits(), Ok(1));
+        disk.store_sample_for_test(DiskSample {
+            sampled_at: SystemTime::now() - std::time::Duration::from_secs(600),
+            free_bytes: Some(1),
+            free_unknown_reason: None,
+            breakdown: Default::default(),
+            breakdown_partial_reason: None,
+        });
+        let health = DaemonHealth::new(Arc::new(ComponentRegistry::new()), disk);
+        let status = health.disk_status();
+        assert_eq!(status.free_bytes, None);
+        assert!(status.free_unknown_reason.unwrap().contains("stale"));
+        assert_eq!(status.journal_bytes, None);
+        assert!(!status.warning_active);
+        assert_eq!(status.guard_decision, "disabled");
+    }
+
+    #[test]
+    fn enabled_disk_guard_gates_readiness_with_redacted_public_reasons() {
+        let mut limits = test_limits();
+        limits.disk_guard_enabled = true;
+        let disk = monitor(limits, Err("private/path: probe failed".into()));
+        disk.refresh();
+        let health = DaemonHealth::new(Arc::new(ComponentRegistry::new()), disk);
+        assert!(!health.readiness().ready);
+        assert!(health.readiness().reasons[0].contains("private/path"));
+        let public = health.public_readiness();
+        assert!(!public.ready);
+        assert_eq!(public.reasons, ["disk guard is unknown"]);
+    }
+
+    #[tokio::test]
+    async fn failed_session_queries_are_unknown_not_a_fabricated_zero() {
+        let root = std::env::temp_dir().join(format!("oly_bad_health_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("oly.db");
+        let db = Database::open(&path, root.join("sessions")).await.unwrap();
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&path),
+        )
+        .await
+        .unwrap();
+        sqlx::query("DROP TABLE sessions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let db = Arc::new(db);
+        let store = store_with(vec![], db.clone());
+        let health = DaemonHealth::new(
+            Arc::new(ComponentRegistry::new()),
+            monitor(test_limits(), Ok(8192)),
+        );
+        let report = health.report(&make_test_config(50), &store, &db).await;
+        assert!(report.alive);
+        assert_eq!(report.affected_sessions_total, None);
+        assert!(
+            report
+                .diagnostic_errors
+                .iter()
+                .any(|err| err.contains("affected sessions"))
+        );
     }
 
     #[test]

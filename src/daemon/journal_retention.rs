@@ -155,13 +155,21 @@ async fn sweep_one(
     }
 }
 
-/// The session directory for `session_id`, but only when the id is a single
-/// normal path component (no separators, `..`, roots, or prefixes). Anything
+/// The session directory for `session_id`, but only when the id is a portable
+/// ASCII identifier in a single normal path component. Reject dots, spaces,
+/// and colons too: Windows normalizes trailing dots/spaces and supports ADS.
+/// Anything
 /// else is rejected rather than joined: `sessions_dir.join(id)` with a
 /// traversal id would name a directory outside the sessions dir.
 fn safe_session_dir(sessions_dir: &std::path::Path, session_id: &str) -> Option<PathBuf> {
     use std::path::Component;
 
+    if !session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
     let mut components = std::path::Path::new(session_id).components();
     let first = components.next()?;
     if components.next().is_some() {
@@ -304,19 +312,24 @@ mod tests {
     fn safe_session_dir_accepts_only_single_normal_components() {
         let base = std::path::Path::new("base");
         assert_eq!(safe_session_dir(base, "abc123"), Some(base.join("abc123")));
-        for bad in ["", ".", "..", "a/b", "/abs", "../x"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "../x",
+            "abc.",
+            "abc ",
+            "abc:stream",
+        ] {
             assert_eq!(safe_session_dir(base, bad), None, "accepted {bad:?}");
         }
-        // A backslash is a separator on Windows, so it must be rejected like
-        // `/`; on Unix it is an ordinary character inside one normal
-        // component and the join still stays inside `base`.
-        #[cfg(windows)]
         assert_eq!(
-            safe_session_dir(base, "a\\b"),
-            None,
-            "accepted a backslash separator"
+            safe_session_dir(base, "session-1_a"),
+            Some(base.join("session-1_a"))
         );
-        #[cfg(not(windows))]
-        assert_eq!(safe_session_dir(base, "a\\b"), Some(base.join("a\\b")));
     }
 }
