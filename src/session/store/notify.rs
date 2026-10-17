@@ -664,8 +664,11 @@ mod tests {
         // exemption from silence detection (see the regression test below).
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
+        // Database setup/migrations can exceed the grace period on Windows.
+        // Complete them before constructing the spawn-relative clock fixture.
+        let db = make_test_db().await;
         let rt = make_runtime("abc1234", SessionStatus::Running, "prompt> ", None);
-        let store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], db);
         let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
