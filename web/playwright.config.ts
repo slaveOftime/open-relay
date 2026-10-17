@@ -49,7 +49,10 @@ export default defineConfig({
       // gestures it drives — the tap that opens the bar and the filter menu,
       // the focus that tap must keep, and the drag that moves the trigger — are
       // exactly the class of thing that differs on WebKit.
-      testMatch: /(attach|quick-keys|sessions-search)[^/]*\.spec\.ts/,
+      // `sessions-group-collapse` is the same shape: the group header's tap and
+      // its `position: sticky` (including on a table cell) are where WebKit has
+      // historically diverged.
+      testMatch: /(attach|quick-keys|sessions-group|sessions-search)[^/]*\.spec\.ts/,
       use: { ...MOBILE_SAFARI },
     },
   ],

@@ -16,7 +16,7 @@ src/
 │   ├── ui/          Radix-backed primitives (Button, Dialog, Badge, ...)
 │   ├── attach/      the attach drawer + its storage, history, send path, key bar
 │   ├── dialogs/     every dialog, plus the helpers they share
-│   ├── sessions/    session row, card, tags, pin, notification toggle, skeletons
+│   ├── sessions/    session row, card, group header, tags, pin, notification toggle, skeletons
 │   ├── sparkline/   the sparkline renderer and its pure model
 │   └── terminal/    XTerm wrapper, quick keys, fonts, theme, scroll wheel
 ├── hooks/         shared React hooks
@@ -165,6 +165,12 @@ primary accent.
   list, so a `created_at` computed inside the route handler was rebuilt on every
   request and the count never moved — indistinguishable from a clock that never
   ticked. Build fixtures once, then hand them to the handler.
+- **A sticky header must out-paint the rows it covers.** The sessions list's
+  group header is `sticky top-0 z-20` on an opaque wrapper, because the header
+  tint is translucent and the mobile card content carries `z-10` of its own: it
+  needs an opaque layer beneath _and_ a level above the rows, in both the card
+  list and the table (`e2e/sessions-group-collapse.spec.ts` hit-tests the band,
+  so only a header that is actually on top passes).
 
 ## Avoid
 
