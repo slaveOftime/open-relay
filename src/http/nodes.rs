@@ -8,12 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{info, warn};
 
 use crate::{
     federation_crypto,
     http::AppState,
+    node::liveness::{NODE_SEND_TIMEOUT, wait_for_inbound_timeout},
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{
@@ -120,127 +121,123 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     // transport pongs cannot keep an identity-authenticated link alive.
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_inbound = std::time::Instant::now();
-    let disconnect_reason = loop {
-        tokio::select! {
-            _ = keepalive.tick() => {
-                if last_inbound.elapsed() > std::time::Duration::from_secs(45) {
-                    break "node keepalive timeout (no inbound frames for 45s)".to_string();
+    let (inbound_tx, inbound_rx) = watch::channel(tokio::time::Instant::now());
+    let relay = async {
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if let Err(err) = send_node_message(&mut ws_tx, &NodeWsMessage::Ping, &mut phase).await {
+                        break format!("failed to send sealed node keepalive: {err}");
+                    }
                 }
-                if let Err(err) = send_node_message(&mut ws_tx, &NodeWsMessage::Ping, &mut phase).await {
-                    break format!("failed to send sealed node keepalive: {err}");
+                // Outgoing: channel → WS
+                msg = send_rx.recv() => {
+                    let Some(ws_msg) = msg else {
+                        break "node RPC relay channel closed".to_string();
+                    };
+                    if let Err(err) = send_node_message(&mut ws_tx, &ws_msg, &mut phase).await {
+                        break format!("failed to send proxied RPC to node WebSocket: {err}");
+                    }
                 }
-            }
-            // Outgoing: channel → WS
-            msg = send_rx.recv() => {
-                let Some(ws_msg) = msg else {
-                    break "node RPC relay channel closed".to_string();
-                };
-                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg, &mut phase).await {
-                    break format!("failed to send proxied RPC to node WebSocket: {err}");
-                }
-            }
-            // Incoming: WS → resolve pending RPC callers
-            incoming = ws_rx.next() => {
-                match incoming {
-                    Some(Ok(frame)) => {
-                        // Tungstenite auto-frames Ping / Pong on the
-                        // WebSocket transport — silently drop ones that
-                        // surface here so we do not emit "failed to
-                        // decode secondary node frame" warnings on every
-                        // 15s keepalive tick.
-                        match frame {
-                            Message::Ping(_) | Message::Pong(_) => continue,
-                            _ => {}
-                        }
-                        let message = match frame {
-                            Message::Close(frame) => {
-                                break close_frame_disconnect_reason(frame);
+                // Incoming: WS → resolve pending RPC callers
+                incoming = ws_rx.next() => {
+                    match incoming {
+                        Some(Ok(frame)) => {
+                            // Tungstenite auto-frames Ping / Pong on the
+                            // WebSocket transport — silently drop ones that
+                            // surface here so we do not emit "failed to
+                            // decode secondary node frame" warnings on every
+                            // 15s keepalive tick.
+                            match frame {
+                                Message::Ping(_) | Message::Pong(_) => continue,
+                                _ => {}
                             }
-                            other => match parse_node_message(other, &mut phase) {
-                                Ok(message) => message,
-                                Err(err) => {
-                                    break format!("invalid sealed node frame: {err}");
+                            let message = match frame {
+                                Message::Close(frame) => {
+                                    break close_frame_disconnect_reason(frame);
                                 }
-                            },
-                        };
-                        last_inbound = std::time::Instant::now();
-                        match message {
-                                NodeWsMessage::RpcResponse { id, response } => {
-                                    if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                        let sender = {
-                                            let mut pm = pending_recv.lock().await;
-                                            pm.remove(&id)
-                                        };
-                                        if let Some(sender) = sender {
-                                            match sender {
-                                                PendingRpc::OneShot(tx) => {
-                                                    let _ = tx.send(Ok(rpc_resp));
-                                                }
-                                                PendingRpc::Stream(tx) => {
-                                                    let _ = tx.send(Ok(rpc_resp)).await;
-                                                }
-                                            }
-                                        }
+                                other => match parse_node_message(other, &mut phase) {
+                                    Ok(message) => message,
+                                    Err(err) => {
+                                        break format!("invalid sealed node frame: {err}");
                                     }
-                                }
-                                NodeWsMessage::RpcStreamFrame { id, response, done } => {
-                                    if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                        if done {
+                                },
+                            };
+                            inbound_tx.send_replace(tokio::time::Instant::now());
+                            match message {
+                                    NodeWsMessage::RpcResponse { id, response } => {
+                                        if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                             let sender = {
                                                 let mut pm = pending_recv.lock().await;
                                                 pm.remove(&id)
                                             };
                                             if let Some(sender) = sender {
                                                 match sender {
-                                                    PendingRpc::Stream(tx) => {
-                                                        let _ = tx.send(Ok(rpc_resp)).await;
-                                                    }
                                                     PendingRpc::OneShot(tx) => {
                                                         let _ = tx.send(Ok(rpc_resp));
                                                     }
+                                                    PendingRpc::Stream(tx) => {
+                                                        if tokio::time::timeout(NODE_SEND_TIMEOUT, tx.send(Ok(rpc_resp))).await.is_err() {
+                                                            break "node RPC response queue stalled for 15s".to_string();
+                                                        }
+                                                    }
                                                 }
                                             }
-                                        } else {
-                                            let tx_clone = {
-                                                let pm = pending_recv.lock().await;
-                                                if let Some(PendingRpc::Stream(tx)) = pm.get(&id) {
-                                                    Some(tx.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            };
-                                            if let Some(tx) = tx_clone
-                                                && tx.send(Ok(rpc_resp)).await.is_err() {
-                                                    let mut pm = pending_recv.lock().await;
-                                                    pm.remove(&id);
-                                                }
                                         }
                                     }
-                                }
-                                NodeWsMessage::Ping => {
-                                    if let Err(err) = send_node_message(
-                                        &mut ws_tx,
-                                        &NodeWsMessage::Pong,
-                                        &mut phase,
-                                    )
-                                    .await {
-                                        break format!("failed to send pong to node WebSocket: {err}");
+                                    NodeWsMessage::RpcStreamFrame { id, response, done } => {
+                                        if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
+                                            if done {
+                                                let sender = {
+                                                    let mut pm = pending_recv.lock().await;
+                                                    pm.remove(&id)
+                                                };
+                                                if let Some(sender) = sender {
+                                                    match sender {
+                                                        PendingRpc::Stream(tx) => {
+                                                            if tokio::time::timeout(NODE_SEND_TIMEOUT, tx.send(Ok(rpc_resp))).await.is_err() {
+                                                                break "node stream response queue stalled for 15s".to_string();
+                                                            }
+                                                        }
+                                                        PendingRpc::OneShot(tx) => {
+                                                            let _ = tx.send(Ok(rpc_resp));
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                let tx_clone = {
+                                                    let pm = pending_recv.lock().await;
+                                                    if let Some(PendingRpc::Stream(tx)) = pm.get(&id) {
+                                                        Some(tx.clone())
+                                                    } else {
+                                                        None
+                                                    }
+                                                };
+                                                if let Some(tx) = tx_clone {
+                                                    match tokio::time::timeout(NODE_SEND_TIMEOUT, tx.send(Ok(rpc_resp))).await {
+                                                        Ok(Ok(())) => {},
+                                                        Ok(Err(_)) => {
+                                                            pending_recv.lock().await.remove(&id);
+                                                        }
+                                                        Err(_) => {
+                                                            break format!("node stream response queue stalled for 15s for RPC {id}");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                }
-                                NodeWsMessage::Notification {
-                                    kind,
-                                    title,
-                                    description,
-                                    body,
-                                    navigation_url,
-                                    session_ids,
-                                    trigger_rule,
-                                    trigger_detail,
-                                    last_total_bytes,
-                                    enabled_for_channels,
-                                } => {
-                                    let payload = SessionEvent::SessionNotification {
+                                    NodeWsMessage::Ping => {
+                                        if let Err(err) = send_node_message(
+                                            &mut ws_tx,
+                                            &NodeWsMessage::Pong,
+                                            &mut phase,
+                                        )
+                                        .await {
+                                            break format!("failed to send pong to node WebSocket: {err}");
+                                        }
+                                    }
+                                    NodeWsMessage::Notification {
                                         kind,
                                         title,
                                         description,
@@ -249,26 +246,43 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                         session_ids,
                                         trigger_rule,
                                         trigger_detail,
-                                        node: Some(name.clone()),
                                         last_total_bytes,
                                         enabled_for_channels,
-                                    };
-                                    handle_forwarded_session_event(&state, &name, payload)
-                                        .await;
-                                }
-                                NodeWsMessage::SessionEvent { payload } => {
-                                    handle_forwarded_session_event(&state, &name, payload)
-                                        .await;
-                                }
-                                NodeWsMessage::Pong => {},
-                                _ => break "unexpected message in established secondary channel".to_string(),
+                                    } => {
+                                        let payload = SessionEvent::SessionNotification {
+                                            kind,
+                                            title,
+                                            description,
+                                            body,
+                                            navigation_url,
+                                            session_ids,
+                                            trigger_rule,
+                                            trigger_detail,
+                                            node: Some(name.clone()),
+                                            last_total_bytes,
+                                            enabled_for_channels,
+                                        };
+                                        handle_forwarded_session_event(&state, &name, payload)
+                                            .await;
+                                    }
+                                    NodeWsMessage::SessionEvent { payload } => {
+                                        handle_forwarded_session_event(&state, &name, payload)
+                                            .await;
+                                    }
+                                    NodeWsMessage::Pong => {},
+                                    _ => break "unexpected message in established secondary channel".to_string(),
+                            }
                         }
+                        Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
+                        None => break "node WebSocket stream ended".to_string(),
                     }
-                    Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
-                    None => break "node WebSocket stream ended".to_string(),
                 }
             }
         }
+    };
+    let disconnect_reason = tokio::select! {
+        _ = wait_for_inbound_timeout(inbound_rx) => "node keepalive timeout (no authenticated inbound frames for 45s)".to_string(),
+        reason = relay => reason,
     };
 
     // Drain pending waiters with an error so callers don't hang.
@@ -473,10 +487,13 @@ async fn send_node_message(
             return Err(err.to_string());
         }
     };
-    ws_tx
-        .send(Message::Binary(payload.into()))
-        .await
-        .map_err(|err| err.to_string())
+    tokio::time::timeout(
+        NODE_SEND_TIMEOUT,
+        ws_tx.send(Message::Binary(payload.into())),
+    )
+    .await
+    .map_err(|_| "node WebSocket send timed out after 15s".to_string())?
+    .map_err(|err| err.to_string())
 }
 
 fn parse_node_message(

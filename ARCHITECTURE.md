@@ -187,8 +187,11 @@ Design points worth knowing before touching this code:
 
 Any daemon can be a **primary** (it serves `GET /api/nodes/join`); any
 daemon can attach to a primary as a **secondary** (`oly join start`,
-config persisted in `joins.json`, connector task reconnects with
-exponential backoff 1→60 s — `client/join.rs`, `daemon/rpc_nodes.rs`).
+config persisted in `joins.json`, one connector per saved name reconnects with
+exponential backoff 1→60 s, reset after each successful handshake —
+`client/join.rs`, `daemon/rpc_nodes.rs`). Multiple outbound joins are independent:
+each owns its connection, liveness deadline, retry state, bounded local relay
+tasks, and broadcast receiver. A failing primary must not stall another join.
 
 Federation-v2 handshake (`src/federation_crypto.rs`, `http/nodes.rs`,
 `daemon/rpc_nodes.rs`; transport is WebSocket, not SSH):
@@ -224,8 +227,16 @@ parsing, and terminates on failure or counter exhaustion.
 
 A 5-second overall handshake deadline and 4096-byte handshake payload cap
 apply on each side; WS message/frame allocation is additionally capped at
-64 MiB for application traffic. Cancellation interrupts connector handshake
-IO and retry backoff. Registration is atomic after encrypted readiness;
+64 MiB for application traffic. Cancellation interrupts connector handshake,
+established relay IO, and retry backoff. Both endpoints run a 45-second
+authenticated-inbound watchdog outside the relay future, so stalled socket,
+channel, or local operations cannot suppress disconnect/retry. Socket and
+relay-channel sends have 15-second deadlines. Secondary local RPC/attach
+tasks are bounded (64 per connection) and aborted when that connection ends;
+slow local RPCs do not block sealed keepalives. Outbound `join ls` status
+comes from the live connector, not a hard-coded disconnected value. Invalid
+or unreadable saved join configuration fails explicitly rather than silently
+skipping all connectors. Registration is atomic after encrypted readiness;
 generation-scoped disconnect cannot evict a newer connection. Federation
 failure throttling is independent of browser authentication. Primary sealed
 pings run every 15 s; only authenticated frames refresh the 45 s liveness clock.
@@ -290,6 +301,17 @@ Where to look: `src/node/registry.rs` (NodeRegistry, proxy_*),
 allowlists), `src/http/nodes.rs` (join endpoint, keepalive, event
 tagging), `src/federation_crypto.rs` (channel-key derivation + signature
 helpers), `src/client/join.rs` (join config + CLI).
+
+## Linux IPC isolation
+
+Linux abstract sockets belong to the network namespace. They are not scoped
+by the state directory or PID namespace, and WSL distributions can share them.
+The default Linux socket name therefore hashes the canonical absolute state
+directory and `WSL_DISTRO_NAME` (when present). Explicit `OLY_SOCKET_NAME`
+remains authoritative and must be unique among independent daemons sharing a
+network namespace. Other platforms retain their existing default IPC routing.
+See [IPC upgrade and isolation](./docs/guides/troubleshooting.md#linuxwsl-ipc-upgrade-and-isolation)
+before replacing a Linux binary that used the old global socket name.
 
 ## Windows IPC and sleep/resume failures
 

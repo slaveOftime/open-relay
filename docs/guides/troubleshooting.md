@@ -20,6 +20,25 @@ oly daemon status
 - Only one daemon can own a state directory (`oly.db`, `daemon.lock`, `daemon.sock`). Use a separate `OLY_STATE_DIR` for an isolated second daemon.
 - `daemon is unavailable` means no daemon is listening on the state socket (or the CLI and daemon use different `OLY_STATE_DIR` / `OLY_SOCKET_NAME` values). In a restricted agent sandbox, `Access is denied` means IPC is blocked by the sandbox while the daemon may still be running — retry with approval/escalation rather than starting a second daemon.
 
+### Linux/WSL IPC upgrade and isolation
+
+The Linux default socket is now scoped to the canonical state directory and
+`WSL_DISTRO_NAME`, rather than the shared `open-relay.oly.sock`. Upgrade the CLI
+and daemon together. **Finish live work and stop the old daemon with the old
+binary before replacing it**; a new CLI will not discover the old default
+socket. If an old daemon is still running after the upgrade, an explicit
+`OLY_SOCKET_NAME=open-relay.oly.sock` can address it, but verify ownership first.
+
+WSL distributions can share a network namespace while having different PID
+namespaces and filesystems. An old global or reused explicit socket name can
+make the CLI reach another distribution's daemon. Symptoms include an empty
+join list despite a local `joins.json`, missing local daemon lock/info files,
+and no fresh local logs. Do not stop that daemon blindly. Use a unique explicit
+socket name with older binaries, or the new scoped default, consistently in
+both the daemon service environment and CLI shells. Custom containers that
+share identical state paths/network namespaces still need distinct explicit
+socket names if they do not provide a distinct `WSL_DISTRO_NAME`.
+
 ### Detached start never becomes ready
 Check `<state>/logs/daemon.log`, `logs/daemon-crash.log` (Rust panics), and `logs/daemon-stderr.log`. When inspecting panics, preserve the **first** panic location (later `PoisonError` panics are usually secondary).
 
@@ -79,7 +98,9 @@ Geometry follows the last controller resize. Detach and reattach (or resize the 
 1. Both sides must run matching 0.5 versions.
 2. The primary must authorize the exact name and public key (`oly node accept --name <n> --id-pub-key <key>`).
 3. The secondary must pin the primary's public key (`oly join start --name <n> --id-pub-key <key> <url>`).
-4. After rotating a key with `oly node accept`, restart the secondary connector (`oly join stop` + `oly join start`) to force re-verification. See [Node federation](../releases/compatibility-0.5.md#node-federation).
+4. Check that CLI and daemon use the same state/IPC environment; see [Linux/WSL isolation](#linuxwsl-ipc-upgrade-and-isolation). `join ls --primary` reports inbound nodes, not the secondary's outbound connection.
+5. Inspect `<state>/logs/daemon.log.<UTC-date>` or `daemon-stderr.log` for handshake, send, and authenticated keepalive timeout reasons. Invalid/unreadable `joins.json` fails explicitly; fix it without replacing verified identity pins. No log activity can mean you are reaching the wrong daemon, not a networking failure.
+6. After rotating a key with `oly node accept`, restart the secondary connector (`oly join stop` + `oly join start`) to force re-verification. See [Node federation](../releases/compatibility-0.5.md#node-federation).
 
 ## Reporting an issue
 
