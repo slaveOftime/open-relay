@@ -68,7 +68,6 @@ import {
 import { TooltipProvider } from '@/components/ui/tooltip'
 import {
   BellIcon,
-  CaretDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   GridIcon,
@@ -87,8 +86,8 @@ import { useSseConnectionState } from '@/hooks/use-session-events'
 import { useSessionTableColumns } from '@/hooks/use-session-table-columns'
 import { useSessionListGestures } from '@/hooks/use-session-list-gestures'
 import { useSessionLoaders } from './sessions-page-loaders'
-import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
-import type { GroupBy } from '@/components/sessions/group-by'
+import { SessionGroupHeader } from '@/components/sessions/SessionGroupHeader'
+import { collapsedGroupKey, type GroupBy } from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
 import { SessionRow } from '@/components/sessions/SessionRow'
 import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
@@ -123,6 +122,9 @@ export default function SessionsPage() {
   const [search, setSearch] = useState(initialPrefs.search)
   const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>(initialPrefs.statusFilter)
   const [groupBy, setGroupBy] = useState<GroupBy>(initialPrefs.groupBy)
+  // Groups the user collapsed, by `collapsedGroupKey`. Browser-local and not a
+  // saved preference: a fresh visit starts with every group open.
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(new Set())
   const [sortField, setSortField] = useState<SessionSortField>(initialPrefs.sortField)
   const [sortOrder, setSortOrder] = useState<SortOrder>(initialPrefs.sortOrder)
   const [pageSize, setPageSize] = useState<number>(initialPrefs.pageSize)
@@ -501,6 +503,18 @@ export default function SessionsPage() {
     }
     return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
   }, [groupBy, pagedSessions])
+
+  const handleToggleGroup = useCallback(
+    (keyLabel: string) => {
+      const key = collapsedGroupKey(groupBy, keyLabel)
+      setCollapsedGroups((prev) => {
+        const next = new Set(prev)
+        if (!next.delete(key)) next.add(key)
+        return next
+      })
+    },
+    [groupBy]
+  )
 
   const handleRunAgain = useCallback((session: SessionSummary) => {
     setRerunSession(session)
@@ -1068,34 +1082,46 @@ export default function SessionsPage() {
               )}
               {!loading && sessions.length > 0 && (
                 <div className="pb-4">
-                  {grouped.map(({ key, items }) => (
-                    <div key={key || '__flat__'}>
-                      {groupBy !== 'none' && key && (
-                        <div className="flex flex-nowrap gap-1 items-center px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
-                          <CaretDownIcon className="h-4 w-4 shrink-0" />
-                          <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
-                        </div>
-                      )}
-                      {items.map((s) => (
-                        <SessionCard
-                          key={s.id}
-                          session={s}
-                          animateIn={enteringIds.has(s.id)}
-                          pinned={isSessionPinned(s)}
-                          onStop={handleStop}
-                          onKill={handleKill}
-                          onToggleNotifications={handleToggleNotifications}
-                          onTogglePin={handleTogglePin}
-                          onRunAgain={handleRunAgain}
-                          onEditSession={handleEditSession}
-                          onRequestDelete={setDeletingSession}
-                          notificationsPending={notificationRequestIds.has(s.id)}
-                          node={selectedNode ?? undefined}
-                          showCwd={groupBy !== 'cwd'}
-                        />
-                      ))}
-                    </div>
-                  ))}
+                  {grouped.map(({ key, items }) => {
+                    const collapsed = collapsedGroups.has(collapsedGroupKey(groupBy, key))
+                    return (
+                      <div key={key || '__flat__'}>
+                        {groupBy !== 'none' && key && (
+                          // Sticky inside the list's own scrollport, on an
+                          // opaque backing: the header's tint is translucent,
+                          // and the cards sliding under it must stay hidden.
+                          <div className="sticky top-0 z-20 bg-[hsl(var(--background))]">
+                            <SessionGroupHeader
+                              groupBy={groupBy}
+                              keyLabel={key}
+                              items={items}
+                              collapsed={collapsed}
+                              onToggle={() => handleToggleGroup(key)}
+                            />
+                          </div>
+                        )}
+                        {!collapsed &&
+                          items.map((s) => (
+                            <SessionCard
+                              key={s.id}
+                              session={s}
+                              animateIn={enteringIds.has(s.id)}
+                              pinned={isSessionPinned(s)}
+                              onStop={handleStop}
+                              onKill={handleKill}
+                              onToggleNotifications={handleToggleNotifications}
+                              onTogglePin={handleTogglePin}
+                              onRunAgain={handleRunAgain}
+                              onEditSession={handleEditSession}
+                              onRequestDelete={setDeletingSession}
+                              notificationsPending={notificationRequestIds.has(s.id)}
+                              node={selectedNode ?? undefined}
+                              showCwd={groupBy !== 'cwd'}
+                            />
+                          ))}
+                      </div>
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -1195,41 +1221,51 @@ export default function SessionsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {grouped.map(({ key, items }) => (
-                  <Fragment key={key || '__flat__'}>
-                    {groupBy !== 'none' && key && (
-                      <TableRow>
-                        <TableCell
-                          colSpan={orderedTableColumns.length}
-                          className="px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10"
-                        >
-                          <div className="flex items-center gap-1">
-                            <CaretDownIcon className="h-4 w-4" />
-                            <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    )}
-                    {items.map((s) => (
-                      <SessionRow
-                        key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
-                        session={s}
-                        animateIn={enteringIds.has(s.id)}
-                        pinned={isSessionPinned(s)}
-                        onStop={handleStop}
-                        onKill={handleKill}
-                        onToggleNotifications={handleToggleNotifications}
-                        onTogglePin={handleTogglePin}
-                        onRunAgain={handleRunAgain}
-                        onEditSession={handleEditSession}
-                        onRequestDelete={setDeletingSession}
-                        notificationsPending={notificationRequestIds.has(s.id)}
-                        node={selectedNode ?? undefined}
-                        columns={orderedTableColumns}
-                      />
-                    ))}
-                  </Fragment>
-                ))}
+                {grouped.map(({ key, items }) => {
+                  const collapsed = collapsedGroups.has(collapsedGroupKey(groupBy, key))
+                  return (
+                    <Fragment key={key || '__flat__'}>
+                      {groupBy !== 'none' && key && (
+                        <TableRow>
+                          <TableCell
+                            colSpan={orderedTableColumns.length}
+                            // The same sticky, opaque wrapper as the mobile
+                            // list: the cell paints a solid canvas under the
+                            // header's translucent tint.
+                            className="sticky top-0 z-20 bg-[hsl(var(--background))] p-0"
+                          >
+                            <SessionGroupHeader
+                              groupBy={groupBy}
+                              keyLabel={key}
+                              items={items}
+                              collapsed={collapsed}
+                              onToggle={() => handleToggleGroup(key)}
+                            />
+                          </TableCell>
+                        </TableRow>
+                      )}
+                      {!collapsed &&
+                        items.map((s) => (
+                          <SessionRow
+                            key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
+                            session={s}
+                            animateIn={enteringIds.has(s.id)}
+                            pinned={isSessionPinned(s)}
+                            onStop={handleStop}
+                            onKill={handleKill}
+                            onToggleNotifications={handleToggleNotifications}
+                            onTogglePin={handleTogglePin}
+                            onRunAgain={handleRunAgain}
+                            onEditSession={handleEditSession}
+                            onRequestDelete={setDeletingSession}
+                            notificationsPending={notificationRequestIds.has(s.id)}
+                            node={selectedNode ?? undefined}
+                            columns={orderedTableColumns}
+                          />
+                        ))}
+                    </Fragment>
+                  )
+                })}
               </TableBody>
             </Table>
           )}
