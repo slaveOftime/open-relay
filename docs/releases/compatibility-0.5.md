@@ -139,7 +139,7 @@ contract:
 | Unknown future journal version | explicit unsupported-version error; never empty history |
 | Peer lacks a requested capability (planned) | explicit refusal naming the capability |
 | Unknown optional field in CLI JSON or private IPC JSON | ignored (additions stay forward-compatible) |
-| Unknown field in a federation frame | rejected on field-bearing frames; unit `joined` tolerates extras (serde limit) — the handshake version is the gate |
+| Unknown field in a federation envelope | rejected on field-bearing variants; unit `joined`, `ping`, and `pong` tolerate extras (serde limit); nested RPC JSON follows the IPC rules — the handshake version is the gate |
 | Unknown IPC type tag or missing required field | protocol error |
 | Wrong-session, stale-incarnation, or past-end cursor | explicit cursor error naming the condition |
 | Delivered request rejected by the daemon | request-failure error; never reported as daemon-unavailable |

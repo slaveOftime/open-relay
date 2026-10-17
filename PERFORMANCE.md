@@ -97,10 +97,16 @@ reconnecting under sustained output instead of idling.
   (single segment; appender payload 6,739,319 B, ~2.4× framing overhead),
   produced by ~259k lines in ~25–30 s of live flooding.
 
-Reproduction (PowerShell; isolated daemon, never the real state dir):
+Maintainer-reported measurements; raw run artifacts are not checked in.
+Workload sketch (PowerShell; isolated daemon, never the real state dir).
+This is not a complete automation script: the eight idle shells, observer
+launch/reconnect phases, metric collection, and cleanup must be supplied
+separately. The results below describe one run, not a capacity guarantee:
 
 ```powershell
-$env:OLY_STATE_DIR = "$env:TEMP\oly-bench"; $env:OLY_SOCKET_NAME = 'oly-bench-sock'
+$benchId = [guid]::NewGuid().ToString('N')
+$env:OLY_STATE_DIR = "$env:TEMP\oly-bench-$benchId"; $env:OLY_SOCKET_NAME = "oly-bench-$benchId"
+New-Item -ItemType Directory -Path $env:OLY_STATE_DIR | Out-Null
 Set-Content "$env:OLY_STATE_DIR\config.json" '{"http_port": 15999}'
 oly daemon start --detach --no-auth-without-ask
 oly start --detach --title flood -- cmd /c '(for /L %i in (1,1,600000) do @echo line %i with padding) & ping -n 601 127.0.0.1 >nul'
@@ -137,7 +143,7 @@ Notes:
   resync:** ~4.15 MB of journal replayed across 322 resyncs in ~30 s
   (~13 KB each — small ring gaps, not full re-reads). No client was
   credit-closed; `attach_credit_closes_total` never registered.
-- **`oly ls` stays bounded under load:** ~40–70 ms daemon-side while the
+- **`oly ls` in this measured workload:** ~40–70 ms daemon-side while the
   flood runs vs ~24 ms after it stops, on 10 live sessions. The remaining
   gap is live-row work while a session writes ~0.6 MB/s of durable
   journal.
