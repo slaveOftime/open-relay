@@ -63,7 +63,7 @@ oly attach <id> --node worker-1
 oly stop <id> --node worker-1
 ```
 
-`oly join ls` lists saved outbound joins on a secondary (`oly join ls --primary` inspects active connector inventory). `oly join stop --name worker-1` disconnects and removes the saved join.
+`oly node ls` (on the primary) lists the **inbound secondaries currently connected** to its WebSocket connector registry (only live, post-handshake). `oly join ls` (on the secondary) lists this secondary's saved outbound joins from `joins.json`, each labeled `connected` or `saved` (retrying with backoff). `oly join ls --primary`/`-p` (also on the secondary) asks the primary, from this secondary, for the connected node names it sees — it is not a view of the secondary's outbound connector state. `oly join stop --name worker-1` disconnects and removes a saved join.
 
 ### Trust, encryption, and rotation
 

@@ -75,7 +75,7 @@ Geometry follows the last controller resize. Detach and reattach (or resize the 
 
 ## Connected machines
 
-`oly node ls` on the primary lists currently **connected** nodes; `oly join ls` on the secondary shows `connected` or `saved` (retrying with backoff). If a node fails to connect:
+`oly node ls` (on the primary) lists **inbound secondaries currently connected** (live WebSocket). `oly join ls` (on the secondary) lists each saved outbound join with state `connected` or `saved` (retrying with backoff). `oly join ls --primary`/`-p` on a secondary asks the primary to list its connected node **names only**. If a node fails to connect:
 1. Both sides must run matching 0.5 versions.
 2. The primary must authorize the exact name and public key (`oly node accept --name <n> --id-pub-key <key>`).
 3. The secondary must pin the primary's public key (`oly join start --name <n> --id-pub-key <key> <url>`).
