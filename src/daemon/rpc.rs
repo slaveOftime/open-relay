@@ -302,7 +302,9 @@ async fn dispatch_request(
             .await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
-        RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
+        RpcRequest::JoinList { primary } => {
+            handle_join_list(config, join_handles, node_registry, primary).await
+        }
         RpcRequest::NodeList => handle_node_list(node_registry).await,
         RpcRequest::NodeAccept { name, id_pub_key } => {
             handle_node_accept(name, id_pub_key, db).await
@@ -679,9 +681,10 @@ async fn handle_join_start(
     // the CLI synchronously instead of the user finding out about a
     // rejected join only by absence in `oly join ls`.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let (abort, stop_tx) =
+    let connector =
         spawn_join_connector(join, Arc::clone(config), session_event_tx.clone(), Some(tx));
-    join_handles.lock().await.insert(name, (abort, stop_tx));
+    // Dropping the replaced connector cancels it, including any blocked IO.
+    join_handles.lock().await.insert(name, connector);
     let outcome = match tokio::time::timeout(FIRST_JOIN_ATTEMPT_DEADLINE, rx).await {
         Ok(Ok(super::rpc_nodes::JoinAttempt::Connected)) => ("connected", String::new()),
         Ok(Ok(super::rpc_nodes::JoinAttempt::Failed(msg))) => ("failed", msg),
@@ -719,16 +722,18 @@ async fn handle_join_stop(
     join_handles: &JoinHandles,
     name: String,
 ) -> RpcResponse {
-    client::join::remove_join_config(config, &name);
-    if let Some((abort, stop_tx)) = join_handles.lock().await.remove(&name) {
-        let _ = stop_tx.send(true);
-        drop(abort);
+    if let Err(err) = client::join::remove_join_config(config, &name) {
+        return RpcResponse::Error {
+            message: err.to_string(),
+        };
     }
+    join_handles.lock().await.remove(&name);
     RpcResponse::Ack
 }
 
 async fn handle_join_list(
     config: &AppConfig,
+    join_handles: &JoinHandles,
     node_registry: &NodeRegistry,
     primary: bool,
 ) -> RpcResponse {
@@ -744,7 +749,21 @@ async fn handle_join_list(
             })
             .collect()
     } else {
-        client::join::list_join_summaries(config)
+        let mut summaries = match client::join::list_join_summaries(config) {
+            Ok(summaries) => summaries,
+            Err(err) => {
+                return RpcResponse::Error {
+                    message: err.to_string(),
+                };
+            }
+        };
+        let handles = join_handles.lock().await;
+        for join in &mut summaries {
+            join.connected = handles
+                .get(&join.name)
+                .is_some_and(|handle| handle.is_connected());
+        }
+        summaries
     };
 
     RpcResponse::JoinList { joins }

@@ -63,7 +63,17 @@ oly attach <id> --node worker-1
 oly stop <id> --node worker-1
 ```
 
-`oly join ls` lists saved outbound joins on a secondary (`oly join ls --primary` inspects active connector inventory). `oly join stop --name worker-1` disconnects and removes the saved join.
+`oly join ls` lists saved outbound joins on a secondary and reports whether
+its connector is currently connected. `oly join ls --primary` lists connected
+**inbound secondaries**, not outbound connector inventory. `oly join stop --name
+worker-1` disconnects and removes the saved join. Saved joins reconnect at daemon
+startup and after link failure with 1–60 s backoff, reset after a successful
+handshake. Multiple primaries are supported: use a distinct saved name for each
+join (the same name replaces its previous connector). Each connection has its
+own retry, liveness, and relay-task state. Both endpoints abandon a
+connection after 45 s without authenticated inbound traffic; stalled sends
+also have deadlines. Invalid/unreadable `joins.json` fails explicitly at startup
+or when listing/updating joins; it is not treated as an empty list.
 
 ### Trust, encryption, and rotation
 
@@ -104,7 +114,12 @@ Available placeholders (also exported as `OLY_EVENT_*` env vars): `{kind}`, `{ti
 | Linux | `$XDG_STATE_HOME/oly` or `~/.local/state/oly` |
 | macOS | `~/Library/Application Support/oly` |
 
-Override with `OLY_STATE_DIR` (use `OLY_STATE_DIR="$PWD/.dev-state"` for development clones). State contains `oly.db`, `logs/`, `sessions/<id>/journal/`, `config.json`, `identity_key`, `joins.json`, and optional `wwwroot/apps/`.
+Override with `OLY_STATE_DIR` (use `OLY_STATE_DIR="$PWD/.dev-state"` for development clones).
+On Linux, default IPC names are scoped to the canonical state path and WSL
+distribution. An explicit `OLY_SOCKET_NAME` overrides this: use the same value
+for daemon and CLI, and distinct values for independent environments. Other
+platforms keep their previous defaults. See [IPC upgrade and isolation](./troubleshooting.md#linuxwsl-ipc-upgrade-and-isolation).
+State contains `oly.db`, `logs/`, `sessions/<id>/journal/`, `config.json`, `identity_key`, `joins.json`, and optional `wwwroot/apps/`.
 
 Configuration in `<state>/config.json` is flat JSON:
 - For config keys, defaults, and hot reload, see the [daemon skill](../../skills/oly-daemon/SKILL.md) (`oly skill --daemon`).

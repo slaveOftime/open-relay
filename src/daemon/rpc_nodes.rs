@@ -1,5 +1,11 @@
 use interprocess::local_socket::tokio::Stream;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     sync::{broadcast, mpsc, watch},
@@ -15,7 +21,10 @@ use crate::{
     db::Database,
     error::Result,
     federation_crypto, ipc,
-    node::NodeRegistry,
+    node::{
+        NodeRegistry,
+        liveness::{NODE_SEND_TIMEOUT, wait_for_inbound_timeout},
+    },
     protocol::{
         FEDERATION_VERSION, MAX_NODE_HANDSHAKE_BYTES, NODE_HANDSHAKE_TIMEOUT, NodeWsMessage,
         RpcRequest, RpcResponse,
@@ -61,22 +70,91 @@ impl AttemptReporter {
     }
 }
 
+/// Owns cancellation and live outbound status. Replacing/removing an entry
+/// must end its old socket even if the relay is blocked in an await.
+pub(crate) struct JoinConnector {
+    abort: tokio::task::AbortHandle,
+    stop_tx: watch::Sender<bool>,
+    connected: Arc<AtomicBool>,
+}
+
+impl JoinConnector {
+    pub(crate) fn is_connected(&self) -> bool {
+        !self.abort.is_finished() && self.connected.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for JoinConnector {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.abort.abort();
+    }
+}
+
+/// Reset status on every exit path, including watchdog cancellation and abort.
+struct ConnectedGuard(Arc<AtomicBool>);
+
+impl ConnectedGuard {
+    fn new(connected: Arc<AtomicBool>) -> Self {
+        connected.store(true, Ordering::Release);
+        Self(connected)
+    }
+}
+
+impl Drop for ConnectedGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub(super) fn spawn_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
     session_event_tx: broadcast::Sender<SessionEvent>,
     on_attempt: Option<tokio::sync::oneshot::Sender<JoinAttempt>>,
-) -> (tokio::task::AbortHandle, watch::Sender<bool>) {
+) -> JoinConnector {
     let (stop_tx, stop_rx) = watch::channel(false);
     let reporter = match on_attempt {
         Some(tx) => AttemptReporter::new(tx),
         None => AttemptReporter::empty(),
     };
     let session_event_rx = session_event_tx.subscribe();
+    let connected = Arc::new(AtomicBool::new(false));
+    let task_connected = Arc::clone(&connected);
     let task = tokio::spawn(async move {
-        run_join_connector(join, local_config, session_event_rx, stop_rx, reporter).await;
+        run_join_connector(
+            join,
+            local_config,
+            session_event_rx,
+            stop_rx,
+            reporter,
+            task_connected,
+        )
+        .await;
     });
-    (task.abort_handle(), stop_tx)
+    JoinConnector {
+        abort: task.abort_handle(),
+        stop_tx,
+        connected,
+    }
+}
+
+#[derive(Default)]
+struct RetryBackoff {
+    attempt: usize,
+}
+
+impl RetryBackoff {
+    fn reset(&mut self) {
+        self.attempt = 0;
+    }
+
+    fn next_wait_secs(&mut self) -> u64 {
+        const BACKOFF: &[u64] = &[1, 2, 4, 8, 16, 32, 60];
+        let wait = BACKOFF[self.attempt];
+        self.attempt = (self.attempt + 1).min(BACKOFF.len() - 1);
+        wait
+    }
 }
 
 async fn run_join_connector(
@@ -85,9 +163,9 @@ async fn run_join_connector(
     mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
     mut attempt_report: AttemptReporter,
+    connected: Arc<AtomicBool>,
 ) {
-    const BACKOFF: &[u64] = &[1, 2, 4, 8, 16, 32, 60];
-    let mut attempt = 0usize;
+    let mut backoff = RetryBackoff::default();
 
     loop {
         match connect_and_relay(
@@ -96,6 +174,8 @@ async fn run_join_connector(
             &mut session_event_rx,
             &mut stop_rx,
             &mut attempt_report,
+            &connected,
+            &mut backoff,
         )
         .await
         {
@@ -120,7 +200,7 @@ async fn run_join_connector(
             return;
         }
 
-        let wait = BACKOFF[attempt.min(BACKOFF.len() - 1)];
+        let wait = backoff.next_wait_secs();
         warn!(node = %join.name, wait_secs = wait, "join connector retrying");
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -129,7 +209,6 @@ async fn run_join_connector(
                 return;
             }
         }
-        attempt += 1;
     }
 }
 
@@ -139,6 +218,8 @@ async fn connect_and_relay(
     session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
     attempt_report: &mut AttemptReporter,
+    connected: &Arc<AtomicBool>,
+    backoff: &mut RetryBackoff,
 ) -> Result<bool> {
     let base = join.primary_url.trim_end_matches('/');
     let ws_url = if base.starts_with("https://") {
@@ -170,167 +251,197 @@ async fn connect_and_relay(
         }
     };
     info!(node = %join.name, primary = %join.primary_url, "joined primary after encrypted confirmation");
+    let _connected = ConnectedGuard::new(Arc::clone(connected));
+    // An old outage must not leave the next independent outage at a 60s wait.
+    backoff.reset();
     attempt_report.joined();
+    let (inbound_tx, inbound_rx) = watch::channel(tokio::time::Instant::now());
 
-    let (stream_frame_tx, mut stream_frame_rx) = mpsc::channel::<(String, RpcResponse, bool)>(256);
-    // Open streaming RPCs: rpc_id -> inbound client-message channel.
-    // Mid-stream messages from the primary (input/resize/credits/detach)
-    // are routed into the stream's task, which writes them onto the
-    // nested local IPC connection so the owning daemon's attachment-scoped
-    // fencing and credit gate apply to remote clients exactly as local.
-    let mut streams: HashMap<String, mpsc::Sender<RpcRequest>> = HashMap::new();
-    loop {
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    let _ = ws_tx.send(WsMessage::Close(None)).await;
-                    return Ok(true);
-                }
-            }
-            frame = stream_frame_rx.recv() => {
-                let Some((id, response, done)) = frame else { break };
-                if done {
-                    // Stream finished: drop the inbound channel so a late
-                    // mid-stream message fails loudly instead of vanishing.
-                    streams.remove(&id);
-                }
-                let response_json = match serde_json::to_value(&response) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let reply = NodeWsMessage::RpcStreamFrame {
-                    id,
-                    response: response_json,
-                    done,
-                };
-                if !send_node_message(&mut ws_tx, &reply, &mut phase).await {
-                    break;
-                }
-            }
-            incoming = ws_rx.next() => {
-                let Some(msg_result) = incoming else { break };
-
-                let frame = match msg_result {
-                    Ok(WsMessage::Close(_)) | Err(_) => break,
-                    // Tungstenite already frames protocol-level Ping / Pong
-                    // handling on the WebSocket layer (auto-pong on inbound
-                    // pings, dropping inbound pongs), so anything left here
-                    // is application traffic — silently skip these rather
-                    // than emitting "unsupported node connector frame"
-                    // warnings that would otherwise drown the log every
-                    // keepalive tick.
-                    Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
-                    Ok(frame) => frame,
-                };
-                let node_msg = match decode_node_message(frame, &mut phase) {
-                    Ok(message) => message,
-                    Err(err) => {
-                        warn!(node = %join.name, %err, "invalid sealed primary frame; closing");
-                        break;
+    // Keep the cancellation and authenticated-inbound watchdog outside every
+    // relay await, including WebSocket sends and local channel operations.
+    let relay = async {
+        let mut relay_tasks = tokio::task::JoinSet::new();
+        let (rpc_tx, mut rpc_rx) = mpsc::channel::<(String, RpcResponse)>(64);
+        let (stream_frame_tx, mut stream_frame_rx) =
+            mpsc::channel::<(String, RpcResponse, bool)>(256);
+        // Open streaming RPCs: rpc_id -> inbound client-message channel.
+        // Mid-stream messages from the primary (input/resize/credits/detach)
+        // are routed into the stream's task, which writes them onto the
+        // nested local IPC connection so the owning daemon's attachment-scoped
+        // fencing and credit gate apply to remote clients exactly as local.
+        let mut streams: HashMap<String, mpsc::Sender<RpcRequest>> = HashMap::new();
+        loop {
+            tokio::select! {
+                finished = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
+                    if let Some(Err(err)) = finished {
+                        return Err(crate::error::AppError::Protocol(format!("node relay task failed: {err}")));
                     }
-                };
+                }
+                response = rpc_rx.recv() => {
+                    let Some((id, response)) = response else { break };
+                    let reply = NodeWsMessage::RpcResponse { id, response: serde_json::to_value(response)? };
+                    send_node_message(&mut ws_tx, &reply, &mut phase).await?;
+                }
+                frame = stream_frame_rx.recv() => {
+                    let Some((id, response, done)) = frame else { break };
+                    if done {
+                        // Stream finished: drop the inbound channel so a late
+                        // mid-stream message fails loudly instead of vanishing.
+                        streams.remove(&id);
+                    }
+                    let response_json = match serde_json::to_value(&response) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let reply = NodeWsMessage::RpcStreamFrame {
+                        id,
+                        response: response_json,
+                        done,
+                    };
+                    send_node_message(&mut ws_tx, &reply, &mut phase).await?;
+                }
+                incoming = ws_rx.next() => {
+                    let Some(msg_result) = incoming else { break };
 
-                match node_msg {
-                    NodeWsMessage::Rpc { id, request } => {
-                        let response = match serde_json::from_value::<RpcRequest>(request) {
-                            Ok(req) if is_supported_proxied_rpc(&req) => {
-                                if matches!(req, RpcRequest::AttachSubscribe { .. }) {
+                    let frame = match msg_result {
+                        Ok(WsMessage::Close(frame)) => return Err(crate::error::AppError::Protocol(format!("primary sent close frame: {frame:?}"))),
+                        Err(err) => return Err(crate::error::AppError::Protocol(format!("primary WebSocket receive error: {err}"))),
+                        // Tungstenite already frames protocol-level Ping / Pong
+                        // handling on the WebSocket layer (auto-pong on inbound
+                        // pings, dropping inbound pongs), so anything left here
+                        // is application traffic — silently skip these rather
+                        // than emitting "unsupported node connector frame"
+                        // warnings that would otherwise drown the log every
+                        // keepalive tick.
+                        Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
+                        Ok(frame) => frame,
+                    };
+                    let node_msg = match decode_node_message(frame, &mut phase) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            warn!(node = %join.name, %err, "invalid sealed primary frame; closing");
+                            break;
+                        }
+                    };
+
+                    inbound_tx.send_replace(tokio::time::Instant::now());
+                    match node_msg {
+                        NodeWsMessage::Rpc { id, request } => {
+                            if relay_tasks.len() >= 64 {
+                                return Err(crate::error::AppError::Protocol("node relay task capacity exceeded".into()));
+                            }
+                            let response = match serde_json::from_value::<RpcRequest>(request) {
+                                Ok(req) if is_supported_proxied_rpc(&req) => {
+                                    if matches!(req, RpcRequest::AttachSubscribe { .. }) {
+                                        let local_cfg = Arc::clone(local_config);
+                                        let rpc_id = id.clone();
+                                        let frame_tx = stream_frame_tx.clone();
+                                        let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
+                                        streams.insert(rpc_id.clone(), msg_tx);
+                                        relay_tasks.spawn(async move {
+                                            if let Err(err) =
+                                                relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx, msg_rx).await
+                                            {
+                                                warn!(%err, id = %rpc_id, "streaming relay failed");
+                                                let resp = RpcResponse::Error {
+                                                    message: err.to_string(),
+                                                };
+                                                let _ = frame_tx.send((rpc_id, resp, true)).await;
+                                            }
+                                        });
+                                        continue;
+                                    }
+
+                                    // Local RPCs can involve slow journal replay. They must
+                                    // not prevent sealed keepalives or stop from being read.
                                     let local_cfg = Arc::clone(local_config);
-                                    let rpc_id = id.clone();
-                                    let frame_tx = stream_frame_tx.clone();
-                                    let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
-                                    streams.insert(rpc_id.clone(), msg_tx);
-                                    tokio::spawn(async move {
-                                        if let Err(err) =
-                                            relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx, msg_rx).await
-                                        {
-                                            warn!(%err, id = %rpc_id, "streaming relay failed");
-                                            let resp = RpcResponse::Error {
-                                                message: err.to_string(),
-                                            };
-                                            let _ = frame_tx.send((rpc_id, resp, true)).await;
-                                        }
+                                    let reply_tx = rpc_tx.clone();
+                                    relay_tasks.spawn(async move {
+                                        let response = match ipc::send_request(&local_cfg, req).await {
+                                            Ok(response) => response,
+                                            Err(err) => RpcResponse::Error { message: err.to_string() },
+                                        };
+                                        let _ = reply_tx.send((id, response)).await;
                                     });
                                     continue;
                                 }
-
-                                match ipc::send_request(local_config, req).await {
-                                    Ok(r) => r,
-                                    Err(err) => RpcResponse::Error {
-                                        message: err.to_string(),
-                                    },
+                                Ok(req) => {
+                                    warn!(%id, request_type = req.name(), "unsupported proxied RPC method");
+                                    RpcResponse::Error {
+                                        message: format!("unsupported proxied RPC method: {}", req.name()),
+                                    }
                                 }
-                            }
-                            Ok(req) => {
-                                warn!(%id, request_type = req.name(), "unsupported proxied RPC method");
-                                RpcResponse::Error {
-                                    message: format!("unsupported proxied RPC method: {}", req.name()),
+                                Err(err) => {
+                                    warn!(%err, id = %id, "failed to deserialise proxied RPC");
+                                    RpcResponse::Error {
+                                        message: format!("invalid proxied RPC request: {err}"),
+                                    }
                                 }
-                            }
-                            Err(err) => {
-                                warn!(%err, id = %id, "failed to deserialise proxied RPC");
-                                RpcResponse::Error {
-                                    message: format!("invalid proxied RPC request: {err}"),
-                                }
-                            }
-                        };
+                            };
 
-                        let response_json = match serde_json::to_value(&response) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
+                            let response_json = match serde_json::to_value(&response) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
 
-                        let reply = NodeWsMessage::RpcResponse {
-                            id,
-                            response: response_json,
-                        };
-                        if !send_node_message(&mut ws_tx, &reply, &mut phase).await {
-                            break;
+                            let reply = NodeWsMessage::RpcResponse {
+                                id,
+                                response: response_json,
+                            };
+                            send_node_message(&mut ws_tx, &reply, &mut phase).await?;
                         }
-                    }
-                    NodeWsMessage::RpcStreamMessage { id, request } => {
-                        match serde_json::from_value::<RpcRequest>(request) {
-                            Ok(req) if is_stream_message_relayable(&req) => {
-                                match streams.get(&id) {
-                                    Some(tx) => {
-                                        if tx.send(req).await.is_err() {
-                                            // Stream task ended without a done
-                                            // frame yet; drop the route.
-                                            streams.remove(&id);
+                        NodeWsMessage::RpcStreamMessage { id, request } => {
+                            match serde_json::from_value::<RpcRequest>(request) {
+                                Ok(req) if is_stream_message_relayable(&req) => {
+                                    match streams.get(&id) {
+                                        Some(tx) => {
+                                            match tokio::time::timeout(NODE_SEND_TIMEOUT, tx.send(req)).await {
+                                                Ok(Ok(())) => {},
+                                                Ok(Err(_)) => { streams.remove(&id); },
+                                                Err(_) => {
+                                                    return Err(crate::error::AppError::Protocol(format!("node attach input queue stalled for 15s for RPC {id}")));
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            debug!(%id, "mid-stream message for unknown/closed stream");
                                         }
                                     }
-                                    None => {
-                                        debug!(%id, "mid-stream message for unknown/closed stream");
-                                    }
+                                }
+                                Ok(other) => {
+                                    warn!(%id, request_type = other.name(), "rejected non-attach mid-stream message");
+                                }
+                                Err(err) => {
+                                    warn!(%id, %err, "failed to deserialise mid-stream message");
                                 }
                             }
-                            Ok(other) => {
-                                warn!(%id, request_type = other.name(), "rejected non-attach mid-stream message");
-                            }
-                            Err(err) => {
-                                warn!(%id, %err, "failed to deserialise mid-stream message");
-                            }
                         }
+                        NodeWsMessage::Ping => {
+                            send_node_message(&mut ws_tx, &NodeWsMessage::Pong, &mut phase).await?;
+                        }
+                        NodeWsMessage::Pong => {},
+                        _ => break,
                     }
-                    NodeWsMessage::Ping => {
-                        if !send_node_message(&mut ws_tx, &NodeWsMessage::Pong, &mut phase).await { break; }
-                    }
-                    NodeWsMessage::Pong => {},
-                    _ => break,
                 }
-            }
-            session_event = next_relay_event(session_event_rx, &join.name) => {
-                let Some(event) = session_event else { break };
-                let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
-                debug!(node = %join.name, event = ?event, "relaying session event to primary");
-                if !send_node_message(&mut ws_tx, &relay, &mut phase).await {
-                    break;
+                session_event = next_relay_event(session_event_rx, &join.name) => {
+                    let Some(event) = session_event else { break };
+                    let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
+                    debug!(node = %join.name, event = ?event, "relaying session event to primary");
+                    send_node_message(&mut ws_tx, &relay, &mut phase).await?;
                 }
             }
         }
-    }
 
-    Ok(false)
+        Ok(false)
+    };
+    tokio::select! {
+        biased;
+        _ = stop_rx.changed() => Ok(true),
+        _ = wait_for_inbound_timeout(inbound_rx) => Err(crate::error::AppError::Protocol(
+            "primary keepalive timeout (no authenticated inbound frames for 45s)".into()
+        )),
+        result = relay => result,
+    }
 }
 
 /// Convert a local relay gap into a marker for this primary only. Publishing
@@ -459,15 +570,19 @@ async fn send_node_message(
     >,
     message: &NodeWsMessage,
     phase: &mut federation_crypto::Channel,
-) -> bool {
-    let payload = match phase.encode_message(message) {
-        Ok(p) => p,
-        Err(err) => {
-            warn!(%err, "failed to encode node connector frame");
-            return false;
-        }
-    };
-    ws_tx.send(WsMessage::Binary(payload.into())).await.is_ok()
+) -> Result<()> {
+    let payload = phase.encode_message(message)?;
+    tokio::time::timeout(
+        NODE_SEND_TIMEOUT,
+        ws_tx.send(WsMessage::Binary(payload.into())),
+    )
+    .await
+    .map_err(|_| {
+        crate::error::AppError::Protocol("primary WebSocket send timed out after 15s".into())
+    })?
+    .map_err(|err| {
+        crate::error::AppError::Protocol(format!("primary WebSocket send failed: {err}"))
+    })
 }
 
 fn decode_node_message(
@@ -883,6 +998,43 @@ mod tests {
             }
             other => panic!("node stream interruption must be an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_backoff_caps_and_resets_after_a_successful_join() {
+        let mut backoff = super::RetryBackoff::default();
+        let waits = (0..9).map(|_| backoff.next_wait_secs()).collect::<Vec<_>>();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        backoff.reset();
+        assert_eq!(backoff.next_wait_secs(), 1);
+        assert_eq!(backoff.next_wait_secs(), 2);
+    }
+
+    #[tokio::test]
+    async fn connector_abort_clears_live_state_even_during_stalled_io() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let connected = Arc::new(AtomicBool::new(false));
+        let task_state = Arc::clone(&connected);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = super::ConnectedGuard::new(task_state);
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let connector = super::JoinConnector {
+            abort: task.abort_handle(),
+            stop_tx,
+            connected: Arc::clone(&connected),
+        };
+        ready_rx.await.unwrap();
+        assert!(connector.is_connected());
+        drop(connector);
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!connected.load(Ordering::Acquire));
     }
 
     #[tokio::test]

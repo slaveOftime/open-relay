@@ -11,7 +11,7 @@ mod rpc_logs;
 mod rpc_nodes;
 
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 
 use crate::{
     notification::event::NotificationEvent,
@@ -21,8 +21,7 @@ use crate::{
 pub use lifecycle::{start, status, stop};
 
 pub(crate) type SessionStoreHandle = Arc<SessionStore>;
-pub(crate) type JoinHandles =
-    Arc<Mutex<HashMap<String, (tokio::task::AbortHandle, watch::Sender<bool>)>>>;
+pub(crate) type JoinHandles = Arc<Mutex<HashMap<String, rpc_nodes::JoinConnector>>>;
 pub(crate) type NotificationTx = tokio::sync::broadcast::Sender<NotificationEvent>;
 pub(crate) type SessionEventTx = tokio::sync::broadcast::Sender<SessionEvent>;
 pub(crate) type NotifierHandle = crate::notification::dispatcher::SharedNotifier;

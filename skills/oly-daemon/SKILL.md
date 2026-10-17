@@ -21,6 +21,15 @@ Run `oly daemon status` to inspect `ROOT` (`<STATE_DIR>`), `LOGS`, `SESSIONS`, `
 | macOS | `~/Library/Application Support/oly` |
 | Linux | `$XDG_STATE_HOME/oly` or `~/.local/state/oly` |
 
+Linux default IPC names are scoped to the canonical state directory and
+`WSL_DISTRO_NAME`. `OLY_SOCKET_NAME` overrides routing; if set, use the same
+value for CLI and daemon, and unique values for independent environments.
+When upgrading from the old global Linux socket, finish work and stop the old
+daemon with the old binary before replacement. Do not stop a daemon whose
+ownership is unclear: WSL distributions can share abstract sockets even when
+its PID and state files are invisible locally. Other platforms retain their
+previous IPC defaults.
+
 Startup precedence is **CLI flag > `config.json` > built-in default** (for `web_push_proxy`: **CLI > `OLY_WEB_PUSH_PROXY` > file > default**). CLI flags keep winning across hot reloads for the lifetime of the daemon process.
 
 | Startup flag | Config field |

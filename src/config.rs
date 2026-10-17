@@ -393,7 +393,7 @@ impl AppConfig {
             socket_name: std::env::var("OLY_SOCKET_NAME")
                 .ok()
                 .and_then(normalize_optional_string)
-                .unwrap_or_else(|| "open-relay.oly.sock".to_string()),
+                .unwrap_or_else(|| default_socket_name(&state_dir)),
             socket_file: state_dir.join("daemon.sock"),
         };
         let http = HttpConfig {
@@ -700,6 +700,47 @@ fn generate_vapid_keypair() -> (String, String) {
     let private_b64 = base64url_no_pad(secret.to_bytes().as_ref());
     let public_b64 = base64url_no_pad(secret.public_key().to_sec1_point(false).as_bytes());
     (private_b64, public_b64)
+}
+
+/// Linux abstract sockets share the network namespace, not the filesystem or
+/// PID namespace. WSL distributions can therefore see one another's sockets
+/// even when their state directories have identical absolute paths.
+fn default_socket_name(state_dir: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        scoped_socket_name(state_dir, std::env::var_os("WSL_DISTRO_NAME").as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state_dir;
+        "open-relay.oly.sock".to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scoped_socket_name(state_dir: &Path, distro: Option<&std::ffi::OsStr>) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::fs::canonicalize(state_dir).unwrap_or_else(|_| {
+        if state_dir.is_absolute() {
+            state_dir.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(state_dir)
+        }
+    });
+    let mut hash = Sha256::new();
+    hash.update(b"oly-linux-ipc-v1\0");
+    hash.update(path.as_os_str().as_bytes());
+    hash.update(b"\0");
+    if let Some(distro) = distro {
+        hash.update(distro.as_bytes());
+    }
+    format!(
+        "open-relay.oly.{}.sock",
+        URL_SAFE_NO_PAD.encode(hash.finalize())
+    )
 }
 
 /// Generate a missing config without overwriting another process's file.
@@ -1158,6 +1199,40 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_socket_names_are_scoped_by_state_and_wsl_distribution() {
+        use std::ffi::OsStr;
+        let first = PathBuf::from("/tmp/oly-first-state");
+        let second = PathBuf::from("/tmp/oly-second-state");
+        let debian = Some(OsStr::new("Debian"));
+        let ubuntu = Some(OsStr::new("Ubuntu"));
+        let name = super::scoped_socket_name(&first, debian);
+        assert_eq!(name, super::scoped_socket_name(&first, debian));
+        assert_ne!(name, super::scoped_socket_name(&second, debian));
+        assert_ne!(name, super::scoped_socket_name(&first, ubuntu));
+        assert_ne!(name, super::scoped_socket_name(&first, None));
+        assert!(name.len() < 108, "must fit a Linux abstract socket name");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_socket_scope_canonicalizes_relative_paths_and_symlinks() {
+        let dir = std::env::temp_dir().join(format!("oly_socket_scope_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::os::unix::fs::symlink(dir.join("state"), dir.join("alias")).unwrap();
+        assert_eq!(
+            super::scoped_socket_name(&dir.join("state"), None),
+            super::scoped_socket_name(&dir.join("alias"), None)
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            super::scoped_socket_name(std::path::Path::new("."), None),
+            super::scoped_socket_name(&cwd, None)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

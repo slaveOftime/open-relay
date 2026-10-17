@@ -54,6 +54,15 @@ under `env::temp_dir()` per test, so it never writes into the repo
 root and is unaffected by this convention. The same approach is used
 by `PERFORMANCE.md`'s benchmark recipe.
 
+For PTY contracts, prefer benign fixtures in `tests/fixtures/` over shell
+startup behavior. Keep a producer alive until the test observes its output
+and acknowledges it; use bounded waits, not sleeps, for readiness. The color
+probe checks exact plain text and the foreground SGR both live and after a
+daemon restart. Node.js is required for these fixtures (CI installs it on all
+four platforms). On failure, capture CLI exit status/stderr and session info
+alongside the journal transcript so an IPC error cannot masquerade as empty
+child output.
+
 If you touch packaging or release behavior, also review:
 
 - `Cargo.toml`

@@ -832,20 +832,17 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // connect/disconnect publish `SessionEvent::NodeState {…}` for any
     // active SSE listener to consume without polling.
     node_registry.bind_event_tx(event_tx.clone());
-    for join in client::join::load_join_configs(&config) {
+    for join in client::join::load_join_configs(&config)? {
         // Lifecycle replay runs at daemon startup before any IPC
         // client is around; there's no caller to surface the first
         // attempt outcome to, so don't pass an `on_attempt` oneshot.
-        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
+        let connector = super::rpc_nodes::spawn_join_connector(
             join.clone(),
             Arc::clone(&config),
             event_tx.clone(),
             None,
         );
-        join_handles
-            .lock()
-            .await
-            .insert(join.name, (abort, stop_tx));
+        join_handles.lock().await.insert(join.name, connector);
     }
     {
         let count = join_handles.lock().await.len();

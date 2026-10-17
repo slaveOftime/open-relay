@@ -12,6 +12,8 @@ For features, see [What's new in 0.5](./whats-new-0.5.md).
 | Federation credentials changed | Upgrade every node together. Old API-key/SSH-key credential tables are dropped without conversion. Verify public identities independently, re-authorize nodes, and recreate joins with `--id-pub-key`, not join `--key`. See [node setup](../guides/remote-access.md#connect-machines). |
 | Log flags changed | Replace removed `--raw`, `--from`, `--from-file`, `--cols`, `--keep-color`, `--exit`, and `--wait-for-prompt` flags; examples below. |
 | Live recording caps removed | Remove `max_output_log_bytes`, `max_journal_bytes_per_session`, and `max_journal_bytes_per_session_legacy`, even if zero. They now fail explicitly. Use OS quotas for a hard disk bound. |
+| Linux default IPC is scoped | Upgrade CLI and daemon together. Finish work and stop the old daemon with the old binary before replacement; the new default will not discover the old global socket. Explicit `OLY_SOCKET_NAME` still overrides routing. See [IPC upgrade and isolation](../guides/troubleshooting.md#linuxwsl-ipc-upgrade-and-isolation). |
+| Invalid saved joins fail explicitly | Fix malformed/unreadable `joins.json` instead of relying on silently skipped connectors. Existing valid identity pins remain unchanged. |
 | Invalid config now fails startup | Fix malformed JSON, invalid regexes, or out-of-range values instead of relying on a silent reset. Keys remain flat, not nested under `limits`. Unknown keys warn; invalid reloads keep the last good config. |
 | Custom apps/proxies are disabled by default | Enable flat `"trusted_apps_enabled": true` only for reviewed code. This also gates `wwwroot` overrides, not the normal UI. Proxies allow loopback IP literals only, not DNS names or remote hosts. |
 

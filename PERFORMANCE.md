@@ -280,6 +280,37 @@ below 50 µs at idle and no DB or journal reads per tick. Idle sessions should
 produce no activity frames. Lag and activity batches currently have tracing
 logs; dedicated metric counters and latency histograms are not implemented.
 
+## Two-primary federation resilience probe (2026-10-17)
+
+Linux WSL2 x86_64, debug builds, loopback, isolated state/socket names:
+two primaries and one secondary with a distinct outbound name for each primary.
+Before is the preserved pre-fix Rust binary; the fetched main revision changed
+only web code relative to that Rust baseline. After includes bounded concurrent
+local RPC relays and authenticated-inbound watchdogs. For each build, start fresh
+daemons with empty session inventories, establish both joins, then alternate
+35 `oly ls --node <name> --json` calls between primaries. Discard five warmups;
+verify every result's `items` is empty and `total` is zero. IPC durations use
+`OLY_TIMING=1` response-minus-connected marks; wall time includes CLI startup.
+
+| Path (30 samples/build) | Before | After |
+|---|---|---|
+| Empty remote list RPC, p50 / p95 | 2.8 / 3.5 ms | 3.1 / 3.7 ms |
+| CLI wall time, p50 / p95 | 8.24 / 8.83 ms | 8.49 / 10.24 ms |
+
+This short debug probe shows slight fast-path overhead, **not a speedup or a
+release-throughput guarantee**. The change removes head-of-line blocking by
+slow local RPCs and bounds stalled socket/channel operations, rather than
+optimizing empty list requests. Release throughput and laptop sleep/resume
+soak tests remain unmeasured.
+
+`tests/e2e_join_reconnect.rs` separately verifies two simultaneous joins: one
+primary remains registered and serves proxied lists throughout the other's
+45-second authenticated-inbound timeout, and the stalled connection re-handshakes
+and answers a sealed ping without restarting the secondary. Unsealed transport
+pings continue during the outage and must not refresh authenticated liveness.
+Retry backoff resets after successful joins, so a previous long outage does not
+leave the next outage at a 60-second initial retry delay.
+
 ## Backlog (measure before optimizing)
 
 - **TUI tree rebuild on every refresh** (2026-10-16): even a list-mode
