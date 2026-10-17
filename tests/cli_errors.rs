@@ -88,11 +88,16 @@ fn list_json_without_daemon_prints_machine_readable_output() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
-    // Frozen empty-list shape: additions must be deliberate.
-    assert_eq!(
-        value,
-        serde_json::json!({"items": [], "total": 0, "offset": 0, "limit": 10})
-    );
+    // Pin required keys and values while allowing additive fields, as
+    // promised by the CLI JSON compatibility policy.
+    for (key, expected) in [
+        ("items", serde_json::json!([])),
+        ("total", serde_json::json!(0)),
+        ("offset", serde_json::json!(0)),
+        ("limit", serde_json::json!(10)),
+    ] {
+        assert_eq!(value.get(key), Some(&expected), "empty-list field {key}");
+    }
     assert!(
         !stdout.contains("No sessions"),
         "json output should not mix table/hint text into stdout: {stdout}"

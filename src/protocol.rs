@@ -845,9 +845,9 @@ mod tests {
     /// Wire contract for the private JSON protocol: unknown fields are
     /// ignored (forward-compatible additions), while missing required
     /// fields, unknown type tags and malformed base64 fail loudly. The
-    /// federation wire is stricter, but per serde rules: field-bearing
-    /// frames reject unknown fields, while the unit `joined` variant has
-    /// no fields to validate and tolerates extra keys. Both behaviors are
+    /// federation envelope is stricter, but per serde rules: field-bearing
+    /// frames reject unknown fields, while unit variants have no fields to
+    /// validate and tolerate extra keys. Both behaviors are
     /// frozen here; the handshake `version` is the compatibility gate.
     #[test]
     fn wire_contract_ignores_unknown_fields_and_enforces_required_ones() {
@@ -860,6 +860,13 @@ mod tests {
         let response: RpcResponse = serde_json::from_str(r#"{"type":"ack","future_field":1}"#)
             .expect("unknown response field must be ignored");
         assert!(matches!(response, RpcResponse::Ack));
+        let response: RpcResponse = serde_json::from_str(
+            r#"{"type":"attach_stream_chunk","offset":7,"data":"b2s=","future_field":1}"#,
+        )
+        .expect("unknown fields must also be ignored on field-bearing responses");
+        assert!(
+            matches!(response, RpcResponse::AttachStreamChunk { offset: 7, data } if data == b"ok")
+        );
 
         // Missing required fields and unknown tags are hard errors.
         for json in [
@@ -875,6 +882,19 @@ mod tests {
             );
         }
 
+        for json in [
+            r#"{"type":"error"}"#,
+            r#"{"type":"attach_stream_chunk","offset":0}"#,
+            r#"{"type":"attach_stream_chunk","offset":0,"data":"%%%"}"#,
+            r#"{"type":"not_a_real_response"}"#,
+            r#"["not","an","object"]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RpcResponse>(json).is_err(),
+                "must be rejected: {json}"
+            );
+        }
+
         // Federation frames: unknown fields are rejected on field-bearing
         // variants (the handshake binds versions)...
         assert!(
@@ -882,13 +902,22 @@ mod tests {
                 .is_err(),
             "unknown federation fields must be rejected on field-bearing frames"
         );
-        // ...but the unit `joined` variant has no fields to validate, so
-        // serde cannot reject extras there. Freeze the actual behavior.
-        assert!(matches!(
-            serde_json::from_str::<NodeWsMessage>(r#"{"type":"joined","future_field":1}"#)
-                .expect("unit-variant frames tolerate extra keys today"),
-            NodeWsMessage::Joined
-        ));
+        // ...but unit variants have no fields to validate. Freeze all
+        // three exceptions rather than implying that only Joined allows it.
+        for message in [
+            NodeWsMessage::Joined,
+            NodeWsMessage::Ping,
+            NodeWsMessage::Pong,
+        ] {
+            let mut json = serde_json::to_value(&message).unwrap();
+            json["future_field"] = serde_json::json!(1);
+            let decoded: NodeWsMessage = serde_json::from_value(json)
+                .expect("unit-variant frames tolerate extra keys today");
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(message).unwrap()
+            );
+        }
     }
 
     #[test]
