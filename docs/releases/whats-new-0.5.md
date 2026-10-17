@@ -50,8 +50,26 @@ See [Attach](../guides/cli.md#attach-and-scroll) and [Browser access](../guides/
 
 Pinned Ed25519 identities, encrypted readiness, and replay-checked application
 traffic replace the old federation credential paths. Verify public identities
-independently and upgrade nodes together. Federation has **no forward secrecy**
-and, in 0.5.x, no primary-side identity removal.
+independently and upgrade nodes together. Federation has **no forward secrecy**;
+later seed compromise can expose recorded federation traffic.
+
+### Current node redesign (not attributed to a shipped beta)
+
+- Unified `oly node add/ls/info/update/enable/disable/rm` manages both roles.
+  Names identify the remote peer; outbound primary entries use `--as` for the
+  local claimed name authorized on the remote.
+- SQLite `nodes` stores inbound authorization and outbound pins together.
+  Disable survives restart; remove revokes local trust without killing sessions.
+- List/info expose connected, connecting, retrying, waiting, and disabled state,
+  plus last errors and next retry. Mutations report persisted/applied state
+  immediately; success is not a completed connection.
+- The cryptographic handshake and HTTP live-secondary route inventory stay
+  unchanged. Session `--node` still targets secondaries only.
+
+This replaces `oly join` and `oly node accept` without aliases. See
+[Migration](./migration-0.5.md#current-node-redesign) for script/state changes.
+Exact-version release notes below remain the record of shipped scope, not proof
+that the redesign is included or verified in those artifacts.
 
 ## Platforms
 

@@ -303,10 +303,15 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
 }
 
 async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
-    socket
-        .send(Message::Binary(encode_server_message(msg).into()))
-        .await
-        .is_ok()
+    // A stalled browser must not indefinitely retain a revoked relay/source.
+    matches!(
+        tokio::time::timeout(
+            crate::node::liveness::NODE_SEND_TIMEOUT,
+            socket.send(Message::Binary(encode_server_message(msg).into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 /// Per-connection attach parameters bundled to keep handler signatures

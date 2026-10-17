@@ -76,7 +76,7 @@ pub struct AppState {
 ///   map and HKDF-Expand) for the post-handshake AES-256-GCM phase.
 /// - On a **secondary** it signs the full nonce-bound handshake transcript
 ///   so the primary can authenticate the secondary against the key registered via
-///   `oly node accept --name <n> -k <...>`, and it also participates
+///   `oly node add <name> --role secondary --key <...>`, and it also participates
 ///   in the same ECDH process to derive the channel keys.
 ///
 /// Auth is end-to-end exact-pin (operator types the primary's pubkey on

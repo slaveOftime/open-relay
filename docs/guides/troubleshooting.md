@@ -32,7 +32,7 @@ socket. If an old daemon is still running after the upgrade, an explicit
 WSL distributions can share a network namespace while having different PID
 namespaces and filesystems. An old global or reused explicit socket name can
 make the CLI reach another distribution's daemon. Symptoms include an empty
-join list despite a local `joins.json`, missing local daemon lock/info files,
+node inventory despite locally configured SQLite peers, missing local daemon lock/info files,
 and no fresh local logs. Do not stop that daemon blindly. Use a unique explicit
 socket name with older binaries, or the new scoped default, consistently in
 both the daemon service environment and CLI shells. Custom containers that
@@ -94,13 +94,16 @@ Geometry follows the last controller resize. Detach and reattach (or resize the 
 
 ## Connected machines
 
-`oly node ls` on the primary lists currently **connected** nodes; `oly join ls` on the secondary shows `connected` or `saved` (retrying with backoff). If a node fails to connect:
-1. Both sides must run matching 0.5 versions.
-2. The primary must authorize the exact name and public key (`oly node accept --name <n> --id-pub-key <key>`).
-3. The secondary must pin the primary's public key (`oly join start --name <n> --id-pub-key <key> <url>`).
-4. Check that CLI and daemon use the same state/IPC environment; see [Linux/WSL isolation](#linuxwsl-ipc-upgrade-and-isolation). `join ls --primary` reports inbound nodes, not the secondary's outbound connection.
-5. Inspect `<state>/logs/daemon.log.<UTC-date>` or `daemon-stderr.log` for handshake, send, and authenticated keepalive timeout reasons. Invalid/unreadable `joins.json` fails explicitly; fix it without replacing verified identity pins. No log activity can mean you are reaching the wrong daemon, not a networking failure.
-6. After rotating a key with `oly node accept`, restart the secondary connector (`oly join stop` + `oly join start`) to force re-verification. See [Node federation](../releases/compatibility-0.5.md#node-federation).
+`oly node ls` lists configured primary and secondary peers, including disconnected
+ones. Add/update/enable success is not a completed connection. If a peer fails:
+
+1. Both ends must run matching versions; the node CLI redesign is not backward-compatible.
+2. On the primary, inspect `oly node info worker-1`: it must be an enabled secondary with the secondary's verified key. `waiting` means authorized but not connected.
+3. On the secondary, inspect `oly node info gateway`: it must be an enabled primary with the primary's verified key, reachable `http`/`https` URL, and `as` exactly `worker-1`.
+4. Use `oly node ls --role primary --status retrying` and `oly node info gateway --json` for `last_error` and `next_retry_at`. `disabled` persists until `oly node enable NAME`; a daemon restart does not enable it.
+5. Check state/IPC routing before restarting anything; see [Linux/WSL isolation](#linuxwsl-ipc-upgrade-and-isolation). Offline mutations fail rather than editing SQLite. HTTP `GET /api/nodes` lists live secondary routes, not all configured peers.
+6. Inspect `<state>/logs/daemon.log.<UTC-date>` or `daemon-stderr.log` for handshake, send, and authenticated keepalive timeout reasons. No fresh local logs may mean the CLI is reaching the wrong daemon.
+7. For rotation, independently verify the new key, disable both counterpart peers, update the affected pin, then enable and confirm `connected`. See [Trust and rotation](./remote-access.md#trust-encryption-and-rotation). Never fix a mismatch by removing identity checks.
 
 ## Reporting an issue
 

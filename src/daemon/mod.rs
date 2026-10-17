@@ -4,6 +4,7 @@ mod crash;
 pub(crate) mod health;
 mod journal_retention;
 mod lifecycle;
+mod node_manager;
 mod reload;
 mod rpc;
 mod rpc_attach;
@@ -21,7 +22,7 @@ use crate::{
 pub use lifecycle::{start, status, stop};
 
 pub(crate) type SessionStoreHandle = Arc<SessionStore>;
-pub(crate) type JoinHandles = Arc<Mutex<HashMap<String, rpc_nodes::JoinConnector>>>;
+pub(crate) type NodeConnectors = Arc<Mutex<HashMap<String, rpc_nodes::NodeConnector>>>;
 pub(crate) type NotificationTx = tokio::sync::broadcast::Sender<NotificationEvent>;
 pub(crate) type SessionEventTx = tokio::sync::broadcast::Sender<SessionEvent>;
 pub(crate) type NotifierHandle = crate::notification::dispatcher::SharedNotifier;

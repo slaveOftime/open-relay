@@ -6,7 +6,6 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    client,
     config::{AppConfig, LiveConfig},
     db::Database,
     error::{AppError, Result},
@@ -22,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    JoinHandles, NotifierHandle, SessionStoreHandle,
+    NodeConnectors, NotifierHandle, SessionStoreHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
     components::{ComponentRegistry, spawn_supervised},
     crash,
@@ -516,7 +515,7 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
     let _ = writeln!(out, "SESSIONS:     {}", config.paths.sessions_dir.display());
 
     // Surface the daemon's identity so the operator can paste it onto a
-    // peer (or hand it to `oly node accept -k ...`). Reads from the
+    // peer (or hand it to `oly node add <name> --key ...`). Reads from the
     // on-disk `.pub` file (lifecycle creates it on daemon start) so status
     // works even if the daemon was started after this CLI process.
     match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
@@ -799,7 +798,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // (OnceLock) and can be called through the Arc.
     let node_registry = Arc::new(node_registry);
 
-    let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let node_connectors: NodeConnectors = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     // Remove any stale socket file left by a crashed daemon.  On macOS (and
     // other platforms without abstract-namespace sockets) the file-based Unix
@@ -832,22 +831,19 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // connect/disconnect publish `SessionEvent::NodeState {…}` for any
     // active SSE listener to consume without polling.
     node_registry.bind_event_tx(event_tx.clone());
-    for join in client::join::load_join_configs(&config)? {
-        // Lifecycle replay runs at daemon startup before any IPC
-        // client is around; there's no caller to surface the first
-        // attempt outcome to, so don't pass an `on_attempt` oneshot.
-        let connector = super::rpc_nodes::spawn_join_connector(
-            join.clone(),
-            Arc::clone(&config),
-            event_tx.clone(),
-            None,
-        );
-        join_handles.lock().await.insert(join.name, connector);
+    super::node_manager::NodeManager {
+        config: &config,
+        db: &db,
+        registry: &node_registry,
+        connectors: &node_connectors,
+        events: &event_tx,
     }
-    {
-        let count = join_handles.lock().await.len();
-        info!(count, "join connectors initialized");
-    }
+    .restore()
+    .await?;
+    info!(
+        count = node_connectors.lock().await.len(),
+        "outbound node connectors initialized"
+    );
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let notifier: NotifierHandle = Arc::new(arc_swap::ArcSwap::from_pointee(
         crate::notification::build_notifier(db.clone(), &config),
@@ -879,13 +875,10 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // generates (or loads) an Ed25519 identity key at startup. The same
     // keypair serves both federation roles: primaries use it to sign the
     // host-challenge nonce, secondaries use it to sign the join payload.
-    // We still tolerate a failed load: in that case SSH-key joins in
-    // either direction are rejected (API key auth still works).
+    // A failed identity load disables federation; there is no fallback auth.
     let node_identity = http::NodeIdentity::create_or_load(&config.paths.state_dir)
         .await
-        .inspect_err(
-            |e| warn!(%e, "failed to create node identity key, SSH-key node joins will be rejected"),
-        )
+        .inspect_err(|e| warn!(%e, "failed to create node identity key; federation is disabled"))
         .unwrap_or_else(|_| http::NodeIdentity::disabled());
     if !no_http {
         let (event_bytes_tx, _) = tokio::sync::broadcast::channel::<http::EncodedSessionEvent>(
@@ -1096,7 +1089,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                         let shutdown_tx_clone = shutdown_tx.clone();
                         let registry_clone = node_registry.clone();
                         let db_clone = db.clone();
-                        let handles_clone = join_handles.clone();
+                        let handles_clone = node_connectors.clone();
                         let event_tx_clone = event_tx.clone();
                         let notification_tx_clone = notification_tx.clone();
                         let notifier_clone = notifier.clone();

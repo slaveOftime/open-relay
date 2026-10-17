@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use std::time::Duration;
 
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::{
     error::{AppError, Result},
@@ -44,6 +44,15 @@ pub struct NodeHandle {
     pub send_tx: mpsc::Sender<NodeWsMessage>,
     /// Pending response channels, keyed by `rpc_id`.
     pub pending: Arc<Mutex<HashMap<String, PendingRpc>>>,
+    /// Cancels socket IO even while the relay is blocked in another await.
+    pub stop_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Stream and cancellation belong to the same connection generation.
+pub struct ProxyStream {
+    pub id: String,
+    pub responses: mpsc::Receiver<Result<RpcResponse>>,
+    pub cancelled: watch::Receiver<bool>,
 }
 
 struct RegisteredNode {
@@ -60,6 +69,8 @@ impl std::ops::Deref for RegisteredNode {
 
 /// Tracks all connected secondary nodes on the primary.
 pub struct NodeRegistry {
+    /// Serializes persisted mutations with final inbound authorization/insertion.
+    pub(crate) config_lock: Mutex<()>,
     nodes: Mutex<HashMap<String, RegisteredNode>>,
     join_failures: Mutex<HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
     /// Deadline applied to one-shot proxied RPCs (test-overridable).
@@ -74,6 +85,7 @@ pub struct NodeRegistry {
 impl NodeRegistry {
     pub fn new() -> Self {
         Self {
+            config_lock: Mutex::new(()),
             nodes: Mutex::new(HashMap::new()),
             join_failures: Mutex::new(HashMap::new()),
             rpc_timeout: NODE_RPC_TIMEOUT,
@@ -84,6 +96,7 @@ impl NodeRegistry {
     #[cfg(test)]
     pub(crate) fn with_rpc_timeout(rpc_timeout: Duration) -> Self {
         Self {
+            config_lock: Mutex::new(()),
             nodes: Mutex::new(HashMap::new()),
             join_failures: Mutex::new(HashMap::new()),
             rpc_timeout,
@@ -139,6 +152,22 @@ impl NodeRegistry {
                 connected: false,
                 last_seen: None,
             });
+        }
+    }
+
+    /// Revoke the live generation immediately; stale teardown cannot remove a
+    /// later generation. In-flight RPCs are failed by the cancelled relay.
+    pub(crate) async fn revoke(&self, name: &str) {
+        let mut nodes = self.nodes.lock().await;
+        if let Some(node) = nodes.remove(name) {
+            let _ = node.stop_tx.send(true);
+            if let Some(tx) = self.event_tx() {
+                let _ = tx.send(SessionEvent::NodeState {
+                    node: name.into(),
+                    connected: false,
+                    last_seen: None,
+                });
+            }
         }
     }
 
@@ -221,13 +250,17 @@ impl NodeRegistry {
         &self,
         node: &str,
         request: &crate::protocol::RpcRequest,
-    ) -> Result<(String, mpsc::Receiver<Result<RpcResponse>>)> {
-        let (send_tx, pending) = {
+    ) -> Result<ProxyStream> {
+        let (send_tx, pending, cancelled) = {
             let nodes = self.nodes.lock().await;
             let handle = nodes
                 .get(node)
                 .ok_or_else(|| AppError::NodeNotConnected(node.to_string()))?;
-            (handle.send_tx.clone(), Arc::clone(&handle.pending))
+            (
+                handle.send_tx.clone(),
+                Arc::clone(&handle.pending),
+                handle.stop_tx.subscribe(),
+            )
         };
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -247,7 +280,11 @@ impl NodeRegistry {
             .await
             .map_err(|_| AppError::NodeNotConnected(node.to_string()))?;
 
-        Ok((id, rx))
+        Ok(ProxyStream {
+            id,
+            responses: rx,
+            cancelled,
+        })
     }
 
     /// Send one mid-stream client message to an open streaming RPC on
@@ -314,6 +351,7 @@ mod tests {
             NodeHandle {
                 send_tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                stop_tx: tokio::sync::watch::channel(false).0,
             },
             send_rx,
         )
@@ -338,6 +376,34 @@ mod tests {
         assert!(
             pending.lock().await.is_empty(),
             "timed-out pending entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_stream_cancellation_is_bound_to_its_generation() {
+        let registry = NodeRegistry::new();
+        let (handle, mut messages) = fake_handle();
+        let first = registry.connect("worker".into(), handle).await.unwrap();
+        let mut stream = registry
+            .proxy_rpc_stream("worker", &RpcRequest::Health)
+            .await
+            .unwrap();
+        messages.recv().await.unwrap();
+        assert!(!*stream.cancelled.borrow());
+        registry.revoke("worker").await;
+        stream.cancelled.changed().await.unwrap();
+        assert!(*stream.cancelled.borrow());
+        let (replacement, _messages) = fake_handle();
+        let replacement_signal = replacement.stop_tx.subscribe();
+        registry
+            .connect("worker".into(), replacement)
+            .await
+            .unwrap();
+        registry.disconnect("worker", first).await;
+        assert!(registry.is_connected("worker").await);
+        assert!(
+            !*replacement_signal.borrow(),
+            "old teardown cancelled its replacement"
         );
     }
 

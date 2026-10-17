@@ -54,12 +54,19 @@ pub(super) fn list_targets_for_all_nodes(
 pub(super) async fn fetch_node_names(config: &AppConfig) -> Result<Vec<String>> {
     let response = tokio::time::timeout(
         Duration::from_secs(2),
-        ipc::send_request_checked(config, RpcRequest::NodeList),
+        ipc::send_request_checked(
+            config,
+            RpcRequest::NodeList {
+                role: Some(crate::node::config::NodeRole::Secondary),
+                status: Some(crate::node::config::NodeStatus::Connected),
+            },
+        ),
     )
     .await
     .map_err(|_| AppError::Protocol("node list refresh timed out".to_string()))??;
     match response {
-        RpcResponse::NodeList { mut nodes } => {
+        RpcResponse::NodeList { items, .. } => {
+            let mut nodes: Vec<_> = items.into_iter().map(|node| node.config.name).collect();
             nodes.sort();
             nodes.dedup();
             Ok(nodes)

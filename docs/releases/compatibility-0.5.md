@@ -26,31 +26,40 @@ It is suitable for early adopters who can back up state and coordinate upgrades.
 
 ## Node federation
 
-Pinned-identity federation is a supported interface in 0.5.x. The trust model
-is stated here rather than implied; setup is in
-[Remote access](../guides/remote-access.md#connect-machines).
+Pinned-identity federation uses the trust model below; setup is in
+[Remote access](../guides/remote-access.md#connect-machines). **Current redesign
+(not attributed to a shipped beta):** `oly node` replaces top-level `oly join`
+and `oly node accept` without backward compatibility. Exact-version release
+notes describe historical behavior; follow the [migration steps](./migration-0.5.md#current-node-redesign)
+when moving from those builds. The cryptographic handshake is unchanged.
 
 - **Identity:** one Ed25519 identity per daemon, encoded as
-  `ed25519 <standard-base64(raw32)>`. A primary binds one identity to one
-  registered name, and `public_key` is `UNIQUE`, so one identity cannot be bound
-  to two names. The accept table and the secondary's configured pin are the
-  trust anchors and are re-checked on every join. No SSH integration, OpenSSH key
-  import, TOFU, key-discovery endpoint, or shared API-key fallback.
-- **Rotation:** `oly node accept --name <name> --id-pub-key <key>` replaces that
-  name's key atomically. Verify the replacement public identity out of band
-  first. The previous key then fails the next join; an already-connected node is
-  **not** torn down, so restart the connector on the secondary
-  (`oly join stop`, then `oly join start`) to force re-verification.
-- **Transport:** WebSocket, not SSH. AES-256-GCM seals application frames and
-  keepalives under per-direction monotonic sequences; replay and reordering are
-  rejected terminally. HTTP `--no-auth` does not relax federation identity checks
-  or encryption.
-- **Known limit — no revocation command:** there is no primary-side `node
-  remove` in 0.5.x. An accepted name's row cannot be deleted through the CLI, and
-  because `public_key` is `UNIQUE` a retired machine's identity cannot be rebound
-  to a different name. Re-accept a name to replace its identity; otherwise
-  generate a new identity on the replacement machine. A leaked seed cannot be
-  contained by configuration alone — also block the transport path.
+  `ed25519 <standard-base64(raw32)>`. SQLite `nodes` stores one key per
+  configured peer for both inbound authorization and outbound pins. Keys are
+  unique across local peer entries; one identity cannot bind two local names. Enabled
+  secondary authorization requires the exact claimed name/key; primary peers
+  require a verified remote key and `--as` matching that authorization. No SSH
+  integration, OpenSSH import, TOFU, key-discovery endpoint, or API-key fallback.
+- **Lifecycle:** add enables by default and rejects duplicate names; update
+  cannot change role. All mutations require the running daemon and mean
+  persisted/applied, not connected. Disable persists and blocks reconnection;
+  enable persists; rm deletes local config/auth and closes federation, not remote
+  sessions. Inspect `ls`/`info` for runtime state and retry/error details.
+- **Rotation and revocation:** verify replacement identities out of band. Disable
+  both counterpart peers, update the affected key with `oly node update NAME
+  --key KEY`, then enable and confirm a fresh handshake. Remove with `oly node
+  rm NAME` to revoke that local trust; remove the counterpart too to stop retries.
+  A leaked seed still requires identity replacement and transport containment.
+- **Transport:** WebSocket, not SSH. Primary URLs accept only HTTP/HTTPS, without
+  userinfo, query, or fragment. AES-256-GCM seals application frames and keepalives
+  under per-direction monotonic sequences; replay and reordering fail terminally.
+  HTTP `--no-auth` does not relax federation identity checks or encryption.
+- **Inventory and routing:** `node ls --json` is `{items:[summaries],total:N}`;
+  `node info --json` has flat `name`, `role`, `key`, `url`, `as`, `enabled`,
+  `status`, `last_error`, and `next_retry_at`. Runtime status is not persisted.
+  HTTP `GET /api/nodes` remains a live secondary route array `{name,connected}`
+  for existing UI clients, not unified configuration. Session `--node` still
+  targets secondary peers only.
 - **Known property — no forward secrecy:** the channel key is static-static
   X25519 over the two long-lived identities, mixed with HKDF-SHA-256 over the
   signed transcript. Later private-seed compromise can decrypt recorded
@@ -90,8 +99,8 @@ of fsync completion. No supported live journal byte cap is provided in this beta
 
 ### Private protocol consumers
 
-CLI/daemon IPC uses Protocol **14**. One-shot messages are newline-delimited
-`{"version":14,"payload":...}` envelopes. Attach sends a JSON init line, then
+CLI/daemon IPC uses Protocol **15**. One-shot messages are newline-delimited
+`{"version":15,"payload":...}` envelopes. Attach sends a JSON init line, then
 `[u32 LE payload_len][u8 tag][payload]`: output tag 1 carries an offset and bytes;
 control tag 2 carries bare JSON `RpcResponse`. Browser WebSocket uses a separate
 binary envelope over the attach contract.
@@ -107,7 +116,7 @@ here extends what 0.5.x already supports, and the per-axis versions stay
 what the sections above state.
 
 - **One version per axis.** External CLI JSON, the private IPC envelope
-  (`Protocol **14**`), the browser WS frame layout, SSE view notifications,
+  (`Protocol **15**`), the browser WS frame layout, SSE view notifications,
   the federation handshake, and the journal/SQLite formats are separate
   contracts. A change on one axis never implies compatibility on another.
 - **New semantic records use a new journal format version.** When the
@@ -147,8 +156,8 @@ contract:
 ## Before stable 0.5
 
 Freeze the CLI/JSON/config contract deliberately; validate backup/upgrade/rollback
-on actual platform artifacts. Add a primary-side node identity removal command so
-revocation no longer depends on rotating an identity or blocking transport. If
-bounded live history is added, define an explicit retained-start cursor and
+on actual platform artifacts. Exercise node disable/remove, rotation, and
+restart persistence on those artifacts before claiming verified revocation.
+If bounded live history is added, define an explicit retained-start cursor and
 history-expiration behavior before deleting recorded prefixes. Do not add parallel
 recording/parser stacks just to retain old accidental behavior.

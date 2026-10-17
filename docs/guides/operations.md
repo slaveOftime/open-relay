@@ -14,7 +14,7 @@ The size breakdown separates the four things people confuse:
 |---|---|
 | `journal` | Recorded session journals under `sessions/<id>/journal` |
 | `uploads` | Files attached to sessions under `sessions/<id>/files` |
-| `sqlite` | The session database and its `-wal`/`-shm` companions |
+| `sqlite` | The SQLite database (session metadata and `nodes` configuration) and its `-wal`/`-shm` companions |
 | `logs` | Daemon logs under `<STATE_DIR>/logs` |
 
 A size scan that hits its entry budget or encounters a read/metadata error reports `partial` and its numbers are a lower bound. Symlinks are not followed. The `journal` column is not "all disk usage" — declared uploads, SQLite, and logs are separate.
@@ -62,6 +62,16 @@ Supervised components are `http`, `sse_encoder`, `activity_sampler`, `notificati
 
 The summary is assembled from metadata only: no terminal content, input, environment, identity seeds, or credentials. `oly export <id>` is a separate, explicit terminal-bytes export and is never part of a diagnostic summary. Even so, treat any diagnostic text as potentially sensitive and review it before sharing.
 
+### Node diagnostics
+
+`oly node ls` inventories both configured roles, not just live routes. Use
+`--role primary --status retrying` to find outbound failures and `oly node info
+NAME --json` for `last_error` and `next_retry_at`. A successful mutation only
+confirms persistence/application; it is not a connection or readiness check.
+Secondary peers may be `waiting`; disabled peers remain configured across restart.
+HTTP `GET /api/nodes` still lists live secondary routes only. See
+[Node management](./remote-access.md#manage-configured-peers).
+
 ## Listener changes and stopping a daemon
 
 `http_bind`, `http_port`, and `--no-http` are startup-only settings: change them in `config.json` and restart the daemon deliberately. A restart (or any `oly daemon stop`, host reboot, or crash) ends all live PTY sessions — that is the documented contract, and there is no way to migrate a live child to a new daemon process.
@@ -73,17 +83,18 @@ Never stop a shared daemon without operator approval, and never start a second d
 A supported backup is taken **while no daemon runs**:
 
 1. Stop the daemon and confirm it: `oly daemon stop`, then `oly daemon status` must report that the daemon is not running.
-2. Copy the **entire** state directory — `oly.db` together with any `-wal`/`-shm` companions, the `sessions/` journals, `config.json`, and the identity keys. Copying the directory while a daemon runs is not a supported backup: SQLite and journals are mid-write and files change underneath the copy.
+2. Copy the **entire** state directory — `oly.db` together with any `-wal`/`-shm` companions, the `sessions/` journals, `config.json`, and the identity keys. The database includes both inbound authorization and outbound pins in `nodes`; there is no separate active `joins.json` to copy. Copying the directory while a daemon runs is not a supported backup: SQLite and journals are mid-write and files change underneath the copy.
 3. Store the copy outside the active state directory and keep it together with the version that produced it.
 
 ## Restore drill
 
-Restore into an **isolated** state directory so the original stays untouched, and verify the copy before trusting it:
+Restore into an **isolated** state directory so the original stays untouched, and verify the copy before trusting it. Also isolate federation network access: a restored identity and enabled primary peers can reconnect even with `--no-http`. Do not let the drill impersonate the original node:
 
 ```sh
 OLY_STATE_DIR=/path/to/restored oly daemon start --detach --no-http
 OLY_STATE_DIR=/path/to/restored oly daemon status   # readiness + component states
 OLY_STATE_DIR=/path/to/restored oly ls              # backed-up sessions appear
+OLY_STATE_DIR=/path/to/restored oly node ls --json  # saved peers/enabled flags appear
 OLY_STATE_DIR=/path/to/restored oly logs <id>       # journals replay
 OLY_STATE_DIR=/path/to/restored oly daemon stop
 ```
@@ -92,8 +103,8 @@ On Windows, set `OLY_STATE_DIR` with `$env:OLY_STATE_DIR = "C:\path\to\restored"
 
 What the drill proves and what it does not:
 
-- It proves the copied database opens, sessions are listed, and journals replay through `oly logs`.
+- The session drill proves the copied database opens, sessions are listed, and journals replay through `oly logs`. Inspecting `node ls` additionally checks saved peer configuration and enabled flags; runtime status is rebuilt, not restored.
 - Sessions that were `running` at backup time come back as `failed`: PTYs and child processes do not exist in a backup. Use `oly restart <id>` (or the suggested resume command) to start a fresh run.
 - It does not prove the backup was taken at a consistent moment if the daemon was running during the copy — that is why the offline rule above is the first step.
 
-The end-to-end regression `e2e_offline_backup_restore_drill_recovers_journal_and_metadata` automates exactly this drill: stop, copy, restore into an isolated directory, list, replay logs.
+The end-to-end regression `e2e_offline_backup_restore_drill_recovers_journal_and_metadata` automates the session drill: stop, copy, restore into an isolated directory, list, replay logs. Peer inventory and federation isolation are additional checks, not proven by that session regression.

@@ -41,6 +41,25 @@ Startup precedence is **CLI flag > `config.json` > built-in default** (for `web_
 
 `--no-http` and `--no-auth` are startup-only flags, not JSON keys.
 
+### Persisted node resources
+
+`oly node` manages remote peers through the running daemon, not `config.json`.
+SQLite `nodes` is the source of truth for inbound authorization and outbound
+pins, with one key per configured peer. Role describes the remote: primary
+requires URL and local claimed `--as` name; secondary authorizes inbound and
+rejects those fields. See `oly skill` for setup commands.
+
+Use `oly node ls`/`info NAME` for runtime state, `last_error`, and
+`next_retry_at`; `waiting` is an enabled inbound authorization. Mutation success
+means persisted/applied, not connected. `disable` retains configuration and
+blocks reconnection across restart; `enable` persists; `rm` deletes config/auth
+and closes federation only, never the owning daemon's sessions. Offline mutations
+fail without direct database/file writes. Runtime status is not stored. Back up
+all stopped state, including the database and identity keys; there is no active
+`joins.json`. A restored enabled primary peer can reconnect even with `--no-http`,
+so isolate federation transport during restore drills. Never rotate keys or
+remove trust without operator authorization and independent key verification.
+
 ## 2) Config keys and hot-reload boundaries
 
 The daemon polls `config.json` mtime every **2 seconds**. Duration settings in seconds are clamped/validated within `1..=31536000` (365 days).

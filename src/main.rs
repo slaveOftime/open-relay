@@ -22,7 +22,7 @@ mod terminal_guards;
 mod utils;
 
 use clap::Parser;
-use cli::{Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
+use cli::{Cli, Commands, DaemonCommand, NotifyCommand};
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 use std::path::{Path, PathBuf};
@@ -436,84 +436,7 @@ async fn run() -> Result<()> {
             client::run_send(&config, &id, send_args.node, send_args.chunks, free_text).await
         }
 
-        // ── Node listing (primary side) ──────────────────────────────────────
-        Commands::Node(node_args) => match node_args.command {
-            NodeCommand::List => {
-                match ipc::send_request_checked(&config, RpcRequest::NodeList).await? {
-                    RpcResponse::NodeList { nodes } => {
-                        if nodes.is_empty() {
-                            println!("No secondary nodes connected.");
-                        } else {
-                            println!("NAME");
-                            for n in nodes {
-                                println!("{}", n);
-                            }
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-            NodeCommand::Accept(args) => {
-                let name = args.name.clone();
-                match ipc::send_request_checked(
-                    &config,
-                    RpcRequest::NodeAccept {
-                        name: args.name,
-                        id_pub_key: args.id_pub_key,
-                    },
-                )
-                .await?
-                {
-                    RpcResponse::Empty => {
-                        println!("Identity public key registered for node '{}'.", name);
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-        },
-
-        // ── Join management (secondary side) ─────────────────────────────────
-        Commands::Join(join_args) => match join_args.command {
-            JoinCommand::Start(args) => {
-                let Some(pinned) = args.id_pub_key else {
-                    return Err(AppError::Protocol(
-                        "missing --id-pub-key <PRIMARY_PUB_KEY> — `--id-pub-key` is the trust root for the join".into(),
-                    ));
-                };
-                client::run_join(&config, args.url, args.name, Some(pinned)).await
-            }
-            JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
-            JoinCommand::List(args) => {
-                match ipc::send_request_checked(
-                    &config,
-                    RpcRequest::JoinList {
-                        primary: args.primary,
-                    },
-                )
-                .await?
-                {
-                    RpcResponse::JoinList { joins } => {
-                        if joins.is_empty() {
-                            println!("No active joins.");
-                        } else if args.primary {
-                            for j in joins {
-                                println!("{:<24}", j.name);
-                            }
-                        } else {
-                            println!("{:<24} {:<12} PRIMARY URL", "NAME", "STATUS");
-                            for j in joins {
-                                let status = if j.connected { "connected" } else { "saved" };
-                                println!("{:<24} {:<12} {}", j.name, status, j.primary_url);
-                            }
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-        },
+        Commands::Node(args) => client::run_nodes(&config, args).await,
     }
 }
 

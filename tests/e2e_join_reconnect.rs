@@ -102,10 +102,11 @@ fn default_linux_ipc_isolates_daemons_and_joins_the_correct_primary() {
     let accept = default_cmd(&primary_tmp)
         .args([
             "node",
-            "accept",
-            "--name",
+            "add",
             "worker",
-            "--id-pub-key",
+            "--role",
+            "secondary",
+            "--key",
             &id_pub_key(&secondary_tmp),
         ])
         .output()
@@ -117,12 +118,16 @@ fn default_linux_ipc_isolates_daemons_and_joins_the_correct_primary() {
     );
     let join = default_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker",
-            "--id-pub-key",
+            "--key",
             &id_pub_key(&primary_tmp),
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
@@ -132,83 +137,45 @@ fn default_linux_ipc_isolates_daemons_and_joins_the_correct_primary() {
         "{}",
         String::from_utf8_lossy(&join.stderr)
     );
-    assert!(String::from_utf8_lossy(&join.stdout).contains("Joined primary"));
     let rt = tokio::runtime::Runtime::new().unwrap();
     assert!(rt.block_on(wait_for_node_connected(port, "worker", 5)));
-    let ls = default_cmd(&secondary_tmp)
-        .args(["join", "ls"])
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&ls.stdout).contains("connected"));
-    let primary_ls = default_cmd(&primary_tmp)
-        .args(["join", "ls"])
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&primary_ls.stdout).contains("No active joins."));
-}
-
-#[test]
-fn invalid_saved_joins_fail_loudly_and_are_not_overwritten() {
-    let tmp = make_tmp_dir("invalid_saved_joins");
-    let daemon = start_daemon(&tmp);
-    let path = tmp.join("oly/joins.json");
-    let pin = crypto::public_key_line(&ed25519_dalek::SigningKey::from_bytes(
-        &crypto::fresh_nonce(),
-    ));
-    for data in [
-        "{ broken".to_string(),
-        json!([{"name":"worker","primary_url":"http://primary","api_key":"obsolete"}]).to_string(),
-    ] {
-        fs::write(&path, &data).unwrap();
-        let ls = oly_cmd(&tmp).args(["join", "ls"]).output().unwrap();
-        assert!(!ls.status.success());
-        assert!(String::from_utf8_lossy(&ls.stderr).contains("invalid join configuration"));
-        let join = oly_cmd(&tmp)
-            .args([
-                "join",
-                "start",
-                "--name",
-                "worker",
-                "--id-pub-key",
-                &pin,
-                "http://127.0.0.1:1",
-            ])
+    // The primary registry insertion precedes the connector's sealed Joined
+    // response; wait for the secondary's own live state rather than racing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ls = default_cmd(&secondary_tmp)
+            .args(["node", "ls", "--json"])
             .output()
             .unwrap();
-        assert!(!join.status.success());
-        assert_eq!(fs::read_to_string(&path).unwrap(), data);
-        let stop = oly_cmd(&tmp)
-            .args(["join", "stop", "--name", "worker"])
-            .output()
-            .unwrap();
-        assert!(!stop.status.success());
-        assert_eq!(fs::read_to_string(&path).unwrap(), data);
+        assert!(ls.status.success());
+        let nodes: Value = serde_json::from_slice(&ls.stdout).unwrap();
+        assert_eq!(nodes["total"], 1);
+        assert_eq!(nodes["items"][0]["name"], "primary");
+        assert_eq!(nodes["items"][0]["role"], "primary");
+        assert_eq!(nodes["items"][0]["as"], "worker");
+        if nodes["items"][0]["status"] == "connected" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connector not connected: {nodes}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
-    // Read errors must not masquerade as an empty saved join list either.
-    fs::remove_file(&path).unwrap();
-    fs::create_dir(&path).unwrap();
-    let ls = oly_cmd(&tmp).args(["join", "ls"]).output().unwrap();
-    assert!(!ls.status.success());
-    assert!(String::from_utf8_lossy(&ls.stderr).contains("failed to read join configuration"));
-    fs::remove_dir(&path).unwrap();
-    fs::write(&path, "{ broken").unwrap();
-    drop(daemon);
-    let startup = oly_cmd(&tmp)
-        .args([
-            "daemon",
-            "start",
-            "--foreground-internal",
-            "--no-auth",
-            "--no-http",
-        ])
+    let primary_ls = default_cmd(&primary_tmp)
+        .args(["node", "ls", "--json"])
         .output()
         .unwrap();
-    assert!(!startup.status.success());
-    assert!(String::from_utf8_lossy(&startup.stderr).contains("invalid join configuration"));
+    assert!(primary_ls.status.success());
+    let nodes: Value = serde_json::from_slice(&primary_ls.stdout).unwrap();
+    assert_eq!(nodes["total"], 1);
+    assert_eq!(nodes["items"][0]["name"], "worker");
+    assert_eq!(nodes["items"][0]["role"], "secondary");
+    assert_eq!(nodes["items"][0]["status"], "connected");
 }
 
 #[test]
-fn replacing_and_stopping_a_join_leaves_no_orphan_connector() {
+fn updating_and_removing_a_primary_leaves_no_orphan_connector() {
     let primary_tmp = make_tmp_dir("replace_join_primary");
     let secondary_tmp = make_tmp_dir("replace_join_secondary");
     let port = pick_free_port();
@@ -217,46 +184,93 @@ fn replacing_and_stopping_a_join_leaves_no_orphan_connector() {
     let accepted = oly_cmd(&primary_tmp)
         .args([
             "node",
-            "accept",
-            "--name",
+            "add",
             "worker",
-            "--id-pub-key",
+            "--role",
+            "secondary",
+            "--key",
             &id_pub_key(&secondary_tmp),
         ])
         .output()
         .unwrap();
     assert!(accepted.status.success());
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let added = oly_cmd(&secondary_tmp)
+        .args([
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
+            "worker",
+            "--key",
+            &id_pub_key(&primary_tmp),
+            "--url",
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+    assert!(rt.block_on(wait_for_node_connected(port, "worker", 10)));
     for _ in 0..3 {
-        let join = oly_cmd(&secondary_tmp)
+        // Replacing a live connector must cancel both its socket and retry
+        // task. This path intentionally cannot upgrade to federation.
+        let changed = oly_cmd(&secondary_tmp)
             .args([
-                "join",
-                "start",
-                "--name",
-                "worker",
-                "--id-pub-key",
-                &id_pub_key(&primary_tmp),
-                &format!("http://127.0.0.1:{port}"),
+                "node",
+                "update",
+                "primary",
+                "--url",
+                &format!("{url}/unavailable"),
             ])
             .output()
             .unwrap();
-        assert!(join.status.success());
+        assert!(changed.status.success());
+        assert!(rt.block_on(wait_for_no_nodes(port, 5)));
+        let restored = oly_cmd(&secondary_tmp)
+            .args(["node", "update", "primary", "--url", &url])
+            .output()
+            .unwrap();
+        assert!(restored.status.success());
         assert!(rt.block_on(wait_for_node_connected(port, "worker", 10)));
     }
-    let stopped = oly_cmd(&secondary_tmp)
-        .args(["join", "stop", "--name", "worker"])
+    // Permanent removal, unlike disable, must delete the saved resource.
+    let removed = oly_cmd(&secondary_tmp)
+        .args(["node", "rm", "primary"])
         .output()
         .unwrap();
-    assert!(stopped.status.success());
+    assert!(removed.status.success());
     assert!(rt.block_on(wait_for_no_nodes(port, 5)));
-    // A detached old connector would rejoin on its 1s backoff after JoinStop.
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(rt.block_on(wait_for_no_nodes(port, 1)));
+    // Observe the whole backoff window, not just one empty snapshot: detached
+    // old connectors must never publish the removed node again.
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let response = client
+                .get(format!("http://127.0.0.1:{port}/api/nodes"))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let nodes: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+            assert_eq!(nodes, json!([]), "removed connector reappeared");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
     let ls = oly_cmd(&secondary_tmp)
-        .args(["join", "ls"])
+        .args(["node", "ls", "--json"])
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&ls.stdout).contains("No active joins."));
+    assert!(ls.status.success());
+    let nodes: Value = serde_json::from_slice(&ls.stdout).unwrap();
+    assert_eq!(nodes["items"], json!([]));
+    assert_eq!(nodes["total"], 0);
 }
 
 async fn receive(
@@ -358,10 +372,11 @@ fn two_primary_joins_recover_independently_when_one_stops_authenticated_traffic(
     let accepted = oly_cmd(&healthy_tmp)
         .args([
             "node",
-            "accept",
-            "--name",
+            "add",
             "stable",
-            "--id-pub-key",
+            "--role",
+            "secondary",
+            "--key",
             &id_pub_key(&tmp),
         ])
         .output()
@@ -369,19 +384,23 @@ fn two_primary_joins_recover_independently_when_one_stops_authenticated_traffic(
     assert!(accepted.status.success());
     let healthy_join = oly_cmd(&tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "healthy-primary",
+            "--role",
+            "primary",
+            "--as",
             "stable",
-            "--id-pub-key",
+            "--key",
             &id_pub_key(&healthy_tmp),
+            "--url",
             &format!("http://127.0.0.1:{healthy_port}"),
         ])
         .output()
         .unwrap();
     assert!(healthy_join.status.success());
-    assert!(String::from_utf8_lossy(&healthy_join.stdout).contains("Joined primary"));
     let rt = tokio::runtime::Runtime::new().unwrap();
+    assert!(rt.block_on(wait_for_node_connected(healthy_port, "stable", 10)));
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
@@ -421,12 +440,16 @@ fn two_primary_joins_recover_independently_when_one_stops_authenticated_traffic(
     });
     let join = oly_cmd(&tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "silent-primary",
+            "--role",
+            "primary",
+            "--as",
             "worker",
-            "--id-pub-key",
+            "--key",
             &pin,
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
@@ -436,7 +459,6 @@ fn two_primary_joins_recover_independently_when_one_stops_authenticated_traffic(
         "{}",
         String::from_utf8_lossy(&join.stderr)
     );
-    assert!(String::from_utf8_lossy(&join.stdout).contains("Joined primary"));
     rt.block_on(async {
         timeout(Duration::from_secs(60), peer)
             .await
@@ -447,7 +469,7 @@ fn two_primary_joins_recover_independently_when_one_stops_authenticated_traffic(
     let log = fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap();
     assert!(log.contains("primary keepalive timeout"));
     assert_eq!(
-        log.matches("joined primary after encrypted confirmation")
+        log.matches("connected to primary after encrypted confirmation")
             .count(),
         3, // healthy primary once, stalled primary initially and after recovery
     );

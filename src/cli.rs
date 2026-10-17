@@ -86,9 +86,7 @@ pub enum Commands {
     Export(ExportArgs),
     /// Send text, keys, or application mouse input. Example: `oly send <id> mouse:wheel+3`.
     Send(SendArgs),
-    /// Manage this daemon's outbound connections to a primary daemon.
-    Join(JoinArgs),
-    /// List secondary nodes currently connected to this (primary) daemon.
+    /// Configure peer nodes, inspect their live state, and manage federation access.
     Node(NodeArgs),
 }
 
@@ -633,91 +631,8 @@ pub(crate) fn join_free_text(values: &[std::ffi::OsString]) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Join management (secondary side)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Args)]
-pub struct JoinArgs {
-    #[command(subcommand)]
-    pub command: JoinCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum JoinCommand {
-    /// Connect this daemon to a primary as a named secondary node. Config is persisted across restarts.
-    Start(JoinStartArgs),
-    /// Disconnect from a primary and delete the saved join config.
-    Stop(JoinStopArgs),
-    /// List all active join configs on this (secondary) daemon.
-    #[command(name = "ls")]
-    List(JoinListArgs),
-}
-
-// ---------------------------------------------------------------------------
-// Node listing (primary side)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Args)]
-pub struct NodeArgs {
-    #[command(subcommand)]
-    pub command: NodeCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum NodeCommand {
-    /// List all secondary nodes currently connected to this (primary) daemon.
-    #[command(name = "ls")]
-    List,
-    /// Authorize a secondary node's id pubkey so it can join this
-    /// primary. Pair this with the line printed by `oly daemon status`
-    /// (or `<state>/identity_key.pub`) on the secondary box.
-    #[command(name = "accept")]
-    Accept(AcceptArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct AcceptArgs {
-    /// Name of the secondary node to register the id pubkey for.
-    #[arg(long, short = 'n')]
-    pub name: String,
-    /// Canonical identity public key of the secondary, in the form
-    /// `ed25519 <base64(raw32)>` — the line printed by `oly daemon status`
-    /// on the secondary box, or the contents of
-    /// `<state>/identity_key.pub` on the secondary.
-    #[arg(long, short = 'k', value_name = "PUB_KEY")]
-    pub id_pub_key: String,
-}
-
-#[derive(Debug, Args)]
-pub struct JoinStartArgs {
-    /// Name this daemon will be known as on the primary (must be unique per primary).
-    #[arg(long, short = 'n')]
-    pub name: String,
-    /// Required canonical identity public key of the primary, in the form
-    /// `ed25519 <base64(raw32)>`. The secondary pins the primary to
-    /// exactly this identifier — the line printed by `oly daemon status`
-    /// on the primary, or the contents of `<state>/identity_key.pub` on
-    /// the primary.
-    #[arg(long, value_name = "PRIMARY_PUB_KEY")]
-    pub id_pub_key: Option<String>,
-    #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
-    pub url: String,
-}
-
-#[derive(Debug, Args)]
-pub struct JoinStopArgs {
-    /// Name of the join config to stop and remove.
-    #[arg(long, short = 'n')]
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct JoinListArgs {
-    /// For list all the nodes joined to the current daemon (primary)
-    #[arg(long, short = 'p')]
-    pub primary: bool,
-}
+mod nodes;
+pub use nodes::*;
 
 #[cfg(test)]
 mod tests {

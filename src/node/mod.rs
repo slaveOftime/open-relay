@@ -1,3 +1,4 @@
+pub mod config;
 pub(crate) mod liveness;
 pub mod registry;
 

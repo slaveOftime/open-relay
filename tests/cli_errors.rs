@@ -610,3 +610,14 @@ fn input_live_daemon_session_error_is_not_reported_as_unavailable() {
         "live daemon request failures should not be mislabeled as availability issues: {stderr}"
     );
 }
+
+#[test]
+fn removed_join_and_node_accept_commands_are_rejected() {
+    let tmp = make_tmp_dir("removed_federation_commands");
+    for args in [["join", "start"], ["node", "accept"]] {
+        let output = oly_cmd(&tmp).args(args).output().unwrap();
+        assert!(!output.status.success(), "removed command parsed: {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+    }
+}

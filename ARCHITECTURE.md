@@ -185,13 +185,32 @@ Design points worth knowing before touching this code:
 
 ## Node federation
 
-Any daemon can be a **primary** (it serves `GET /api/nodes/join`); any
-daemon can attach to a primary as a **secondary** (`oly join start`,
-config persisted in `joins.json`, one connector per saved name reconnects with
-exponential backoff 1→60 s, reset after each successful handshake —
-`client/join.rs`, `daemon/rpc_nodes.rs`). Multiple outbound joins are independent:
-each owns its connection, liveness deadline, retry state, bounded local relay
-tasks, and broadcast receiver. A failing primary must not stall another join.
+Any daemon can be a **primary** (it serves `GET /api/nodes/join`) and can
+connect outbound as a **secondary**. `oly node` unifies both configurations:
+`NAME` is always the remote peer's local name, and role describes that peer.
+A primary peer requires `--url` and `--as` (the local claimed name authorized
+on the remote); a secondary peer rejects both and authorizes inbound traffic.
+Both pins and authorization live in SQLite `nodes`, one key per configured peer.
+There is no active `joins.json` or `node_identities` source of truth.
+
+The daemon applies and persists add/update/enable/disable/rm via local IPC;
+offline CLI mutations fail without direct state writes. Add enables by default
+and rejects duplicates. Update cannot change role. Disable retains configuration
+and blocks reconnection; rm deletes it and authorization. Both end federation,
+not owning-daemon sessions. Mutations return current state without waiting for
+a handshake; success is not connectivity. `node ls`/`info` combine saved config
+with runtime-only `connected`, `connecting`, `retrying`, `waiting`, or `disabled`
+status, `last_error`, and `next_retry_at`. Runtime status is never persisted.
+
+Enabled primary peers each own a connector with exponential backoff 1→60 s,
+reset after successful handshake. Connections have independent liveness,
+retry state, bounded local relay tasks, and broadcast receivers; a failing
+primary must not stall another connector. `--node` still routes to secondary
+peers only. HTTP `GET /api/nodes` deliberately retains the live secondary route
+array `{name,connected}`, not the configured-peer inventory. CLI `node ls
+--json` instead returns `{items:[summaries],total:N}`; `node info --json` summaries
+flatten `name`, `role`, `key`, `url`, `as`, `enabled`, `status`, `last_error`,
+and `next_retry_at`.
 
 Federation-v2 handshake (`src/federation_crypto.rs`, `http/nodes.rs`,
 `daemon/rpc_nodes.rs`; transport is WebSocket, not SSH):
@@ -209,8 +228,9 @@ secondary                                     primary
 
 Each daemon persists `identity_key` (32-byte Ed25519 seed) and
 `identity_key.pub` (`ed25519 <standard-base64(raw32)>`). Operators independently
-exchange public identities: accept binds the secondary name/key in
-`node_identities`, and `--id-pub-key` pins the primary on the secondary.
+exchange public identities: `node add --role secondary --key` binds the
+secondary name/key, and `node add --role primary --key` pins the primary.
+Primary URLs accept only HTTP/HTTPS and reject userinfo, query, and fragment.
 There is no in-band replacement key, OpenSSH import, or plaintext fallback.
 The transcript length-prefixes its domain, version, role labels, name, both
 raw identities, and both fresh 32-byte nonces. The primary verifies the
@@ -233,11 +253,17 @@ authenticated-inbound watchdog outside the relay future, so stalled socket,
 channel, or local operations cannot suppress disconnect/retry. Socket and
 relay-channel sends have 15-second deadlines. Secondary local RPC/attach
 tasks are bounded (64 per connection) and aborted when that connection ends;
-slow local RPCs do not block sealed keepalives. Outbound `join ls` status
-comes from the live connector, not a hard-coded disconnected value. Invalid
-or unreadable saved join configuration fails explicitly rather than silently
-skipping all connectors. Registration is atomic after encrypted readiness;
-generation-scoped disconnect cannot evict a newer connection. Federation
+slow local RPCs do not block sealed keepalives. `node ls`/`info` report live
+connector state and waiting inbound authorizations, not a hard-coded
+disconnected value. Persisted peer configuration is loaded from SQLite.
+The node manager (`src/daemon/node_manager.rs`) serializes persistence and
+connection reconciliation. Inbound registration rechecks the configuration
+revision under the same mutation lock after encrypted readiness; disable,
+remove, and key updates fence earlier handshakes (from Challenge onward) and
+cancel live links. Outbound cancellation aborts and awaits nested relay tasks;
+CLI stream cancellation also interrupts blocked output writes without appending
+to partial frames. Browser output writes have a 15-second deadline.
+Generation-scoped disconnect cannot evict a newer connection. Federation
 failure throttling is independent of browser authentication. Primary sealed
 pings run every 15 s; only authenticated frames refresh the 45 s liveness clock.
 
@@ -293,14 +319,16 @@ Federation rules to preserve:
   node ends proxied streams with an explicit error, and connectors
   reconnect with backoff rather than silently buffering. A lagged secondary
   connector sends its `resync_required` marker directly to its primary,
-  never back into the source event ring: otherwise multiple lagged joins
+  never back into the source event ring: otherwise multiple lagged connectors
   can keep each other lagging and flood logs after a stalled send or sleep.
 
 Where to look: `src/node/registry.rs` (NodeRegistry, proxy_*),
 `src/daemon/rpc_nodes.rs` (secondary connector, nested-IPC relay,
 allowlists), `src/http/nodes.rs` (join endpoint, keepalive, event
 tagging), `src/federation_crypto.rs` (channel-key derivation + signature
-helpers), `src/client/join.rs` (join config + CLI).
+helpers), `src/client/nodes.rs` (CLI), `src/node/config.rs` (validation and shared types),
+`src/daemon/node_manager.rs` (mutations/reconciliation), and `migrations/`
+(persisted peer schema).
 
 ## Linux IPC isolation
 
@@ -564,9 +592,9 @@ for the response rules.
   agent reports. App routes permit inline scripts; normal UI routes do not.
   Proxy targets are loopback IP literals only, and joined paths cannot change
   origin. Security middleware covers fallback responses as well as named routes.
-  Federation uses pinned identities and sealed traffic but has no forward secrecy
-  and no primary-side identity removal in 0.5.x; the
-  [compatibility policy](./docs/releases/compatibility-0.5.md#node-federation)
+  Federation uses pinned identities and sealed traffic but has no forward secrecy.
+  Node disable/rm contain or revoke a configured peer without killing its sessions;
+  the [compatibility policy](./docs/releases/compatibility-0.5.md#node-federation)
   states the trust model and its limits.
 
 ## Documents

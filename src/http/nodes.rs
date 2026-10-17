@@ -18,7 +18,7 @@ use crate::{
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{
-        FEDERATION_VERSION, MAX_NODE_HANDSHAKE_BYTES, NODE_HANDSHAKE_TIMEOUT, NodeSummary,
+        FEDERATION_VERSION, MAX_NODE_HANDSHAKE_BYTES, NODE_HANDSHAKE_TIMEOUT, NodeRoute,
         NodeWsMessage, RpcResponse,
     },
     session::SessionEvent,
@@ -28,11 +28,11 @@ use crate::{
 // GET /api/nodes
 // ---------------------------------------------------------------------------
 
-pub async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeSummary>> {
+pub async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeRoute>> {
     let names = state.node_registry.connected_names().await;
     let summaries = names
         .into_iter()
-        .map(|name| NodeSummary {
+        .map(|name| NodeRoute {
             name,
             connected: true,
         })
@@ -69,7 +69,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     let deadline = tokio::time::Instant::now() + NODE_HANDSHAKE_TIMEOUT;
     let established =
         tokio::time::timeout_at(deadline, primary_handshake(&mut ws_tx, &mut ws_rx, &state)).await;
-    let (name, mut phase) = match established {
+    let (authorized, mut phase) = match established {
         Ok(Ok(connection)) => connection,
         result => {
             state.node_registry.record_join_failure(client_ip).await;
@@ -82,20 +82,39 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             return;
         }
     };
+    let name = authorized.name.clone();
     let (send_tx, mut send_rx) = mpsc::channel::<NodeWsMessage>(64);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let pending: Arc<Mutex<HashMap<String, PendingRpc>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
-    let handle = NodeHandle { send_tx, pending };
-    let generation = match state.node_registry.connect(name.clone(), handle).await {
-        Ok(generation) => generation,
-        Err(err) => {
+    let handle = NodeHandle {
+        send_tx,
+        pending,
+        stop_tx,
+    };
+    // Final authorization and insertion share the mutation lock. A handshake
+    // from an old key/configuration cannot race disable, update, or removal.
+    let registration = async {
+        let _guard = state.node_registry.config_lock.lock().await;
+        if state.db.get_node(&name).await?.as_ref() != Some(&authorized) {
+            return Err(crate::error::AppError::Protocol(
+                "node authorization changed during handshake".into(),
+            ));
+        }
+        state.node_registry.connect(name.clone(), handle).await
+    };
+    let generation = match tokio::time::timeout_at(deadline, registration).await {
+        Ok(Ok(generation)) => generation,
+        result => {
+            let reason = match result {
+                Ok(Err(err)) => err.to_string(),
+                _ => "node registration timed out".into(),
+            };
             let _ = tokio::time::timeout_at(
                 deadline,
                 send_node_message(
                     &mut ws_tx,
-                    &NodeWsMessage::Error {
-                        message: err.to_string(),
-                    },
+                    &NodeWsMessage::Error { message: reason },
                     &mut phase,
                 ),
             )
@@ -281,6 +300,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
         }
     };
     let disconnect_reason = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => "node configuration revoked".to_string(),
         _ = wait_for_inbound_timeout(inbound_rx) => "node keepalive timeout (no authenticated inbound frames for 45s)".to_string(),
         reason = relay => reason,
     };
@@ -326,7 +347,7 @@ async fn primary_handshake(
     tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     rx: &mut futures_util::stream::SplitStream<WebSocket>,
     state: &AppState,
-) -> crate::error::Result<(String, federation_crypto::Channel)> {
+) -> crate::error::Result<(crate::node::config::NodeConfig, federation_crypto::Channel)> {
     use crate::error::AppError;
     let fail = |message: &str| AppError::Protocol(message.to_string());
     let signing_key = state
@@ -351,6 +372,13 @@ async fn primary_handshake(
         return Err(fail("invalid node name"));
     }
     let peer = federation_crypto::parse_public_key(&public_key)?;
+    // Capture authorization before issuing this socket's challenge. Even a
+    // pause before Join must not survive revoke/restore of the same name/key.
+    let registered = state.db.get_node(&name).await?.filter(|node| {
+        node.role == crate::node::config::NodeRole::Secondary
+            && node.enabled
+            && node.key == peer.to_line()
+    });
     let primary_nonce = federation_crypto::fresh_nonce();
     // A fresh challenge is minted for this socket only. No in-band trust root.
     let challenge = federation_crypto::encode_handshake(&NodeWsMessage::Challenge {
@@ -373,10 +401,8 @@ async fn primary_handshake(
     else {
         return Err(fail("expected identity join proof"));
     };
-    let registered = state.db.get_node_identity(&name).await?;
-    if registered.is_none_or(|(_, key)| key != peer.to_line())
-        || !federation_crypto::verify_transcript(&peer, &signature, &transcript)
-    {
+    let registered = registered.ok_or_else(|| fail("unauthorized node identity or transcript"))?;
+    if !federation_crypto::verify_transcript(&peer, &signature, &transcript) {
         return Err(fail("unauthorized node identity or transcript"));
     }
     let mut channel = federation_crypto::Channel::new(&signing_key, &peer, &transcript, false)?;
@@ -388,7 +414,9 @@ async fn primary_handshake(
         .await
         .map_err(|e| fail(&e.to_string()))?;
     match channel.decode_message(&read_handshake_frame(rx).await?)? {
-        NodeWsMessage::Ready { transcript_hash } if transcript_hash == hash => Ok((name, channel)),
+        NodeWsMessage::Ready { transcript_hash } if transcript_hash == hash => {
+            Ok((registered, channel))
+        }
         _ => Err(fail("expected encrypted readiness for this transcript")),
     }
 }

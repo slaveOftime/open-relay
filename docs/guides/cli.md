@@ -6,6 +6,10 @@ This guide covers the 0.5 CLI. Run `oly <command> --help` for flag details.
 Most runtime operations require a running daemon; local `oly ls` falls back to
 persisted SQLite metadata when the daemon is unreachable.
 
+For federation setup and peer lifecycle, see [Node management](./remote-access.md#connect-machines).
+Session `--node NAME` selects a secondary peer only; primary peer configuration
+is an outbound federation link, not a session routing target.
+
 ## Start, inspect, and finish
 
 ```sh
