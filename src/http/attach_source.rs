@@ -182,10 +182,12 @@ impl AttachSource {
             role: None,
             credited: true,
         };
-        let (stream_rpc_id, mut stream_rx) = registry
+        let stream = registry
             .proxy_rpc_stream(&node, &rpc)
             .await
             .map_err(|err| InitError::Abort(format!("failed to open proxy stream: {err}")))?;
+        let stream_rpc_id = stream.id;
+        let mut stream_rx = stream.responses;
 
         let init_frame = match stream_rx.recv().await {
             Some(Ok(RpcResponse::AttachStreamInit {

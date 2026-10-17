@@ -148,7 +148,7 @@ Open **http://127.0.0.1:15443** for the browser UI, or use
 ## Go deeper
 
 - [CLI guide](./docs/guides/cli.md) — logs, cursors, input, scrolling, and session lifecycle
-- [Remote access](./docs/guides/remote-access.md) — browser security, connected nodes, and notifications
+- [Remote access](./docs/guides/remote-access.md) — browser security, `oly node` peer management, and notifications
 - [Troubleshooting](./docs/guides/troubleshooting.md) — expected limits, and what to collect when reporting
 - [Agent skills](./skills/oly/SKILL.md) — general usage; [sub-agent orchestration](./skills/oly-subagent/SKILL.md), [daemon configuration](./skills/oly-daemon/SKILL.md), [web apps](./skills/oly-apps/SKILL.md)
 - [Upgrade to 0.5](./docs/releases/migration-0.5.md) — breaking changes and safe upgrades

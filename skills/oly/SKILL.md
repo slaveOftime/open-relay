@@ -13,20 +13,47 @@ Other embedded skills: `oly skill --subagent` (multi-agent orchestration), `oly 
 - **Use `oly start`** when a command is interactive/TUI, may prompt later, must survive terminal disconnects, or needs durable logs/handoff. Run short, non-interactive commands (`git`, `ls`, `rg`, quick tests) directly in the shell.
 - **Daemon check:** Run `oly daemon status`. Start with `oly daemon start --detach` **only if confirmed stopped**. Never stop/restart a shared running daemon. In a sandbox, `Access is denied` means IPC is blocked while the daemon may still be running — retry the `oly` command with approval/escalation.
 
-### Secondary nodes
+### Node federation
 
-`oly join ls` on the secondary reports saved outbound joins and their live
-connection state; `oly node ls` on the primary reports connected secondaries.
-`join ls --primary` lists inbound nodes, not outbound connectors. Both ends
-close links after 45s without authenticated inbound traffic and retry joins
-with backoff (reset after success); socket/channel sends have deadlines.
-Multiple outbound primaries use distinct saved names and independent connectors;
-reusing a name replaces and cancels its old connector. Invalid/unreadable
-`joins.json` fails explicitly instead of silently skipping joins. If local
-saved joins and daemon logs disagree with CLI output, check state/IPC routing
-before restarting anything. Linux defaults are scoped by state path and WSL
-distribution; explicit `OLY_SOCKET_NAME` must match daemon and CLI and be unique
-across independent environments. See `oly skill --daemon` for upgrade cautions.
+Role names describe the **remote peer**. Verify daemon public identities out of
+band (`oly daemon status`, `ID-PUB-KEY`); never share the private seed.
+
+```sh
+# On the primary: authorize the secondary's claimed name/key
+oly node add worker-1 --role secondary --key 'ed25519 <secondary-base64>'
+# On the secondary: name the remote primary locally and claim worker-1 there
+oly node add gateway --role primary --url http://primary-host:15443 \
+  --key 'ed25519 <primary-base64>' --as worker-1
+oly node ls --role primary
+oly node info gateway --json
+```
+
+`NAME` always names the remote locally; `--as` must match its authorized
+secondary name on the primary. Primary peers require `--url`/`--as`; secondary
+peers reject them. URLs allow HTTP/HTTPS only, without userinfo/query/fragment.
+Session `--node worker-1` targets a secondary, never an outbound primary.
+
+- `oly node ls [--role primary|secondary] [--status connected|connecting|retrying|waiting|disabled] [--json]` lists all configured peers. JSON is `{items:[...],total:N}`.
+- `oly node info NAME [--json]` shows the flat summary: `name`, `role`, `key`, `url`, `as`, `enabled`, `status`, `last_error`, `next_retry_at`.
+- Add enables by default; duplicate names fail. Use `oly node update NAME [--url URL] [--key KEY] [--as LOCAL_NAME]`; role cannot change.
+- `oly node disable NAME` retains configuration and blocks reconnection; `enable` persists re-enablement. `oly node rm NAME` deletes configuration/auth and ends federation **only**, not remote sessions. These changes require operator authorization.
+- Mutations require a running daemon and never write state offline. Success means persisted/applied, **not connected**; inspect `ls`/`info` for the observable result.
+
+SQLite `nodes` stores inbound authorization and outbound pins; runtime status
+is not persisted. `waiting` is enabled inbound authorization, `retrying` is
+outbound backoff; inspect last errors and next retry. Disabled state survives
+restart. Multiple primary peers have independent connectors and 1–60s backoff,
+reset after handshake success. Both ends close links after 45s without
+authenticated traffic; sends have deadlines. HTTP `GET /api/nodes` remains a
+live secondary route array, not configured-peer inventory.
+
+For key rotation, verify the new public identity independently, disable both
+counterparts, update the affected pin, then enable and check a fresh connection.
+Encryption has no forward secrecy; use trusted transport. If node inventory
+and local daemon logs disagree, check state/IPC routing before restarting.
+Linux defaults are scoped by state path and WSL distribution; explicit
+`OLY_SOCKET_NAME` must match daemon and CLI and be unique across environments.
+See `oly skill --daemon` for upgrade cautions.
 
 ## Core workflow
 

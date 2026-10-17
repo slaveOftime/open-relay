@@ -16,7 +16,7 @@ use crate::session::SessionEvent;
 // lossy UTF-8 round-trip. Mode frames also carry mouse/focus flags.
 // 14: federation uses the sole nonce-bound node identity handshake; API-key
 // RPCs and legacy federation fields are removed.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const FEDERATION_VERSION: u16 = 2;
 pub const NODE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const MAX_NODE_HANDSHAKE_BYTES: usize = crate::federation_crypto::MAX_HANDSHAKE_BYTES;
@@ -391,34 +391,27 @@ pub enum RpcRequest {
         node: String,
         inner: Box<RpcRequest>,
     },
-    /// Signal the daemon to start a persistent outbound join connector
-    /// using the daemon's auto-generated identity key. The connector pins
-    /// the primary's id pubkey to exactly the operator-supplied
-    /// canonical `ed25519 <base64(raw32)>` line — no TOFU file, no
-    /// interactive prompts, no shared secret.
-    JoinStart {
-        url: String,
-        name: String,
-        primary_id_pub_key: String,
+    NodeAdd {
+        config: crate::node::config::NodeConfig,
     },
-    /// Signal the daemon to stop and remove an outbound join connector.
-    JoinStop {
+    NodeUpdate {
+        name: String,
+        update: crate::node::config::NodeUpdate,
+    },
+    NodeSetEnabled {
+        name: String,
+        enabled: bool,
+    },
+    NodeRemove {
         name: String,
     },
-    /// List active join connectors on this (secondary) daemon.
-    JoinList {
-        primary: bool,
-    },
-    /// List all secondary nodes currently connected to this (primary) daemon.
-    NodeList,
-    /// Register a secondary node's id pubkey on the primary. The
-    /// `id_pub_key` field is the canonical `ed25519
-    /// <base64(raw32)>` line printed by `oly daemon status` on the
-    /// secondary (matched against the secondary's
-    /// `<state>/identity_key.pub` on disk).
-    NodeAccept {
+    NodeInfo {
         name: String,
-        id_pub_key: String,
+    },
+    /// Configured peers plus live state; never an inventory of sockets only.
+    NodeList {
+        role: Option<crate::node::config::NodeRole>,
+        status: Option<crate::node::config::NodeStatus>,
     },
 }
 
@@ -452,11 +445,12 @@ impl RpcRequest {
             RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsRead { .. } => "logs_read",
             RpcRequest::NodeProxy { .. } => "node_proxy",
-            RpcRequest::JoinStart { .. } => "join_start",
-            RpcRequest::JoinStop { .. } => "join_stop",
-            RpcRequest::JoinList { .. } => "join_list",
-            RpcRequest::NodeList => "node_list",
-            RpcRequest::NodeAccept { .. } => "node_accept",
+            RpcRequest::NodeAdd { .. } => "node_add",
+            RpcRequest::NodeUpdate { .. } => "node_update",
+            RpcRequest::NodeSetEnabled { .. } => "node_set_enabled",
+            RpcRequest::NodeRemove { .. } => "node_remove",
+            RpcRequest::NodeInfo { .. } => "node_info",
+            RpcRequest::NodeList { .. } => "node_list",
         }
     }
 }
@@ -657,21 +651,12 @@ pub enum RpcResponse {
         message: String,
     },
     // ── Node federation ──────────────────────────────────────────────────────
-    JoinList {
-        joins: Vec<JoinSummary>,
-    },
-    /// Outcome of the first attempt of a `JoinStart` request. The
-    /// connector keeps retrying in the background regardless — these
-    /// states are informational and the user is expected to check
-    /// `oly join ls` for the live view.
-    JoinStartStatus {
-        /// `"connected" | "joining" | "failed"`.
-        state: String,
-        /// Human-readable detail for `joining`/`failed`; empty for `connected`.
-        message: String,
+    NodeInfo {
+        node: crate::node::config::NodeSummary,
     },
     NodeList {
-        nodes: Vec<String>,
+        items: Vec<crate::node::config::NodeSummary>,
+        total: usize,
     },
 }
 
@@ -681,16 +666,8 @@ pub enum RpcResponse {
 
 /// A connected secondary node as seen by the primary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeSummary {
+pub struct NodeRoute {
     pub name: String,
-    pub connected: bool,
-}
-
-/// A persisted join config as reported to `oly join list`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JoinSummary {
-    pub name: String,
-    pub primary_url: String,
     pub connected: bool,
 }
 

@@ -686,32 +686,71 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
 }
 
 // ---------------------------------------------------------------------------
-// Federation accept-table entries
+// Persisted peer configuration (daemon-owned; live state stays in memory)
 // ---------------------------------------------------------------------------
 
 impl Database {
-    /// Look up the exact identity authorized for a claimed node name.
-    pub async fn get_node_identity(&self, name: &str) -> Result<Option<(String, String)>> {
-        let rows = sqlx::query("SELECT name, public_key FROM node_identities WHERE name = ?1")
+    pub async fn list_nodes(&self) -> Result<Vec<crate::node::config::NodeConfig>> {
+        let rows = sqlx::query("SELECT * FROM nodes ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(node_from_row).collect()
+    }
+
+    pub async fn get_node(&self, name: &str) -> Result<Option<crate::node::config::NodeConfig>> {
+        let row = sqlx::query("SELECT * FROM nodes WHERE name = ?1")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
+        row.as_ref().map(node_from_row).transpose()
     }
 
-    /// Replace a name's key explicitly; never steal another name's key.
-    /// The UNIQUE constraint fails atomically rather than REPLACE deleting it.
-    pub async fn register_node_identity(&self, name: &str, public_key: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO node_identities (name, public_key) VALUES (?1, ?2) \
-             ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key",
-        )
-        .bind(name)
-        .bind(public_key)
-        .execute(&self.pool)
-        .await?;
+    pub async fn insert_node(&self, node: &crate::node::config::NodeConfig) -> Result<()> {
+        sqlx::query("INSERT INTO nodes (name, role, public_key, url, as_name, enabled, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+            .bind(&node.name).bind(node.role.as_str()).bind(&node.key)
+            .bind(&node.url).bind(&node.as_name).bind(node.enabled).bind(&node.revision)
+            .execute(&self.pool).await?;
         Ok(())
     }
+
+    pub async fn update_node(&self, node: &crate::node::config::NodeConfig) -> Result<()> {
+        sqlx::query("UPDATE nodes SET public_key = ?2, url = ?3, as_name = ?4, enabled = ?5, revision = ?6 WHERE name = ?1")
+            .bind(&node.name).bind(&node.key).bind(&node.url).bind(&node.as_name)
+            .bind(node.enabled).bind(&node.revision).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn remove_node(&self, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM nodes WHERE name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+fn node_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<crate::node::config::NodeConfig> {
+    use crate::node::config::{NodeConfig, NodeRole};
+    let role: String = row.try_get("role")?;
+    let mut node = NodeConfig {
+        name: row.try_get("name")?,
+        role: match role.as_str() {
+            "primary" => NodeRole::Primary,
+            "secondary" => NodeRole::Secondary,
+            _ => {
+                return Err(crate::error::AppError::Protocol(format!(
+                    "invalid persisted node role: {role}"
+                )));
+            }
+        },
+        key: row.try_get("public_key")?,
+        url: row.try_get("url")?,
+        as_name: row.try_get("as_name")?,
+        enabled: row.try_get("enabled")?,
+        revision: row.try_get("revision")?,
+    };
+    node.validate()?;
+    Ok(node)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,24 +784,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_upsert_cannot_steal_another_registered_name() {
+    async fn node_writes_cannot_replace_names_or_steal_keys() {
+        use crate::node::config::{NodeConfig, NodeRole};
         let db = open_test_db().await;
-        db.register_node_identity("a", "key-a").await.unwrap();
-        db.register_node_identity("b", "key-b").await.unwrap();
-        assert!(db.register_node_identity("b", "key-a").await.is_err());
-        assert_eq!(db.get_node_identity("a").await.unwrap().unwrap().1, "key-a");
-        assert_eq!(db.get_node_identity("b").await.unwrap().unwrap().1, "key-b");
-        db.register_node_identity("a", "replacement").await.unwrap();
+        let node = |name: &str, seed| NodeConfig {
+            name: name.into(),
+            role: NodeRole::Secondary,
+            key: crate::federation_crypto::public_key_line(&ed25519_dalek::SigningKey::from_bytes(
+                &[seed; 32],
+            )),
+            url: None,
+            as_name: None,
+            enabled: true,
+            revision: uuid::Uuid::new_v4().to_string(),
+        };
+        let a = node("a", 41);
+        let b = node("b", 42);
+        db.insert_node(&a).await.unwrap();
+        db.insert_node(&b).await.unwrap();
+        assert!(db.insert_node(&node("a", 43)).await.is_err());
+        let mut conflict = b.clone();
+        conflict.key = a.key.clone();
+        assert!(db.update_node(&conflict).await.is_err());
+        assert_eq!(db.get_node("a").await.unwrap().unwrap(), a);
+        assert_eq!(db.get_node("b").await.unwrap().unwrap(), b);
+        let mut replacement = node("a", 43);
+        replacement.enabled = false;
+        db.update_node(&replacement).await.unwrap();
+        assert_eq!(db.get_node("a").await.unwrap().unwrap(), replacement);
+        assert_eq!(db.list_nodes().await.unwrap().len(), 2);
+        db.remove_node("a").await.unwrap();
+        assert!(db.get_node("a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_nodes_fail_queries_loudly() {
+        let db = open_test_db().await;
+        sqlx::query("INSERT INTO nodes (name,role,public_key,enabled,revision) VALUES ('bad','secondary','invalid-key',1,'revision')").execute(&db.pool).await.unwrap();
+        assert!(db.list_nodes().await.is_err());
+        assert!(db.get_node("bad").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unified_node_migration_drops_legacy_trust_without_importing_it() {
+        use sqlx::migrate::Migrator;
+        let path = temp_path("oly-old-node-schema", "db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let all = sqlx::migrate!("./migrations");
+        let previous =
+            Migrator::with_migrations(all.iter().filter(|m| m.version <= 11).cloned().collect());
+        previous.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO node_identities (name,public_key) VALUES ('legacy','old-public-key')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        all.run(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
-            db.get_node_identity("a").await.unwrap().unwrap().1,
-            "replacement"
+            count, 0,
+            "legacy trust must not become implicit new authorization"
         );
         assert!(
-            db.get_node_identity("unregistered")
+            sqlx::query("SELECT * FROM node_identities")
+                .fetch_all(&pool)
                 .await
-                .unwrap()
-                .is_none()
+                .is_err()
         );
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -804,7 +901,8 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert!(tables.contains(&"node_identities".into()));
+        assert!(tables.contains(&"nodes".into()));
+        assert!(!tables.contains(&"node_identities".into()));
         assert!(!tables.contains(&"api_keys".into()));
         assert!(!tables.contains(&"ssh_keys".into()));
         let mut connection = pool.acquire().await.unwrap();

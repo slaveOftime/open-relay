@@ -4,20 +4,19 @@ use tokio::{io::BufReader, sync::mpsc};
 use tracing::{info, warn};
 
 use crate::{
-    client,
     config::{AppConfig, LiveConfig},
     db::Database,
     error::Result,
     ipc,
     node::NodeRegistry,
-    protocol::{JoinSummary, ListQuery, RpcRequest, RpcResponse},
+    protocol::{ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
         logs::{read_persisted_log_page, render_log_session_tail},
     },
 };
 
-use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
+use super::{NodeConnectors, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
 use super::{
     health::DaemonHealth,
     rpc_attach::{
@@ -25,10 +24,7 @@ use super::{
         handle_attach_resize, handle_attach_subscribe, handle_observe_window,
         handle_session_cursor,
     },
-    rpc_nodes::{
-        handle_node_accept, handle_node_list, handle_node_proxy, handle_node_proxy_streaming,
-        spawn_join_connector,
-    },
+    rpc_nodes::{handle_node_proxy, handle_node_proxy_streaming},
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -40,7 +36,7 @@ pub(super) async fn handle_client(
     shutdown_tx: mpsc::UnboundedSender<()>,
     node_registry: Arc<NodeRegistry>,
     db: Arc<Database>,
-    join_handles: JoinHandles,
+    node_connectors: NodeConnectors,
     session_event_tx: SessionEventTx,
     notification_tx: NotificationTx,
     notifier: NotifierHandle,
@@ -103,7 +99,7 @@ pub(super) async fn handle_client(
         &shutdown_tx,
         &node_registry,
         &db,
-        &join_handles,
+        &node_connectors,
         &session_event_tx,
         &notification_tx,
         &notifier,
@@ -122,7 +118,7 @@ async fn dispatch_request(
     shutdown_tx: &mpsc::UnboundedSender<()>,
     node_registry: &Arc<NodeRegistry>,
     db: &Arc<Database>,
-    join_handles: &JoinHandles,
+    node_connectors: &NodeConnectors,
     session_event_tx: &SessionEventTx,
     notification_tx: &NotificationTx,
     notifier: &NotifierHandle,
@@ -286,29 +282,23 @@ async fn dispatch_request(
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
         }
-        RpcRequest::JoinStart {
-            url,
-            name,
-            primary_id_pub_key,
-        } => {
-            handle_join_start(
-                config,
-                join_handles,
-                session_event_tx,
-                url,
-                name,
-                primary_id_pub_key,
-            )
-            .await?
+        request @ (RpcRequest::NodeAdd { .. }
+        | RpcRequest::NodeUpdate { .. }
+        | RpcRequest::NodeSetEnabled { .. }
+        | RpcRequest::NodeRemove { .. }
+        | RpcRequest::NodeInfo { .. }
+        | RpcRequest::NodeList { .. }) => super::node_manager::NodeManager {
+            config,
+            db,
+            registry: node_registry,
+            connectors: node_connectors,
+            events: session_event_tx,
         }
-        RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
-        RpcRequest::JoinList { primary } => {
-            handle_join_list(config, join_handles, node_registry, primary).await
-        }
-        RpcRequest::NodeList => handle_node_list(node_registry).await,
-        RpcRequest::NodeAccept { name, id_pub_key } => {
-            handle_node_accept(name, id_pub_key, db).await
-        }
+        .handle(request)
+        .await
+        .unwrap_or_else(|err| RpcResponse::Error {
+            message: err.to_string(),
+        }),
     };
 
     Ok(response)
@@ -660,113 +650,6 @@ async fn handle_logs_pagination(
             message: format!("session not found: {id}"),
         },
     }
-}
-
-/// Mirrors `RpcRequest::JoinStart`'s IPC fields plus the dispatch context;
-/// a parameter-object refactor would obscure that this handler is the
-/// 1:1 IPC shim for that request.
-#[allow(clippy::too_many_arguments)]
-async fn handle_join_start(
-    config: &Arc<AppConfig>,
-    join_handles: &JoinHandles,
-    session_event_tx: &SessionEventTx,
-    url: String,
-    name: String,
-    primary_id_pub_key: String,
-) -> Result<RpcResponse> {
-    let join = client::join::build_join_config(url, name.clone(), Some(primary_id_pub_key))?;
-    client::join::save_join_config(config, &join)?;
-    // The connector reports its first-attempt outcome through a oneshot
-    // so the IPC handler can surface `joined` / `joining` / `failed` to
-    // the CLI synchronously instead of the user finding out about a
-    // rejected join only by absence in `oly join ls`.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let connector =
-        spawn_join_connector(join, Arc::clone(config), session_event_tx.clone(), Some(tx));
-    // Dropping the replaced connector cancels it, including any blocked IO.
-    join_handles.lock().await.insert(name, connector);
-    let outcome = match tokio::time::timeout(FIRST_JOIN_ATTEMPT_DEADLINE, rx).await {
-        Ok(Ok(super::rpc_nodes::JoinAttempt::Connected)) => ("connected", String::new()),
-        Ok(Ok(super::rpc_nodes::JoinAttempt::Failed(msg))) => ("failed", msg),
-        // The connector task ended before it could produce an outcome —
-        // treat it as a failed first attempt. This shouldn't normally
-        // happen unless `JoinStop` was raced against `JoinStart`.
-        Ok(Err(_canceled)) => (
-            "failed",
-            "join connector aborted before first response".to_string(),
-        ),
-        // Deadline elapsed: the connector hasn't reached a definitive
-        // state yet, but it keeps trying in the background. Tell the
-        // user we're still trying so they know it's not already done.
-        Err(_elapsed) => (
-            "joining",
-            format!(
-                "still waiting for first response after {} s; connector keeps retrying in the background; check `oly join ls` for status",
-                FIRST_JOIN_ATTEMPT_DEADLINE.as_secs()
-            ),
-        ),
-    };
-    Ok(RpcResponse::JoinStartStatus {
-        state: outcome.0.to_string(),
-        message: outcome.1,
-    })
-}
-
-/// Maximum time the synchronous `oly join start` path waits for the
-/// join connector's first attempt before reporting `joining`. The
-/// connector continues retrying in the background after the deadline.
-const FIRST_JOIN_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-async fn handle_join_stop(
-    config: &AppConfig,
-    join_handles: &JoinHandles,
-    name: String,
-) -> RpcResponse {
-    if let Err(err) = client::join::remove_join_config(config, &name) {
-        return RpcResponse::Error {
-            message: err.to_string(),
-        };
-    }
-    join_handles.lock().await.remove(&name);
-    RpcResponse::Ack
-}
-
-async fn handle_join_list(
-    config: &AppConfig,
-    join_handles: &JoinHandles,
-    node_registry: &NodeRegistry,
-    primary: bool,
-) -> RpcResponse {
-    let joins = if primary {
-        node_registry
-            .connected_names()
-            .await
-            .iter()
-            .map(|n| JoinSummary {
-                name: n.clone(),
-                primary_url: "".into(),
-                connected: true,
-            })
-            .collect()
-    } else {
-        let mut summaries = match client::join::list_join_summaries(config) {
-            Ok(summaries) => summaries,
-            Err(err) => {
-                return RpcResponse::Error {
-                    message: err.to_string(),
-                };
-            }
-        };
-        let handles = join_handles.lock().await;
-        for join in &mut summaries {
-            join.connected = handles
-                .get(&join.name)
-                .is_some_and(|handle| handle.is_connected());
-        }
-        summaries
-    };
-
-    RpcResponse::JoinList { joins }
 }
 
 #[cfg(test)]

@@ -41,19 +41,26 @@ Node federation lets a **primary** daemon route commands and streams to connecte
 
 Each daemon generates a private Ed25519 seed (`<state>/identity_key`) and public identity (`<state>/identity_key.pub`, shown in `oly daemon status` as `ID-PUB-KEY`). Verify public identities out of band and never share `identity_key`.
 
+A node's **role describes the remote peer**, not the local daemon. `NAME` always
+names that peer locally. A primary peer is an outbound connection target;
+a secondary peer is authorized to connect inbound. A daemon may have both roles.
+
 ```sh
 # 1. On each machine: inspect ID-PUB-KEY
 oly daemon status
 
-# 2. On the primary: authorize the secondary's name and public key
-oly node accept --name worker-1 --id-pub-key "<secondary public identity>"
+# 2. On the primary: authorize the secondary's claimed name and public key
+oly node add worker-1 --role secondary --key 'ed25519 <secondary-base64>'
 
-# 3. On the secondary: connect and pin the primary's public key
-oly join start --name worker-1 --id-pub-key "<primary public identity>" \
-  http://primary-host:15443
+# 3. On the secondary: name the primary locally and pin its public key
+oly node add gateway --role primary --url http://primary-host:15443 \
+  --key 'ed25519 <primary-base64>' --as worker-1
 
-# 4. On the primary: target the connected node with --node
+# 4. Check connection state on both ends; add success is not connectivity
 oly node ls
+oly node info gateway                 # on the secondary
+
+# 5. On the primary: target a connected secondary with --node
 oly start --node worker-1 --detach --title "nightly task" claude
 oly ls --node worker-1
 oly info <id> --node worker-1
@@ -63,23 +70,62 @@ oly attach <id> --node worker-1
 oly stop <id> --node worker-1
 ```
 
-`oly join ls` lists saved outbound joins on a secondary and reports whether
-its connector is currently connected. `oly join ls --primary` lists connected
-**inbound secondaries**, not outbound connector inventory. `oly join stop --name
-worker-1` disconnects and removes the saved join. Saved joins reconnect at daemon
-startup and after link failure with 1–60 s backoff, reset after a successful
-handshake. Multiple primaries are supported: use a distinct saved name for each
-join (the same name replaces its previous connector). Each connection has its
-own retry, liveness, and relay-task state. Both endpoints abandon a
-connection after 45 s without authenticated inbound traffic; stalled sends
-also have deadlines. Invalid/unreadable `joins.json` fails explicitly at startup
-or when listing/updating joins; it is not treated as an empty list.
+`--as worker-1` is the local name claimed to the remote primary; it must exactly
+match the secondary name authorized there. Primary peers require `--url` and
+`--as`; secondary peers reject both. URLs must use `http` or `https`, without
+userinfo, query, or fragment. `--node` targets secondary peers only; it does not
+route sessions to a configured primary such as `gateway`.
+
+### Manage configured peers
+
+| Command | Effect |
+|---|---|
+| `oly node ls [--role primary\|secondary] [--status connected\|connecting\|retrying\|waiting\|disabled] [--json]` | List configured peers, including disconnected and disabled entries |
+| `oly node info NAME [--json]` | Inspect configuration, current state, last error, and next retry |
+| `oly node update NAME [--url URL] [--key KEY] [--as LOCAL_NAME]` | Change an existing peer; role cannot change |
+| `oly node disable NAME` | Persist disabled state, end the link, and block reconnection; retain configuration |
+| `oly node enable NAME` | Persist enabled state and resume connection/authorization |
+| `oly node rm NAME` | Delete configuration and authorization, and end federation only; do not stop remote sessions |
+
+Add enables a peer by default. A duplicate name fails: use `update`, not another
+`add`. To change role, remove and add the peer deliberately. Every mutation
+requires a running local daemon; there is no offline direct-write fallback.
+Mutations return the current node state without waiting for the first connection.
+Success means **persisted and applied**, not connected; confirm via `ls`/`info`.
+Changes invalidate old links and in-progress handshakes; existing relayed streams
+are interrupted, not reported as completed sessions.
+
+| Status | Meaning |
+|---|---|
+| `connected` | Authenticated link established |
+| `connecting` | Outbound connection attempt in progress |
+| `retrying` | Outbound peer waiting for another attempt; inspect `last_error` and `next_retry_at` |
+| `waiting` | Enabled secondary authorization waiting for an inbound link |
+| `disabled` | Persistently disabled; no connection allowed |
+
+`node ls --json` returns an object `{items: [...], total: N}`, not an array.
+`node info --json` returns a flat summary with `name`, `role`, `key`,
+`url`, `as`, `enabled`, `status`, `last_error`, and `next_retry_at`.
+`enabled` is boolean; secondary `url`/`as` are null. `last_error` is nullable
+text and `next_retry_at` is a nullable UTC timestamp. Runtime status is never persisted. Both outbound pins and inbound authorization
+live in SQLite's `nodes` table, not `joins.json` or `node_identities`.
+
+Enabled primary peers reconnect at daemon startup and after link failure with
+1–60 s backoff, reset after a successful handshake. Multiple primaries have
+independent connection, retry, liveness, and relay-task state. Both endpoints
+abandon a connection after 45 s without authenticated inbound traffic; stalled
+sends also have deadlines. Disabled state survives daemon restarts.
+
+For existing UI clients, HTTP `GET /api/nodes` deliberately remains the **live
+secondary route inventory**: an array of `{name, connected}` entries. It is not
+the unified configured-peer inventory exposed by `oly node ls`.
 
 ### Trust, encryption, and rotation
 
-- **Transport:** WebSocket (not SSH) using canonical `ed25519 <base64>` identities. No TOFU, SSH-agent, or API-key fallback.
+- **Transport:** WebSocket (not SSH) using canonical `ed25519 <base64>` identities. No TOFU, SSH-agent, or API-key fallback. Each configured peer has one key, unique across local peer names; verify replacements independently.
 - **Encryption:** Signed Federation v2 handshake with mutual `KeyConfirm`/`Ready` messages, followed by AES-256-GCM frame encryption derived via static-static X25519 + HKDF-SHA-256. **No forward secrecy** — run federation over a trusted network or tunnel. See [Architecture](../../ARCHITECTURE.md#node-federation).
-- **Key rotation & decommission:** Re-run `oly node accept --name worker-1 --id-pub-key "<new-key>"` on the primary, then restart the secondary connector (`oly join stop` + `oly join start`) so the live connection re-verifies. 0.5.x has no primary-side `node remove` command, and each public key is unique to one node name. See [Node federation](../releases/compatibility-0.5.md#node-federation).
+- **Rotation:** Disable the peer on both ends, update the affected pin with `oly node update NAME --key 'ed25519 <new-base64>'`, then enable and inspect `node info` to confirm a fresh handshake. Do not restart a shared daemon just to rotate a key.
+- **Decommission:** `oly node rm NAME` revokes that local authorization/pin and closes federation; remove the counterpart configuration too to stop its retries. `disable` is reversible containment. Neither operation kills sessions on the owning daemon. A compromised seed still requires identity replacement and transport containment; deletion cannot protect recorded traffic.
 
 ## Notifications
 
@@ -119,7 +165,7 @@ On Linux, default IPC names are scoped to the canonical state path and WSL
 distribution. An explicit `OLY_SOCKET_NAME` overrides this: use the same value
 for daemon and CLI, and distinct values for independent environments. Other
 platforms keep their previous defaults. See [IPC upgrade and isolation](./troubleshooting.md#linuxwsl-ipc-upgrade-and-isolation).
-State contains `oly.db`, `logs/`, `sessions/<id>/journal/`, `config.json`, `identity_key`, `joins.json`, and optional `wwwroot/apps/`.
+State contains `oly.db` (including configured peers in `nodes`), `logs/`, `sessions/<id>/journal/`, `config.json`, `identity_key`, `identity_key.pub`, and optional `wwwroot/apps/`. Node configuration is managed through the daemon, not by editing state files.
 
 Configuration in `<state>/config.json` is flat JSON:
 - For config keys, defaults, and hot reload, see the [daemon skill](../../skills/oly-daemon/SKILL.md) (`oly skill --daemon`).

@@ -1,10 +1,7 @@
 use interprocess::local_socket::tokio::Stream;
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -16,11 +13,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 
 use crate::{
-    client::join::JoinConfig,
     config::AppConfig,
-    db::Database,
     error::Result,
     federation_crypto, ipc,
+    node::config::{ConnectorState, NodeStatus, PrimaryConnection},
     node::{
         NodeRegistry,
         liveness::{NODE_SEND_TIMEOUT, wait_for_inbound_timeout},
@@ -32,110 +28,59 @@ use crate::{
     session::SessionEvent,
 };
 
-/// Outcome of the first attempt of a join connector. Reported exactly
-/// once (via `oneshot`) to whatever spawned the connector; subsequent
-/// retries/disconnects use the normal `Backoff` loop without further
-/// notification through this channel.
-#[derive(Debug)]
-pub(crate) enum JoinAttempt {
-    /// WS handshake completed and `NodeWsMessage::Joined` was received.
-    Connected,
-    /// WS handshake (or its prerequisites) failed before reaching
-    /// `Joined`; carries the reason from the connector.
-    Failed(String),
-}
-
-/// One-shot reporter for the first-attempt outcome. Holding this in the
-/// connector's state means we never forget to fire (or double-fire) the
-/// signal even across deep retry paths; `joined`/`fail` consume the
-/// inner sender so a later disconnect cannot accidentally signal again.
-struct AttemptReporter(Option<tokio::sync::oneshot::Sender<JoinAttempt>>);
-
-impl AttemptReporter {
-    fn empty() -> Self {
-        Self(None)
-    }
-    fn new(tx: tokio::sync::oneshot::Sender<JoinAttempt>) -> Self {
-        Self(Some(tx))
-    }
-    fn joined(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(JoinAttempt::Connected);
-        }
-    }
-    fn fail(&mut self, msg: impl Into<String>) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(JoinAttempt::Failed(msg.into()));
-        }
-    }
-}
-
-/// Owns cancellation and live outbound status. Replacing/removing an entry
-/// must end its old socket even if the relay is blocked in an await.
-pub(crate) struct JoinConnector {
-    abort: tokio::task::AbortHandle,
+/// Owns cancellation and derived outbound diagnostics.
+pub(crate) struct NodeConnector {
+    task: tokio::task::JoinHandle<()>,
     stop_tx: watch::Sender<bool>,
-    connected: Arc<AtomicBool>,
+    state: Arc<RwLock<ConnectorState>>,
 }
 
-impl JoinConnector {
-    pub(crate) fn is_connected(&self) -> bool {
-        !self.abort.is_finished() && self.connected.load(Ordering::Acquire)
+impl NodeConnector {
+    pub(crate) fn state(&self) -> ConnectorState {
+        self.state.read().unwrap().clone()
+    }
+
+    /// Await teardown so successful mutations do not leave an old relay alive.
+    pub(crate) async fn stop(mut self) {
+        let _ = self.stop_tx.send(true);
+        // Cooperative cancellation reaches the descendant cleanup barrier.
+        // Abort is only a bounded fallback for an unexpectedly stuck task.
+        if tokio::time::timeout(NODE_SEND_TIMEOUT, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
     }
 }
 
-impl Drop for JoinConnector {
+impl Drop for NodeConnector {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(true);
-        self.abort.abort();
+        self.task.abort();
     }
 }
 
-/// Reset status on every exit path, including watchdog cancellation and abort.
-struct ConnectedGuard(Arc<AtomicBool>);
-
-impl ConnectedGuard {
-    fn new(connected: Arc<AtomicBool>) -> Self {
-        connected.store(true, Ordering::Release);
-        Self(connected)
-    }
-}
-
-impl Drop for ConnectedGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-pub(super) fn spawn_join_connector(
-    join: JoinConfig,
+pub(super) fn spawn_node_connector(
+    join: PrimaryConnection,
     local_config: Arc<AppConfig>,
     session_event_tx: broadcast::Sender<SessionEvent>,
-    on_attempt: Option<tokio::sync::oneshot::Sender<JoinAttempt>>,
-) -> JoinConnector {
+) -> NodeConnector {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let reporter = match on_attempt {
-        Some(tx) => AttemptReporter::new(tx),
-        None => AttemptReporter::empty(),
-    };
-    let session_event_rx = session_event_tx.subscribe();
-    let connected = Arc::new(AtomicBool::new(false));
-    let task_connected = Arc::clone(&connected);
-    let task = tokio::spawn(async move {
-        run_join_connector(
-            join,
-            local_config,
-            session_event_rx,
-            stop_rx,
-            reporter,
-            task_connected,
-        )
-        .await;
-    });
-    JoinConnector {
-        abort: task.abort_handle(),
+    let state = Arc::new(RwLock::new(ConnectorState::default()));
+    let task_state = Arc::clone(&state);
+    let task = tokio::spawn(run_node_connector(
+        join,
+        local_config,
+        session_event_tx.subscribe(),
+        stop_rx,
+        task_state,
+    ));
+    NodeConnector {
+        task,
         stop_tx,
-        connected,
+        state,
     }
 }
 
@@ -157,71 +102,61 @@ impl RetryBackoff {
     }
 }
 
-async fn run_join_connector(
-    join: JoinConfig,
+async fn run_node_connector(
+    join: PrimaryConnection,
     local_config: Arc<AppConfig>,
     mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
-    mut attempt_report: AttemptReporter,
-    connected: Arc<AtomicBool>,
+    state: Arc<RwLock<ConnectorState>>,
 ) {
     let mut backoff = RetryBackoff::default();
-
     loop {
-        match connect_and_relay(
+        {
+            let mut s = state.write().unwrap();
+            s.status = NodeStatus::Connecting;
+            s.next_retry_at = None;
+        }
+        let reason = match connect_and_relay(
             &join,
             &local_config,
             &mut session_event_rx,
             &mut stop_rx,
-            &mut attempt_report,
-            &connected,
+            &state,
             &mut backoff,
         )
         .await
         {
-            Ok(true) => {
-                info!(node = %join.name, "join connector stopped");
-                return;
-            }
-            Ok(false) => {
-                warn!(node = %join.name, "join connector disconnected");
-            }
-            Err(err) => {
-                // connect_and_relay already converts the reason into a
-                // `Failed(...)` signal when appropriate, but the helper
-                // can't reach every path; firefall here for any escape.
-                attempt_report.fail(err.to_string());
-                warn!(node = %join.name, %err, "join connector disconnected");
-            }
-        }
-
+            Ok(true) => return,
+            Ok(false) => "primary disconnected".to_string(),
+            Err(err) => err.to_string(),
+        };
         if *stop_rx.borrow() {
-            info!(node = %join.name, "join connector stopped");
             return;
         }
-
         let wait = backoff.next_wait_secs();
-        warn!(node = %join.name, wait_secs = wait, "join connector retrying");
+        {
+            let mut s = state.write().unwrap();
+            s.status = NodeStatus::Retrying;
+            s.last_error = Some(reason.clone());
+            s.next_retry_at = Some(chrono::Utc::now() + chrono::Duration::seconds(wait as i64));
+        }
+        warn!(node = %join.name, %reason, wait_secs = wait, "node connector retrying");
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
-            _ = stop_rx.changed() => {
-                info!(node = %join.name, "join connector stopped during backoff");
-                return;
-            }
+            _ = stop_rx.changed() => return,
         }
     }
 }
 
 async fn connect_and_relay(
-    join: &JoinConfig,
+    join: &PrimaryConnection,
     local_config: &Arc<AppConfig>,
     session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
-    attempt_report: &mut AttemptReporter,
-    connected: &Arc<AtomicBool>,
+    state: &Arc<RwLock<ConnectorState>>,
     backoff: &mut RetryBackoff,
 ) -> Result<bool> {
-    let base = join.primary_url.trim_end_matches('/');
+    let base = join.url.trim_end_matches('/');
     let ws_url = if base.starts_with("https://") {
         format!("{}/api/nodes/join", base.replacen("https://", "wss://", 1))
     } else {
@@ -240,27 +175,28 @@ async fn connect_and_relay(
     };
     let (mut ws_tx, mut ws_rx, mut phase) = match established {
         Ok(Ok(connection)) => connection,
-        Ok(Err(err)) => {
-            attempt_report.fail(err.to_string());
-            return Err(err);
-        }
+        Ok(Err(err)) => return Err(err),
         Err(_) => {
-            let msg = "node identity handshake timed out before encrypted Joined";
-            attempt_report.fail(msg);
-            return Err(crate::error::AppError::Protocol(msg.into()));
+            return Err(crate::error::AppError::Protocol(
+                "node identity handshake timed out before encrypted Joined".into(),
+            ));
         }
     };
-    info!(node = %join.name, primary = %join.primary_url, "joined primary after encrypted confirmation");
-    let _connected = ConnectedGuard::new(Arc::clone(connected));
+    info!(node = %join.name, primary = %join.url, "connected to primary after encrypted confirmation");
+    {
+        let mut s = state.write().unwrap();
+        s.status = NodeStatus::Connected;
+        s.last_error = None;
+        s.next_retry_at = None;
+    }
     // An old outage must not leave the next independent outage at a 60s wait.
     backoff.reset();
-    attempt_report.joined();
     let (inbound_tx, inbound_rx) = watch::channel(tokio::time::Instant::now());
 
     // Keep the cancellation and authenticated-inbound watchdog outside every
     // relay await, including WebSocket sends and local channel operations.
+    let mut relay_tasks = tokio::task::JoinSet::new();
     let relay = async {
-        let mut relay_tasks = tokio::task::JoinSet::new();
         let (rpc_tx, mut rpc_rx) = mpsc::channel::<(String, RpcResponse)>(64);
         let (stream_frame_tx, mut stream_frame_rx) =
             mpsc::channel::<(String, RpcResponse, bool)>(256);
@@ -423,9 +359,9 @@ async fn connect_and_relay(
                         _ => break,
                     }
                 }
-                session_event = next_relay_event(session_event_rx, &join.name) => {
+                session_event = next_relay_event(session_event_rx, &join.as_name) => {
                     let Some(event) = session_event else { break };
-                    let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
+                    let relay = NodeWsMessage::from_session_event(&event, Some(join.as_name.as_str()));
                     debug!(node = %join.name, event = ?event, "relaying session event to primary");
                     send_node_message(&mut ws_tx, &relay, &mut phase).await?;
                 }
@@ -434,14 +370,21 @@ async fn connect_and_relay(
 
         Ok(false)
     };
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         _ = stop_rx.changed() => Ok(true),
         _ = wait_for_inbound_timeout(inbound_rx) => Err(crate::error::AppError::Protocol(
             "primary keepalive timeout (no authenticated inbound frames for 45s)".into()
         )),
         result = relay => result,
-    }
+    };
+    drain_relay_tasks(&mut relay_tasks).await;
+    result
+}
+
+async fn drain_relay_tasks(tasks: &mut tokio::task::JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Convert a local relay gap into a marker for this primary only. Publishing
@@ -483,7 +426,7 @@ async fn read_handshake_frame(rx: &mut NodeSource) -> Result<Vec<u8>> {
 
 async fn secondary_handshake(
     url: &str,
-    join: &JoinConfig,
+    join: &PrimaryConnection,
     config: &AppConfig,
 ) -> Result<(NodeSink, NodeSource, federation_crypto::Channel)> {
     use crate::error::AppError;
@@ -491,7 +434,7 @@ async fn secondary_handshake(
     let seed =
         federation_crypto::load_seed(&federation_crypto::seed_path(&config.paths.state_dir))?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let primary = federation_crypto::parse_public_key(&join.primary_id_pub_key)?;
+    let primary = federation_crypto::parse_public_key(&join.key)?;
     let secondary_nonce = federation_crypto::fresh_nonce();
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(64 * 1024 * 1024))
@@ -502,7 +445,7 @@ async fn secondary_handshake(
     let (mut tx, mut rx) = socket.split();
     let hello = federation_crypto::encode_handshake(&NodeWsMessage::Hello {
         version: FEDERATION_VERSION,
-        name: join.name.clone(),
+        name: join.as_name.clone(),
         public_key: federation_crypto::public_key_line(&signing_key),
         nonce: secondary_nonce,
     })?;
@@ -519,7 +462,7 @@ async fn secondary_handshake(
     let transcript = federation_crypto::build_transcript(
         FEDERATION_VERSION,
         "secondary-proof",
-        &join.name,
+        &join.as_name,
         signing_key.verifying_key().as_bytes(),
         primary.as_bytes(),
         &secondary_nonce,
@@ -790,40 +733,6 @@ pub(super) async fn handle_node_proxy(
     }
 }
 
-pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcResponse {
-    let nodes = node_registry.connected_names().await;
-    RpcResponse::NodeList { nodes }
-}
-
-pub(super) async fn handle_node_accept(
-    name: String,
-    id_pub_key: String,
-    db: &Arc<Database>,
-) -> RpcResponse {
-    if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
-        return RpcResponse::Error {
-            message: "invalid node name".into(),
-        };
-    }
-    // Validate and normalize the key so lookups at join time (which use the
-    // canonical form) always match, regardless of how the key was pasted in.
-    let canonical = match crate::federation_crypto::parse_public_key(&id_pub_key) {
-        Ok(key) => key.to_line(),
-        Err(e) => {
-            return RpcResponse::Error {
-                message: e.to_string(),
-            };
-        }
-    };
-    if let Err(e) = db.register_node_identity(&name, &canonical).await {
-        return RpcResponse::Error {
-            message: format!("failed to register id pubkey: {e}"),
-        };
-    }
-    info!(node = %name, "registered accepted id pubkey");
-    RpcResponse::Empty
-}
-
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
 /// secondary node and relay all streaming frames back to the CLI via IPC.
 /// Client messages (input/resize/credits/detach) read from the IPC
@@ -837,7 +746,7 @@ pub(super) async fn handle_node_proxy_streaming(
     mut writer: tokio::io::WriteHalf<Stream>,
     node_registry: &Arc<NodeRegistry>,
 ) -> Result<()> {
-    let (stream_rpc_id, mut stream_rx) = match node_registry.proxy_rpc_stream(&node, &inner).await {
+    let stream = match node_registry.proxy_rpc_stream(&node, &inner).await {
         Ok(pair) => pair,
         Err(e) => {
             ipc::write_response_to_writer(
@@ -850,6 +759,9 @@ pub(super) async fn handle_node_proxy_streaming(
             return Ok(());
         }
     };
+    let stream_rpc_id = stream.id;
+    let mut stream_rx = stream.responses;
+    let mut cancelled = stream.cancelled;
 
     let (client_msg_tx, mut client_msg_rx) = mpsc::channel::<Result<RpcRequest>>(64);
     let client_reader_task = tokio::spawn(async move {
@@ -877,99 +789,137 @@ pub(super) async fn handle_node_proxy_streaming(
     // Local IPC attach streams switch to binary frames after the init
     // line (ADR-0004) — this relay is no exception.
     let mut stream_binary = false;
+    let mut writing_frame = false;
 
-    loop {
-        tokio::select! {
-            biased;
+    let relay = async {
+        loop {
+            tokio::select! {
+                biased;
 
-            frame = stream_rx.recv() => {
-                match frame {
-                    Some(Ok(resp)) => {
-                        let is_done = matches!(
-                            resp,
-                            RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
-                        );
-                        let written = if stream_binary {
-                            match resp {
-                                RpcResponse::AttachStreamChunk { offset, data } => {
-                                    ipc::write_attach_output_frame(&mut writer, offset, &data).await
+                frame = stream_rx.recv() => {
+                    match frame {
+                        Some(Ok(resp)) => {
+                            let is_done = matches!(
+                                resp,
+                                RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
+                            );
+                            writing_frame = true;
+                            let written = if stream_binary {
+                                match resp {
+                                    RpcResponse::AttachStreamChunk { offset, data } => {
+                                        ipc::write_attach_output_frame(&mut writer, offset, &data).await
+                                    }
+                                    other => {
+                                        ipc::write_attach_control_frame(&mut writer, &other).await
+                                    }
                                 }
-                                other => {
-                                    ipc::write_attach_control_frame(&mut writer, &other).await
+                            } else {
+                                if matches!(resp, RpcResponse::AttachStreamInit { .. }) {
+                                    stream_binary = true;
                                 }
+                                ipc::write_response_to_writer(&mut writer, resp).await
+                            };
+                            writing_frame = false;
+                            if written.is_err() {
+                                break;
                             }
-                        } else {
-                            if matches!(resp, RpcResponse::AttachStreamInit { .. }) {
-                                stream_binary = true;
+                            if is_done {
+                                break;
                             }
-                            ipc::write_response_to_writer(&mut writer, resp).await
-                        };
-                        if written.is_err() {
+                        }
+                        Some(Err(e)) => {
+                            let resp = RpcResponse::Error {
+                                message: e.to_string(),
+                            };
+                            writing_frame = true;
+                            let _ = if stream_binary {
+                                ipc::write_attach_control_frame(&mut writer, &resp).await
+                            } else {
+                                ipc::write_response_to_writer(&mut writer, resp).await
+                            };
                             break;
                         }
-                        if is_done {
+                        None => {
+                            // The node stream channel was dropped without a
+                            // completion or error frame: the owning node
+                            // disconnected or its relay task ended abnormally.
+                            // Report the interruption instead of fabricating a
+                            // completion with `final_offset: 0`.
+                            let resp = node_stream_interrupted_response(&node);
+                            writing_frame = true;
+                            let _ = if stream_binary {
+                                ipc::write_attach_control_frame(&mut writer, &resp).await
+                            } else {
+                                ipc::write_response_to_writer(&mut writer, resp).await
+                            };
                             break;
                         }
-                    }
-                    Some(Err(e)) => {
-                        let resp = RpcResponse::Error {
-                            message: e.to_string(),
-                        };
-                        let _ = if stream_binary {
-                            ipc::write_attach_control_frame(&mut writer, &resp).await
-                        } else {
-                            ipc::write_response_to_writer(&mut writer, resp).await
-                        };
-                        break;
-                    }
-                    None => {
-                        // The node stream channel was dropped without a
-                        // completion or error frame: the owning node
-                        // disconnected or its relay task ended abnormally.
-                        // Report the interruption instead of fabricating a
-                        // completion with `final_offset: 0`.
-                        let resp = node_stream_interrupted_response(&node);
-                        let _ = if stream_binary {
-                            ipc::write_attach_control_frame(&mut writer, &resp).await
-                        } else {
-                            ipc::write_response_to_writer(&mut writer, resp).await
-                        };
-                        break;
                     }
                 }
-            }
 
-            client_msg = client_msg_rx.recv() => {
-                match client_msg {
-                    Some(Ok(req)) => {
-                        let is_detach = matches!(req, RpcRequest::AttachDetach { .. });
-                        let _ = node_registry
-                            .proxy_rpc_stream_message(&node, &stream_rpc_id, &req)
-                            .await;
-                        if is_detach {
-                            break;
+                client_msg = client_msg_rx.recv() => {
+                    match client_msg {
+                        Some(Ok(req)) => {
+                            let is_detach = matches!(req, RpcRequest::AttachDetach { .. });
+                            let _ = node_registry
+                                .proxy_rpc_stream_message(&node, &stream_rpc_id, &req)
+                                .await;
+                            if is_detach {
+                                break;
+                            }
                         }
+                        _ => break,
                     }
-                    _ => break,
                 }
             }
         }
+    };
+    if interrupt_on_revocation(&mut cancelled, relay).await && !writing_frame {
+        // Only send an interruption at a frame boundary. If cancellation
+        // interrupted a write, close rather than append to a partial frame.
+        // A stalled client gets at most one second to accept the final error.
+        let response = node_stream_interrupted_response(&node);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            if stream_binary {
+                ipc::write_attach_control_frame(&mut writer, &response).await
+            } else {
+                ipc::write_response_to_writer(&mut writer, response).await
+            }
+        })
+        .await;
     }
-
     client_reader_task.abort();
+    let _ = client_reader_task.await;
     // Clean up the pending entry so it doesn't linger if the secondary
     // hasn't sent a done frame yet, and ask the owning node to end the
     // stream (which detaches the remote attachment).
     node_registry.remove_pending(&node, &stream_rpc_id).await;
-    let _ = node_registry
-        .proxy_rpc_stream_message(
+    let _ = tokio::time::timeout(
+        NODE_SEND_TIMEOUT,
+        node_registry.proxy_rpc_stream_message(
             &node,
             &stream_rpc_id,
             &RpcRequest::AttachDetach { id: session_id },
-        )
-        .await;
+        ),
+    )
+    .await;
 
     Ok(())
+}
+
+/// The whole relay future is cancellable, including a blocked IPC write.
+async fn interrupt_on_revocation(
+    cancelled: &mut watch::Receiver<bool>,
+    relay: impl std::future::Future<Output = ()>,
+) -> bool {
+    if *cancelled.borrow() {
+        return true;
+    }
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => true,
+        _ = relay => false,
+    }
 }
 
 #[cfg(test)]
@@ -1000,6 +950,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn revocation_interrupts_a_proven_stalled_attach_output_write() {
+        use tokio::io::AsyncReadExt;
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = completed.clone();
+        let task = tokio::spawn(async move {
+            super::interrupt_on_revocation(&mut stop_rx, async {
+                crate::ipc::write_attach_output_frame(&mut writer, 0, &[b'x'; 4096])
+                    .await
+                    .unwrap();
+                task_completed.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .await
+        });
+        // Observe the actual output frame header, then stop consuming. An
+        // 8-byte buffer cannot accept the remaining 4096-byte body.
+        let mut header = [0; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_exact(&mut header),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(header[4], 1);
+        stop_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_to_end(&mut remaining),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            remaining.len() < 4096,
+            "revoked output writer retained its socket"
+        );
+    }
+
     #[test]
     fn retry_backoff_caps_and_resets_after_a_successful_join() {
         let mut backoff = super::RetryBackoff::default();
@@ -1011,30 +1010,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_abort_clears_live_state_even_during_stalled_io() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-        let connected = Arc::new(AtomicBool::new(false));
-        let task_state = Arc::clone(&connected);
+    async fn connector_stop_awaits_teardown_even_during_stalled_io() {
+        struct Teardown(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Teardown {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (ended_tx, mut ended_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
-            let _guard = super::ConnectedGuard::new(task_state);
-            let _ = ready_tx.send(());
-            std::future::pending::<()>().await;
+            let mut descendants = tokio::task::JoinSet::new();
+            descendants.spawn(async move {
+                let _teardown = Teardown(Some(ended_tx));
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            let _ = stop_rx.changed().await;
+            super::drain_relay_tasks(&mut descendants).await;
         });
-        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
-        let connector = super::JoinConnector {
-            abort: task.abort_handle(),
+        let connector = super::NodeConnector {
+            task,
             stop_tx,
-            connected: Arc::clone(&connected),
+            state: std::sync::Arc::new(std::sync::RwLock::new(super::ConnectorState::default())),
         };
         ready_rx.await.unwrap();
-        assert!(connector.is_connected());
-        drop(connector);
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!connected.load(Ordering::Acquire));
+        connector.stop().await;
+        ended_rx
+            .try_recv()
+            .expect("descendant relay resources released before stop returns");
     }
 
     #[tokio::test]
@@ -1214,51 +1219,5 @@ mod tests {
                 },
             }),
         }));
-    }
-
-    // ── AttemptReporter — first-attempt sync join feedback ─────────────────────
-    //
-    // The reporter is the channel `JoinStart` uses to tell the CLI whether
-    // the first handshake completed, failed, or is still in progress; the
-    // tests below pin its contract: `joined` consumes the inner sender
-    // exactly once, `fail` does the same, and an empty reporter stays
-    // silent (which is what lifecycle boot relies on when nobody is
-    // waiting on the IPC path).
-
-    #[test]
-    fn attempt_reporter_empty_silently_drops_reports() {
-        let mut reporter = super::AttemptReporter::empty();
-        // Both report methods must be safe no-ops without a sender.
-        reporter.joined();
-        reporter.fail("ignored");
-    }
-
-    #[test]
-    fn attempt_reporter_joined_delivers_connected_exactly_once() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut reporter = super::AttemptReporter::new(tx);
-        reporter.joined();
-        reporter.joined(); // second call must not panic (sender already taken).
-        let outcome = rx.blocking_recv().expect("oneshot deliver");
-        assert!(
-            matches!(outcome, super::JoinAttempt::Connected),
-            "expected Connected, got {outcome:?}"
-        );
-    }
-
-    #[test]
-    fn attempt_reporter_fail_delivers_failed_with_message() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut reporter = super::AttemptReporter::new(tx);
-        reporter.fail("join rejected: unauthorized");
-        // Subsequent joined() must be a no-op even after a failure report.
-        reporter.joined();
-        let outcome = rx.blocking_recv().expect("oneshot deliver");
-        match outcome {
-            super::JoinAttempt::Failed(msg) => {
-                assert_eq!(msg, "join rejected: unauthorized");
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
     }
 }

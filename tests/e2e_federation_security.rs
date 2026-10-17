@@ -25,14 +25,16 @@ fn id_pub_key(tmp: &Path) -> String {
         .trim()
         .into()
 }
+
 fn register(tmp: &Path, name: &str, key: &ed25519_dalek::SigningKey) {
     let output = oly_cmd(tmp)
         .args([
             "node",
-            "accept",
-            "--name",
+            "add",
             name,
-            "-k",
+            "--role",
+            "secondary",
+            "--key",
             &crypto::public_key_line(key),
         ])
         .output()
@@ -43,6 +45,52 @@ fn register(tmp: &Path, name: &str, key: &ed25519_dalek::SigningKey) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn node_info(tmp: &Path, name: &str) -> Value {
+    let output = oly_cmd(tmp)
+        .args(["node", "info", name, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn wait_for_connector_error(tmp: &Path, expected: Option<&str>) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let node = node_info(tmp, "primary");
+        assert_ne!(
+            node["status"], "connected",
+            "failed handshake reported connected"
+        );
+        if let Some(error) = node["last_error"].as_str()
+            && !error.is_empty()
+            && expected.is_none_or(|expected| error.contains(expected))
+            && matches!(node["status"].as_str(), Some("retrying" | "waiting"))
+        {
+            return node;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connector failure did not surface in node info: {node}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// Runtime status/retry diagnostics are deliberately not persisted.
+fn node_config(tmp: &Path, name: &str) -> Value {
+    let mut node = node_info(tmp, name);
+    for field in ["status", "last_error", "next_retry_at"] {
+        node.as_object_mut().unwrap().remove(field);
+    }
+    node
+}
+
 async fn receive(socket: &mut Socket) -> Vec<u8> {
     loop {
         match timeout(Duration::from_secs(7), socket.next())
@@ -595,7 +643,92 @@ fn primary_rejects_invalid_proof_weak_identity_and_oversized_handshake() {
 }
 
 #[test]
-fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
+fn configuration_mutations_fence_handshakes_from_challenge_and_readiness() {
+    for (operation, proof_sent) in ["disable", "update", "rm"]
+        .into_iter()
+        .flat_map(|op| [(op, false), (op, true)])
+    {
+        let tmp = make_tmp_dir(&format!("security_config_fence_{operation}_{proof_sent}"));
+        let port = pick_free_port();
+        let _daemon = start_daemon_http(&tmp, port);
+        let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
+        register(&tmp, "worker", &key);
+        let primary = id_pub_key(&tmp);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut stale, mut channel, signature) =
+                introduced(port, &key, "worker", &primary).await;
+            if proof_sent {
+                prove(&mut stale, &mut channel, &signature).await;
+            }
+            assert_empty(port).await;
+            let mutate = |args: &[&str]| {
+                let output = oly_cmd(&tmp).args(args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            match operation {
+                "disable" => {
+                    mutate(&["node", "disable", "worker"]);
+                    mutate(&["node", "enable", "worker"]);
+                }
+                "update" => {
+                    let replacement = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
+                    mutate(&[
+                        "node",
+                        "update",
+                        "worker",
+                        "--key",
+                        &crypto::public_key_line(&replacement),
+                    ]);
+                    mutate(&[
+                        "node",
+                        "update",
+                        "worker",
+                        "--key",
+                        &crypto::public_key_line(&key),
+                    ]);
+                }
+                "rm" => {
+                    mutate(&["node", "rm", "worker"]);
+                    register(&tmp, "worker", &key);
+                }
+                _ => unreachable!(),
+            }
+            // Even restoration of the same name/key cannot revive an old
+            // transcript, whether it paused before Join or encrypted Ready.
+            if !proof_sent {
+                prove(&mut stale, &mut channel, &signature).await;
+            }
+            ready(&mut stale, &mut channel).await;
+            let error = channel
+                .decode(
+                    &receive(&mut stale).await,
+                    crypto::decode_handshake::<Value>,
+                )
+                .unwrap();
+            assert_eq!(error["type"], "error");
+            assert_empty(port).await;
+            let (mut fresh, mut fresh_channel, signature) =
+                introduced(port, &key, "worker", &primary).await;
+            prove(&mut fresh, &mut fresh_channel, &signature).await;
+            ready(&mut fresh, &mut fresh_channel).await;
+            let joined = fresh_channel
+                .decode(
+                    &receive(&mut fresh).await,
+                    crypto::decode_handshake::<Value>,
+                )
+                .unwrap();
+            assert_eq!(joined["type"], "joined");
+            assert!(wait_for_node_connected(port, "worker", 2).await);
+        });
+    }
+}
+
+#[test]
+fn real_connector_timeout_and_disable_interrupt_stalled_handshake() {
     for cancel in [false, true] {
         let tmp = make_tmp_dir(if cancel {
             "security_cancel"
@@ -615,9 +748,10 @@ fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
             assert!(matches!(socket.next().await, Some(Ok(Message::Binary(_)))));
             hello_tx.send(()).unwrap();
             // Never send Challenge; the real connector must stop waiting.
-            let closed = timeout(Duration::from_secs(7), socket.next())
+            let close_deadline = if cancel { 3 } else { 7 };
+            let closed = timeout(Duration::from_secs(close_deadline), socket.next())
                 .await
-                .unwrap();
+                .expect("stalled handshake socket was not closed within its deadline");
             assert!(
                 !matches!(closed, Some(Ok(Message::Binary(_)))),
                 "connector sent an application frame before Challenge"
@@ -627,37 +761,44 @@ fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
                     timeout(Duration::from_millis(1300), listener.accept())
                         .await
                         .is_err(),
-                    "stopped connector retried"
+                    "disabled connector retried"
                 );
             }
         });
         let pin = crypto::public_key_line(&ed25519_dalek::SigningKey::from_bytes(
             &crypto::fresh_nonce(),
         ));
-        let started = std::time::Instant::now();
-        let child = oly_cmd(&tmp)
+        let output = oly_cmd(&tmp)
             .args([
-                "join",
-                "start",
-                "--name",
+                "node",
+                "add",
+                "primary",
+                "--role",
+                "primary",
+                "--as",
                 "worker",
-                "--id-pub-key",
+                "--key",
                 &pin,
+                "--url",
                 &format!("http://127.0.0.1:{port}"),
             ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         rt.block_on(async {
             timeout(Duration::from_secs(3), hello_rx)
                 .await
                 .unwrap()
                 .unwrap();
         });
+        let started = std::time::Instant::now();
         if cancel {
             let stop = oly_cmd(&tmp)
-                .args(["join", "stop", "--name", "worker"])
+                .args(["node", "disable", "primary"])
                 .output()
                 .unwrap();
             assert!(
@@ -666,15 +807,17 @@ fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
                 String::from_utf8_lossy(&stop.stderr)
             );
         }
-        let output = child.wait_with_output().unwrap();
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("Joined primary"));
         if cancel {
             assert!(
                 started.elapsed() < Duration::from_secs(3),
-                "stop did not interrupt handshake"
+                "disable did not interrupt handshake"
             );
+            let node = node_info(&tmp, "primary");
+            assert_eq!(node["enabled"], false);
+            assert_eq!(node["status"], "disabled");
+            assert_eq!(node["key"], pin, "disable deleted the primary pin");
         } else {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
+            wait_for_connector_error(&tmp, Some("timed out"));
         }
         rt.block_on(async {
             timeout(Duration::from_secs(8), peer)
@@ -686,7 +829,7 @@ fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
 }
 
 #[test]
-fn real_connector_wrong_pin_fails_before_success_and_can_rejoin() {
+fn real_connector_wrong_pin_fails_before_success_and_can_update_pin() {
     let primary_tmp = make_tmp_dir("security_pin_primary");
     let secondary_tmp = make_tmp_dir("security_pin_secondary");
     let port = pick_free_port();
@@ -704,60 +847,53 @@ fn real_connector_wrong_pin_fails_before_success_and_can_rejoin() {
     ));
     let output = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker",
-            "--id-pub-key",
+            "--key",
             &wrong,
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stdout.contains("Joined primary"),
-        "false success: {stdout}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        stderr.contains("failed"),
-        "missing bounded failure: {stderr}"
-    );
+    let failed = wait_for_connector_error(&secondary_tmp, None);
+    assert_eq!(failed["key"], wrong);
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(assert_empty(port));
-    assert!(
-        oly_cmd(&secondary_tmp)
-            .args(["join", "stop", "--name", "worker"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    // Correct the pin in place, preserving the resource and advertised name.
     let output = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
-            "worker",
-            "--id-pub-key",
+            "node",
+            "update",
+            "primary",
+            "--key",
             &id_pub_key(&primary_tmp),
-            &format!("http://127.0.0.1:{port}"),
         ])
         .output()
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Joined primary"),
+        output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        assert!(wait_for_node_connected(port, "worker", 2).await);
+        assert!(wait_for_node_connected(port, "worker", 10).await);
     });
 }
 
 #[test]
-fn identities_accept_table_and_saved_join_survive_daemon_restart() {
+fn identities_and_node_configuration_survive_daemon_restart() {
     let primary_tmp = make_tmp_dir("security_restart_primary");
     let secondary_tmp = make_tmp_dir("security_restart_secondary");
     let port = pick_free_port();
@@ -769,18 +905,30 @@ fn identities_accept_table_and_saved_join_survive_daemon_restart() {
     register(&primary_tmp, "worker", &key);
     let output = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker",
-            "--id-pub-key",
+            "--key",
             &id_pub_key(&primary_tmp),
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Joined primary"));
-    let saved = fs::read(secondary_tmp.join("oly/joins.json")).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        assert!(wait_for_node_connected(port, "worker", 10).await);
+    });
+    let saved_primary = node_config(&secondary_tmp, "primary");
+    let saved_secondary = node_config(&primary_tmp, "worker");
     drop(secondary);
     drop(primary);
     let _primary = start_daemon_http(&primary_tmp, port);
@@ -793,15 +941,19 @@ fn identities_accept_table_and_saved_join_survive_daemon_restart() {
         fs::read(secondary_tmp.join("oly/identity_key")).unwrap(),
         secondary_seed
     );
-    assert_eq!(
-        fs::read(secondary_tmp.join("oly/joins.json")).unwrap(),
-        saved
-    );
+    assert_eq!(node_config(&secondary_tmp, "primary"), saved_primary);
+    assert_eq!(node_config(&primary_tmp, "worker"), saved_secondary);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         assert!(wait_for_node_connected(port, "worker", 5).await);
     });
-    let log = fs::read_to_string(secondary_tmp.join("daemon-stderr.log")).unwrap();
-    assert!(log.contains("joined primary after encrypted confirmation"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while node_info(&secondary_tmp, "primary")["status"] != "connected" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted connector never confirmed the primary"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -845,18 +997,26 @@ fn real_connector_rejects_plaintext_joined_at_each_confirmation_boundary() {
         });
         let output = oly_cmd(&secondary_tmp)
             .args([
-                "join",
-                "start",
-                "--name",
+                "node",
+                "add",
+                "primary",
+                "--role",
+                "primary",
+                "--as",
                 "worker",
-                "--id-pub-key",
+                "--key",
                 &pin,
+                "--url",
                 &format!("http://127.0.0.1:{port}"),
             ])
             .output()
             .unwrap();
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("Joined primary"));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("failed"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        wait_for_connector_error(&secondary_tmp, None);
         rt.block_on(async {
             timeout(Duration::from_secs(3), peer)
                 .await

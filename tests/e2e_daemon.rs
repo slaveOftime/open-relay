@@ -1,6 +1,5 @@
 mod e2e;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use e2e::*;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -32,7 +31,7 @@ fn e2e_windows_ipc_survives_clients_disconnecting_during_writes() {
     rt.block_on(async {
         let name_string = socket_name_for_tmp(&tmp);
         let name = name_string.to_ns_name::<GenericNamespaced>().unwrap();
-        let health_frame = b"{\"version\":14,\"payload\":{\"type\":\"health\"}}\n";
+        let health_frame = b"{\"version\":15,\"payload\":{\"type\":\"health\"}}\n";
         let mut initial = Stream::connect(name.clone()).await.unwrap();
         initial.write_all(health_frame).await.unwrap();
         let mut initial_reader = BufReader::new(initial);
@@ -50,7 +49,7 @@ fn e2e_windows_ipc_survives_clients_disconnecting_during_writes() {
         // than the pipe buffers, so a disconnect can interrupt queued writes.
         let missing_id = "missing".repeat(32 * 1024);
         let mut frame = serde_json::to_vec(&json!({
-            "version": 14,
+            "version": 15,
             "payload": {"type": "stop", "id": missing_id, "grace_seconds": 0}
         }))
         .unwrap();
@@ -330,26 +329,34 @@ fn e2e_federation_identity_key_registrations_and_duplicate_name() {
     // Register both identities under distinct node names.
     for (name, pub_line) in [("worker-a", &first_pub), ("worker-b", &second_pub)] {
         let out = oly_cmd(&tmp)
-            .args(["node", "accept", "-n", name, "-k", pub_line])
+            .args([
+                "node",
+                "add",
+                name,
+                "--role",
+                "secondary",
+                "--key",
+                pub_line,
+            ])
             .output()
-            .expect("`oly node accept` should run");
+            .expect("`oly node add` should run");
         assert!(
             out.status.success(),
-            "`oly node accept {name}` exited non-zero.\nstderr: {}",
+            "`oly node add {name}` exited non-zero.\nstderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    // A key owned by worker-a cannot be stolen by worker-b's upsert.
+    // Updating worker-b cannot steal the identity owned by worker-a.
     let conflict = oly_cmd(&tmp)
-        .args(["node", "accept", "-n", "worker-b", "-k", &first_pub])
+        .args(["node", "update", "worker-b", "--key", &first_pub])
         .output()
         .unwrap();
     assert!(
         !conflict.status.success(),
-        "accept upsert stole another name's key"
+        "node update stole another name's key"
     );
-    // Re-registering the same name with a new, unowned identity is allowed.
+    // Existing names require update; adding the same name must not replace its key.
     let mut replacement_seed = [0u8; 32];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut replacement_seed);
     let replacement_key = ed25519_dalek::SigningKey::from_bytes(&replacement_seed);
@@ -357,14 +364,43 @@ fn e2e_federation_identity_key_registrations_and_duplicate_name() {
         "ed25519 {}",
         B64.encode(replacement_key.verifying_key().as_bytes())
     );
-    let out = oly_cmd(&tmp)
-        .args(["node", "accept", "-n", "worker-a", "-k", &replacement_pub])
+    let duplicate = oly_cmd(&tmp)
+        .args([
+            "node",
+            "add",
+            "worker-a",
+            "--role",
+            "secondary",
+            "--key",
+            &replacement_pub,
+        ])
         .output()
-        .expect("`oly node accept worker-a` re-registration should run");
+        .unwrap();
+    assert!(!duplicate.status.success(), "duplicate add replaced a node");
+    let unchanged = oly_cmd(&tmp)
+        .args(["node", "info", "worker-a", "--json"])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success());
+    let unchanged: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert_eq!(unchanged["key"], first_pub);
+
+    let out = oly_cmd(&tmp)
+        .args(["node", "update", "worker-a", "--key", &replacement_pub])
+        .output()
+        .expect("`oly node update worker-a` key replacement should run");
     assert!(
         out.status.success(),
-        "`oly node accept worker-a` re-registration must exit 0"
+        "`oly node update worker-a` key replacement must exit 0"
     );
+    let updated = oly_cmd(&tmp)
+        .args(["node", "info", "worker-a", "--json"])
+        .output()
+        .unwrap();
+    assert!(updated.status.success());
+    let updated: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated["key"], replacement_pub);
+    assert_eq!(updated["role"], "secondary");
 
     // Reject malformed lines: tag mismatch, wrong length, stray tokens.
     let bad = vec![
@@ -376,9 +412,17 @@ fn e2e_federation_identity_key_registrations_and_duplicate_name() {
     ];
     for bad_line in bad {
         let out = oly_cmd(&tmp)
-            .args(["node", "accept", "-n", "broken", "-k", bad_line])
+            .args([
+                "node",
+                "add",
+                "broken",
+                "--role",
+                "secondary",
+                "--key",
+                bad_line,
+            ])
             .output()
-            .expect("`oly node accept` parse-failure should still exit");
+            .expect("`oly node add` parse-failure should still exit");
         assert!(
             !out.status.success(),
             "malformed identity {bad_line:?} must not be accepted"
@@ -414,7 +458,7 @@ fn e2e_daemon_supports_bind_override() {
 }
 
 #[test]
-fn e2e_federation_identity_join_lifecycle() {
+fn e2e_federation_identity_disable_enable() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let primary_tmp = make_tmp_dir("e2e_fed_ssh_lifecycle_primary");
@@ -439,16 +483,24 @@ fn e2e_federation_identity_join_lifecycle() {
 
     // Register the secondary's id pub key on the primary.
     let accept = oly_cmd(&primary_tmp)
-        .args(["node", "accept", "-n", "worker1", "-k", &secondary_pub])
+        .args([
+            "node",
+            "add",
+            "worker1",
+            "--role",
+            "secondary",
+            "--key",
+            &secondary_pub,
+        ])
         .output()
-        .expect("`oly node accept` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(
         accept.status.success(),
-        "`oly node accept` exited non-zero.\nstderr: {}",
+        "`oly node add` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&accept.stderr)
     );
     // Fetch the primary's id pub key and pin it explicitly on the
-    // secondary via `--id-pub-key`.
+    // secondary via `--key`.
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
         .expect("read primary id pub key")
@@ -456,19 +508,23 @@ fn e2e_federation_identity_join_lifecycle() {
         .to_string();
     let join = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker1",
-            "--id-pub-key",
+            "--key",
             &primary_pub,
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
-        .expect("`oly join start` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(
         join.status.success(),
-        "`oly join start` exited non-zero.\nstdout: {}\nstderr: {}",
+        "`oly node add` exited non-zero.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&join.stdout),
         String::from_utf8_lossy(&join.stderr)
     );
@@ -477,39 +533,42 @@ fn e2e_federation_identity_join_lifecycle() {
     let connected = rt.block_on(wait_for_node_connected(port, "worker1", 10));
     assert!(
         connected,
-        "worker1 did not appear in /api/nodes after identity join start"
+        "worker1 did not appear in /api/nodes after primary node add"
     );
 
-    // Stop the join cleanly and confirm the secondary disappears from
+    // Disable the peer without deleting its identity pin; confirm it disappears from
     // /api/nodes; this verifies basic transport liveness on the
     // identity path (channel encryption + relay + disconnect).
     let stop = oly_cmd(&secondary_tmp)
-        .args(["join", "stop", "--name", "worker1"])
+        .args(["node", "disable", "primary"])
         .output()
-        .expect("`oly join stop` failed to execute");
-    assert!(stop.status.success(), "`oly join stop` failed");
+        .expect("`oly node disable` failed to execute");
+    assert!(stop.status.success(), "`oly node disable` failed");
     let disconnected = rt.block_on(wait_for_no_nodes(port, 10));
-    assert!(disconnected, "worker1 did not disconnect after join stop");
-
-    // Re-join with the correct primary identity. Encrypted confirmation
-    // proves the primary owns this independently exchanged pin before success.
-    let rejoin = oly_cmd(&secondary_tmp)
-        .args([
-            "join",
-            "start",
-            "--name",
-            "worker1",
-            "--id-pub-key",
-            &primary_pub,
-            &format!("http://127.0.0.1:{port}"),
-        ])
+    assert!(
+        disconnected,
+        "worker1 did not disconnect after node disable"
+    );
+    let disabled = oly_cmd(&secondary_tmp)
+        .args(["node", "info", "primary", "--json"])
         .output()
-        .expect("`oly join start` (rejoin) failed to execute");
+        .unwrap();
+    assert!(disabled.status.success());
+    let disabled: serde_json::Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(disabled["status"], "disabled");
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["key"], primary_pub);
+    assert_eq!(disabled["as"], "worker1");
+
+    // Enabling the same resource reconnects using its retained identity pin.
+    let rejoin = oly_cmd(&secondary_tmp)
+        .args(["node", "enable", "primary"])
+        .output()
+        .expect("`oly node enable` failed to execute");
     assert!(
         rejoin.status.success(),
-        "`oly join start` (rejoin) exited non-zero.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&rejoin.stdout),
-        String::from_utf8_lossy(&rejoin.stderr),
+        "`oly node enable` failed: {}",
+        String::from_utf8_lossy(&rejoin.stderr)
     );
     let rejoined = rt.block_on(wait_for_node_connected(port, "worker1", 10));
     assert!(
@@ -532,7 +591,7 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     let secondary = start_daemon(&secondary_tmp);
 
     // Federation v2: register the secondary identity with the primary,
-    // pin the primary's identity on the secondary via `--id-pub-key`,
+    // pin the primary's identity on the secondary via `--key`,
     // then join.
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
@@ -545,30 +604,42 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         .trim()
         .to_string();
     let accept = oly_cmd(&primary_tmp)
-        .args(["node", "accept", "-n", "worker1", "-k", &secondary_pub])
+        .args([
+            "node",
+            "add",
+            "worker1",
+            "--role",
+            "secondary",
+            "--key",
+            &secondary_pub,
+        ])
         .output()
-        .expect("`oly node accept` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(
         accept.status.success(),
-        "`oly node accept` exited non-zero.\nstderr: {}",
+        "`oly node add` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&accept.stderr)
     );
 
     let join = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker1",
-            "--id-pub-key",
+            "--key",
             &primary_pub,
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
-        .expect("`oly join start` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(
         join.status.success(),
-        "`oly join start` exited non-zero.\nstdout: {}\nstderr: {}",
+        "`oly node add` exited non-zero.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&join.stdout),
         String::from_utf8_lossy(&join.stderr)
     );
@@ -577,7 +648,7 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     let connected = rt.block_on(wait_for_node_connected(port, "worker1", 10));
     assert!(
         connected,
-        "worker1 did not appear in /api/nodes after join start"
+        "worker1 did not appear in /api/nodes after primary node add"
     );
 
     #[cfg(target_os = "windows")]
@@ -971,35 +1042,33 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     );
 
     let join_stop = oly_cmd(&secondary_tmp)
-        .args(["join", "stop", "--name", "worker1"])
+        .args(["node", "rm", "primary"])
         .output()
-        .expect("`oly join stop` failed to execute");
+        .expect("`oly node rm` failed to execute");
     assert!(
         join_stop.status.success(),
-        "`oly join stop` exited non-zero.\nstderr: {}",
+        "`oly node rm` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&join_stop.stderr)
     );
 
     let no_nodes_after_join_stop = rt.block_on(wait_for_no_nodes(port, 10));
     assert!(
         no_nodes_after_join_stop,
-        "node list did not become empty after join stop"
+        "node list did not become empty after primary node rm"
     );
 
     let join_ls = oly_cmd(&secondary_tmp)
-        .args(["join", "ls"])
+        .args(["node", "ls", "--json"])
         .output()
-        .expect("`oly join ls` failed to execute");
+        .expect("`oly node ls` failed to execute");
     assert!(
         join_ls.status.success(),
-        "`oly join ls` exited non-zero.\nstderr: {}",
+        "`oly node ls` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&join_ls.stderr)
     );
-    let join_ls_out = String::from_utf8_lossy(&join_ls.stdout);
-    assert!(
-        join_ls_out.contains("No active joins."),
-        "expected join config removal after join stop.\nOutput:\n{join_ls_out}"
-    );
+    let nodes: serde_json::Value = serde_json::from_slice(&join_ls.stdout).unwrap();
+    assert_eq!(nodes["items"], json!([]));
+    assert_eq!(nodes["total"], 0, "node rm retained the primary config");
 
     drop(secondary_restart);
 }
@@ -1028,23 +1097,35 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         .trim()
         .to_string();
     let accept = oly_cmd(&primary_tmp)
-        .args(["node", "accept", "-n", "worker1", "-k", &secondary_pub])
+        .args([
+            "node",
+            "add",
+            "worker1",
+            "--role",
+            "secondary",
+            "--key",
+            &secondary_pub,
+        ])
         .output()
-        .expect("`oly node accept` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(accept.status.success());
 
     let join = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "worker1",
-            "--id-pub-key",
+            "--key",
             &primary_pub,
+            "--url",
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
-        .expect("`oly join start` failed to execute");
+        .expect("`oly node add` failed to execute");
     assert!(join.status.success());
 
     let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
@@ -1095,9 +1176,9 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         let mut reader = BufReader::new(read_half);
 
         // IPC control messages are versioned envelopes:
-        // {"version":14,"payload":{...}}; attach output remains binary
+        // {"version":15,"payload":{...}}; attach output remains binary
         // after the JSON init line.
-        let envelope = |payload: serde_json::Value| json!({"version": 14, "payload": payload});
+        let envelope = |payload: serde_json::Value| json!({"version": 15, "payload": payload});
         let subscribe = envelope(json!({
             "type": "node_proxy",
             "node": "worker1",
@@ -2733,18 +2814,10 @@ fn e2e_logs_tail_frames_replays_the_screens_a_tui_painted() {
     assert!(output.status.success());
 }
 
-// Regression guard: a single secondary daemon registering *two* persisted
-// joins against the same primary, using the *same* API key but different
-// name, must surface both nodes on the primary. In 0.3.x this worked; if
-// it ever regresses again we want a CI failure that names the symptom.
+// Sibling secondaries have distinct authorized names and Ed25519 identities.
+// Each must appear independently in the primary's live route inventory.
 #[test]
-#[allow(non_snake_case)]
-fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
-    // Federation v2: each secondary has its own Ed25519 identity. Two
-    // sibling secondaries under one primary, each naming themselves
-    // uniquely and using a distinct identity key, must both surface on
-    // `/api/nodes`. Replaces a pre-removal API-key test that asserted
-    // the same observable behavior through a now-deleted feature.
+fn e2e_federation_cli_two_secondaries_distinct_identities() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let primary_tmp = make_tmp_dir("e2e_fed_two_joins_primary");
@@ -2771,30 +2844,42 @@ fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
 
         // Register the secondary identity on the primary under its name.
         let accept = oly_cmd(&primary_tmp)
-            .args(["node", "accept", "-n", name, "-k", &secondary_pub])
+            .args([
+                "node",
+                "add",
+                name,
+                "--role",
+                "secondary",
+                "--key",
+                &secondary_pub,
+            ])
             .output()
-            .expect("`oly node accept` failed to execute");
+            .expect("`oly node add` failed to execute");
         assert!(
             accept.status.success(),
-            "accept for {name} failed: {}",
+            "secondary add for {name} failed: {}",
             String::from_utf8_lossy(&accept.stderr)
         );
 
         let join = oly_cmd(&secondary_tmp)
             .args([
-                "join",
-                "start",
-                "--name",
+                "node",
+                "add",
+                "primary",
+                "--role",
+                "primary",
+                "--as",
                 name,
-                "--id-pub-key",
+                "--key",
                 &primary_pub,
+                "--url",
                 &primary_url,
             ])
             .output()
-            .expect("`oly join start` failed to execute");
+            .expect("`oly node add` failed to execute");
         assert!(
             join.status.success(),
-            "`oly join start -n {name}` failed: {}",
+            "`oly node add primary --as {name}` failed: {}",
             String::from_utf8_lossy(&join.stderr)
         );
 
@@ -2834,70 +2919,73 @@ fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
     drop(secondary_handles);
 }
 
-// Regression guard: `oly join start` against a primary that doesn't have
-// the supplied API key must surface the rejection on stderr synchronously
-// rather than printing "Joined" and silently failing. Before the
-// AttemptReporter wiring, the CLI printed success immediately and the only
-// signal of failure was the silence in `oly join ls`.
+// Adding a node persists immediately; failed asynchronous authentication must
+// become observable through node info, without publishing a live secondary.
 #[test]
-fn e2e_federation_join_start_reports_rejection_on_stderr() {
-    // Federation v2: when the secondary compiles a join payload that the
-    // primary does not recognise (wrong name/key pair, wrong primary pin),
-    // the rejection must surface on stderr synchronously. The command
-    // itself still exits 0 because the CLI hands work to a background
-    // connector that keeps retrying; what matters is that the operator
-    // sees the failure predicate {@code oly join ls} would otherwise have
-    // to deduce from absence.
+fn e2e_federation_node_info_reports_authentication_rejection() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
     let primary_tmp = make_tmp_dir("e2e_fed_join_reject_primary");
     let secondary_tmp = make_tmp_dir("e2e_fed_join_reject_secondary");
     let port = pick_free_port();
     let _primary = start_daemon_http(&primary_tmp, port);
-    let secondary = start_daemon(&secondary_tmp);
-
-    let secondary_state_dir = secondary_tmp.join("oly");
-    let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-        .expect("read secondary id pub key")
+    let _secondary = start_daemon(&secondary_tmp);
+    let primary_pub = fs::read_to_string(primary_tmp.join("oly/identity_key.pub"))
+        .unwrap()
         .trim()
         .to_string();
 
-    // Pin an identity the primary does not own. Unregistered identity and
-    // wrong-pin failures both must surface without reporting success.
-    let mut wrong_seed = [0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut wrong_seed);
-    let wrong_key = ed25519_dalek::SigningKey::from_bytes(&wrong_seed);
-    let wrong_primary = B64.encode(wrong_key.verifying_key().as_bytes());
-    let wrong_primary_line = format!("ed25519 {wrong_primary}");
-
-    let url = format!("http://127.0.0.1:{port}");
+    // The primary pin is correct, but ghostworker has no secondary authorization.
     let out = oly_cmd(&secondary_tmp)
         .args([
-            "join",
-            "start",
-            "--name",
+            "node",
+            "add",
+            "primary",
+            "--role",
+            "primary",
+            "--as",
             "ghostworker",
-            "--id-pub-key",
-            &wrong_primary_line,
-            &url,
+            "--key",
+            &primary_pub,
+            "--url",
+            &format!("http://127.0.0.1:{port}"),
         ])
         .output()
-        .expect("`oly join start` failed to execute");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
+        .expect("`oly node add` failed to execute");
     assert!(
         out.status.success(),
-        "`oly join start` should still succeed even when the first attempt fails;\nstderr: {stderr}"
+        "add should persist before authentication: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        stderr.contains("failed"),
-        "expected explicit failed attempt: {stderr}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("Joined primary"),
-        "failed attempt reported success"
-    );
-    let _ = (secondary, secondary_pub, &out.stdout);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = oly_cmd(&secondary_tmp)
+            .args(["node", "info", "primary", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            info.status.success(),
+            "{}",
+            String::from_utf8_lossy(&info.stderr)
+        );
+        let node: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+        assert_ne!(node["status"], "connected", "unauthorized peer connected");
+        if node["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+            && matches!(node["status"].as_str(), Some("retrying" | "waiting"))
+        {
+            assert_eq!(node["enabled"], true);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "authentication error never surfaced: {node}"
+        );
+        sleep(Duration::from_millis(100));
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    assert!(rt.block_on(wait_for_no_nodes(port, 2)));
 }
 
 // An injected HTTP bind failure must surface as a named, reason-carrying
