@@ -97,6 +97,9 @@ crc32fast = "1.5"
 # Test-only differential oracle (M6-1): engine conformance and renderer
 # tests validate against vt100; it is never compiled into the binary.
 vt100 = "0.16.2"
+# Paused-clock tests for supervised daemon components (bounded restart
+# backoff) without real sleep time. Test builds only.
+tokio = { version = "1.53", features = ["test-util"] }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 # PTY harness for driving `oly attach` itself in e2e tests (the main
@@ -106,6 +109,9 @@ portable-pty = "0.9"
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = { version = "0.1.52" }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+# Free-space probe (`statvfs`) for the state volume. Windows uses the
+# already-present `windows-sys` `Win32_Storage_FileSystem` bindings.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Transitive through Tokio: 1.2.4 fixes named-pipe use-after-free when an

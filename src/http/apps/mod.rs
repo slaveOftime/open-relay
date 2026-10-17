@@ -352,6 +352,11 @@ mod tests {
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
                 journal_retention_days: 0,
+                disk_guard_enabled: false,
+                disk_min_free_bytes: crate::config::DEFAULT_DISK_MIN_FREE_BYTES,
+                disk_warn_free_bytes: crate::config::DEFAULT_DISK_WARN_FREE_BYTES,
+                disk_sample_interval_seconds: 30,
+                disk_sample_max_age_seconds: 120,
             },
             web_push: crate::config::WebPushConfig {
                 subject: None,

@@ -118,7 +118,19 @@ pub enum DaemonCommand {
     /// Gracefully shut down the running daemon.
     Stop(DaemonStopArgs),
     /// Status of the running daemon.
-    Status,
+    Status(DaemonStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonStatusArgs {
+    /// Report a secondary node's daemon status through the federation
+    /// relay instead of the local daemon's.
+    #[arg(long, value_name = "NAME")]
+    pub node: Option<String>,
+    /// Print the read-only diagnostic summary as JSON (no terminal
+    /// content, input, environment, identity seeds, or credentials).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

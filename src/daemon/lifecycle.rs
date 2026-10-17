@@ -15,7 +15,7 @@ use crate::{
     ipc,
     node::NodeRegistry,
     notification::event::NotificationEvent,
-    protocol::{RpcRequest, RpcResponse},
+    protocol::{DaemonStatusReport, RpcRequest, RpcResponse},
     session::SessionStore,
     storage,
     utils::format_http_url,
@@ -24,9 +24,31 @@ use crate::{
 use super::{
     JoinHandles, NotifierHandle, SessionStoreHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
+    components::{ComponentRegistry, spawn_supervised},
     crash,
+    health::DaemonHealth,
     rpc::handle_client,
 };
+
+/// Every supervised daemon-lifetime component: (name, ready-critical?).
+/// Ready-critical components gate `/api/ready`, the `DaemonStatus` RPC, and
+/// the diagnostic readiness report. Detached startup still waits for IPC
+/// liveness, so a degraded daemon remains inspectable. Registered before any spawn so
+/// readiness is never trivially true while a component is still starting.
+const SUPERVISED_COMPONENTS: &[(&str, bool)] = &[
+    // HTTP is registered here even under `--no-http`, where it is marked
+    // disabled instead of spawned (disabled satisfies readiness).
+    ("http", true),
+    ("sse_encoder", true),
+    ("activity_sampler", true),
+    ("notification_monitor", true),
+    ("disk_sampler", true),
+    // Convenience loops: supervised and visible in diagnostics, but a dead
+    // config reloader or retention sweeper does not make the daemon
+    // unready (running sessions still work; the failure is not silent).
+    ("config_reloader", false),
+    ("journal_retention", false),
+];
 
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(120);
 const LOCK_STARTUP_GRACE: Duration = Duration::from_secs(3);
@@ -223,10 +245,64 @@ pub async fn start(
     run_foreground(config, auth_hash, no_http).await
 }
 
-pub async fn status(config: AppConfig) -> Result<()> {
+pub async fn status(config: AppConfig, node: Option<String>, json: bool) -> Result<()> {
     if !daemon_is_healthy(&config).await {
-        eprintln!("Daemon is not running.");
+        if let Some(node) = &node {
+            return Err(AppError::DaemonUnavailable(format!(
+                "local relay is unavailable; cannot determine status of node '{node}'"
+            )));
+        }
+        if json {
+            // Machine-readable "not running" so scripts do not have to parse
+            // prose; still exit 0 like the human path (a stopped daemon is
+            // not a command failure).
+            println!("{}", serde_json::json!({ "alive": false }));
+        } else {
+            eprintln!("Daemon is not running.");
+        }
         return Ok(());
+    }
+
+    // Remote node: the local daemon relays the read-only status request.
+    // Nothing is presented as "the local daemon" — every field in the report
+    // describes the node's own daemon and its own machine paths.
+    let request = match &node {
+        Some(name) => RpcRequest::NodeProxy {
+            node: name.clone(),
+            inner: Box::new(RpcRequest::DaemonStatus),
+        },
+        None => RpcRequest::DaemonStatus,
+    };
+
+    if json {
+        let report = match ipc::send_request_checked(&config, request).await? {
+            RpcResponse::DaemonStatus { status } => status,
+            other => {
+                return Err(AppError::Protocol(format!(
+                    "unexpected response for daemon status: {other:?}"
+                )));
+            }
+        };
+        let rendered = serde_json::to_string_pretty(&report)
+            .map_err(|err| AppError::Protocol(format!("failed to encode daemon status: {err}")))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    if let Some(node) = &node {
+        println!("Daemon status for node: {}", node);
+        return match ipc::send_request_checked(&config, request).await? {
+            RpcResponse::DaemonStatus { status } => {
+                if let Some(started_at) = &status.started_at {
+                    println!("Started at:   {}", format_status_timestamp(started_at));
+                }
+                print_daemon_status_report(&status);
+                Ok(())
+            }
+            other => Err(AppError::Protocol(format!(
+                "unexpected response for daemon status of node {node}: {other:?}"
+            ))),
+        };
     }
 
     println!("Daemon is running...");
@@ -243,7 +319,133 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     let effective = effective_status_config(&config, info.as_ref());
     print_detached_start_summary(&effective, no_http, no_auth);
+
+    // Read-only diagnostic summary: readiness, component states, disk
+    // capacity, failure-record locations, affected sessions. Printed from
+    // the daemon's own view; a degraded daemon still answers this. Human
+    // mode degrades loudly if an older daemon cannot answer; the summary
+    // above is still useful.
+    match ipc::send_request_checked(&config, request).await {
+        Ok(RpcResponse::DaemonStatus { status }) => print_daemon_status_report(&status),
+        Ok(other) => {
+            eprintln!("warning: unexpected response to daemon status request: {other:?}");
+        }
+        Err(err) => {
+            eprintln!("warning: daemon status report unavailable: {err}");
+        }
+    }
     Ok(())
+}
+
+/// Print the daemon's diagnostic summary. Every unknown stays visibly
+/// unknown: missing sample, missing reason, partial breakdown.
+fn print_daemon_status_report(report: &DaemonStatusReport) {
+    println!("Version:      {}", report.version);
+    println!(
+        "Readiness:    {}",
+        if report.ready { "ready" } else { "DEGRADED" }
+    );
+    for reason in &report.unready_reasons {
+        println!("              - {reason}");
+    }
+    if !report.components.is_empty() {
+        println!("Components:");
+        for component in &report.components {
+            let critical = if component.ready_critical {
+                ""
+            } else {
+                " (non-critical)"
+            };
+            let failures = if component.failures > 0 {
+                format!(", {} failures", component.failures)
+            } else {
+                String::new()
+            };
+            println!(
+                "  {:<20} {}{}{}",
+                component.name, component.state, critical, failures
+            );
+            if let Some(reason) = &component.last_failure {
+                println!("  {:<20}   last failure: {}", "", reason);
+            }
+        }
+    }
+
+    match report.disk.free_bytes {
+        Some(free) => println!("Disk free:    {}", crate::utils::format_bytes_human(free)),
+        None => println!(
+            "Disk free:    unknown ({})",
+            report
+                .disk
+                .free_unknown_reason
+                .as_deref()
+                .unwrap_or("no sample yet")
+        ),
+    }
+    if let Some(sampled_at) = report.disk.sampled_at {
+        let age = (chrono::Utc::now() - sampled_at).num_seconds().max(0);
+        println!("Disk sampled: {}s ago", age);
+    }
+    let usage = [
+        ("journal", report.disk.journal_bytes),
+        ("uploads", report.disk.uploads_bytes),
+        ("sqlite", report.disk.sqlite_bytes),
+        ("logs", report.disk.logs_bytes),
+    ]
+    .iter()
+    .filter_map(|(label, bytes)| {
+        bytes.map(|bytes| format!("{label} {}", crate::utils::format_bytes_human(bytes)))
+    })
+    .collect::<Vec<_>>();
+    if !usage.is_empty() {
+        println!("Disk usage:   {}", usage.join(", "));
+    }
+    if let Some(reason) = &report.disk.breakdown_partial_reason {
+        println!("Disk usage:   partial ({reason})");
+    }
+    let guard = if report.disk.guard_enabled {
+        report.disk.guard_decision.clone()
+    } else {
+        format!("{} (opt-in; disabled)", report.disk.guard_decision)
+    };
+    println!("Disk guard:   {}", guard);
+    if let Some(reason) = &report.disk.guard_refusal_reason {
+        println!("              new sessions refused: {reason}");
+    }
+    if report.disk.warning_active {
+        println!(
+            "Disk warning: free space below {}",
+            crate::utils::format_bytes_human(report.disk.warn_below_bytes)
+        );
+    }
+
+    if !report.failure_records.is_empty() {
+        println!("Failure records:");
+        for path in &report.failure_records {
+            println!("  {}", path);
+        }
+    }
+
+    for err in &report.diagnostic_errors {
+        eprintln!("warning: incomplete diagnostic summary: {err}");
+    }
+    if !report.affected_sessions.is_empty() {
+        let total = report
+            .affected_sessions_total
+            .map(|total| total.to_string())
+            .unwrap_or_else(|| "unknown total".to_string());
+        println!("Affected sessions ({total}):");
+        for session in &report.affected_sessions {
+            println!("  {} [{}] {}", session.id, session.status, session.reason);
+        }
+        let hidden = report
+            .affected_sessions_total
+            .unwrap_or(report.affected_sessions.len())
+            .saturating_sub(report.affected_sessions.len());
+        if hidden > 0 {
+            println!("  ... and {} more", hidden);
+        }
+    }
 }
 
 /// Resolve the config view `status`/already-running messages report from:
@@ -659,6 +861,22 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // through this to pick up hot-reloadable settings without a restart.
     let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
+    // Supervised components: register everything up front, then run
+    // each long-lived task through `spawn_supervised` so an early exit or
+    // panic is recorded by name and restarted with a bounded budget instead
+    // of silently disappearing. The disk observer is installed on the store
+    // before any session can start.
+    let components = Arc::new(ComponentRegistry::new());
+    for &(name, ready_critical) in SUPERVISED_COMPONENTS {
+        components.register(name, ready_critical);
+    }
+    let disk_monitor = Arc::new(crate::disk::DiskMonitor::new(
+        live_config.clone(),
+        Box::new(crate::disk::OsSpaceProbe),
+    ));
+    session_store.set_disk_monitor(Arc::clone(&disk_monitor));
+    let daemon_health = DaemonHealth::new(Arc::clone(&components), Arc::clone(&disk_monitor));
+
     let auth_state = auth_hash.map(AuthState::new);
     // Every daemon — primary or secondary, HTTP-enabled or not — auto-
     // generates (or loads) an Ed25519 identity key at startup. The same
@@ -686,76 +904,131 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             auth: auth_state,
             node_registry: node_registry.clone(),
             node_identity: node_identity.clone(),
+            daemon: Some(daemon_health.clone()),
         };
         // CR-3: one dedicated task that drains `event_tx` and re-broadcasts
         // the encoded frames. Every SSE handler that subscribes afterward
         // does NOT re-serialize events, so a busy relay does not multiply
         // CPU per reminder count.
-        http::run_event_encoder(event_tx.clone(), event_bytes_tx);
-        tokio::spawn(http::serve(http_state));
+        spawn_supervised(Arc::clone(&components), "sse_encoder", true, {
+            let event_tx = event_tx.clone();
+            let event_bytes_tx = event_bytes_tx.clone();
+            move || {
+                let event_bytes_tx = event_bytes_tx.clone();
+                // Subscribe in the factory, which `spawn_supervised` invokes
+                // at wiring time (and again on restart): a receiver-less
+                // broadcast drops events, so the subscription must exist
+                // before the encoder's first poll.
+                let rx = event_tx.subscribe();
+                async move {
+                    http::run_event_encoder(rx, event_bytes_tx).await;
+                    // Reached only if event_tx closed while the daemon
+                    // still runs; the supervisor records and restarts.
+                    Err("SSE encoder stopped: session event channel closed".to_string())
+                }
+            }
+        });
+        spawn_supervised(Arc::clone(&components), "http", true, move || {
+            let state = http_state.clone();
+            async move { http::serve(state).await }
+        });
         info!("http server task spawned");
     } else {
+        components.mark_disabled("http");
+        components.mark_disabled("sse_encoder");
         info!("http server disabled by --no-http");
     }
 
     {
         let activity_store = session_store.clone();
         let activity_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            activity_store.run_activity_sampler(activity_event_tx).await;
-        });
+        spawn_supervised(
+            Arc::clone(&components),
+            "activity_sampler",
+            true,
+            move || {
+                let store = activity_store.clone();
+                let event_tx = activity_event_tx.clone();
+                async move {
+                    store.run_activity_sampler(event_tx).await;
+                    Err("activity sampler stopped".to_string())
+                }
+            },
+        );
         info!("session activity sampler task spawned");
     }
 
-    let notify_store = session_store.clone();
-    let notify_config = live_config.clone();
-    let notify_event_tx = event_tx.clone();
-    let notify_notification_tx = notification_tx.clone();
-    let notify_notifier = notifier.clone();
-    tokio::spawn(async move {
-        crate::notification::run_notification_monitor(
-            notify_notifier,
-            notify_store,
-            notify_config,
-            notify_event_tx,
-            notify_notification_tx,
-        )
-        .await;
+    spawn_supervised(Arc::clone(&components), "notification_monitor", true, {
+        let notify_store = session_store.clone();
+        let notify_config = live_config.clone();
+        let notify_event_tx = event_tx.clone();
+        let notify_notification_tx = notification_tx.clone();
+        let notify_notifier = notifier.clone();
+        move || {
+            let store = notify_store.clone();
+            let config = notify_config.clone();
+            let event_tx = notify_event_tx.clone();
+            let notification_tx = notify_notification_tx.clone();
+            let notifier = notify_notifier.clone();
+            async move {
+                crate::notification::run_notification_monitor(
+                    notifier,
+                    store,
+                    config,
+                    event_tx,
+                    notification_tx,
+                )
+                .await;
+                Err("notification monitor stopped: event channel closed".to_string())
+            }
+        }
     });
     info!("notification monitor task spawned");
 
-    {
+    spawn_supervised(Arc::clone(&components), "config_reloader", false, {
         let reload_config = live_config.clone();
         let reload_store = session_store.clone();
         let reload_notifier = notifier.clone();
         let reload_db = db.clone();
-        tokio::spawn(async move {
-            super::reload::run_config_reloader(
-                reload_config,
-                reload_store,
-                reload_notifier,
-                reload_db,
-                log_filter_handle,
-            )
-            .await;
-        });
-        info!("config hot-reload task spawned");
-    }
+        move || {
+            let config = reload_config.clone();
+            let store = reload_store.clone();
+            let notifier = reload_notifier.clone();
+            let db = reload_db.clone();
+            let log_filter_handle = log_filter_handle.clone();
+            async move {
+                super::reload::run_config_reloader(config, store, notifier, db, log_filter_handle)
+                    .await;
+                Err("config reloader stopped".to_string())
+            }
+        }
+    });
+    info!("config hot-reload task spawned");
 
-    {
+    spawn_supervised(Arc::clone(&components), "journal_retention", false, {
         let retention_config = live_config.clone();
         let retention_db = db.clone();
         let retention_root = config.paths.sessions_dir.clone();
-        tokio::spawn(async move {
-            super::journal_retention::run_journal_retention_sweeper(
-                retention_config,
-                retention_db,
-                retention_root,
-            )
-            .await;
-        });
-        info!("journal retention sweeper task spawned");
-    }
+        move || {
+            let config = retention_config.clone();
+            let db = retention_db.clone();
+            let root = retention_root.clone();
+            async move {
+                super::journal_retention::run_journal_retention_sweeper(config, db, root).await;
+                Err("journal retention sweeper stopped".to_string())
+            }
+        }
+    });
+    info!("journal retention sweeper task spawned");
+
+    spawn_supervised(Arc::clone(&components), "disk_sampler", true, {
+        let monitor = Arc::clone(&disk_monitor);
+        move || {
+            let monitor = Arc::clone(&monitor);
+            async move { crate::disk::run_disk_sampler(monitor).await }
+        }
+    });
+    info!("state volume disk sampler task spawned");
 
     if !startup_failed_sessions.is_empty() {
         let notifier = notifier.clone();
@@ -830,6 +1103,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                         let event_tx_clone = event_tx.clone();
                         let notification_tx_clone = notification_tx.clone();
                         let notifier_clone = notifier.clone();
+                        let health_clone = daemon_health.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_client(
                                 stream,
@@ -843,6 +1117,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                                 event_tx_clone,
                                 notification_tx_clone,
                                 notifier_clone,
+                                health_clone,
                             ).await {
                                 error!(%err, "client handling error");
                             }
@@ -914,6 +1189,11 @@ mod tests {
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
                 journal_retention_days: 0,
+                disk_guard_enabled: false,
+                disk_min_free_bytes: crate::config::DEFAULT_DISK_MIN_FREE_BYTES,
+                disk_warn_free_bytes: crate::config::DEFAULT_DISK_WARN_FREE_BYTES,
+                disk_sample_interval_seconds: 30,
+                disk_sample_max_age_seconds: 120,
             },
             web_push: crate::config::WebPushConfig {
                 subject: None,

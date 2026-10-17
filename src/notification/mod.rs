@@ -63,9 +63,21 @@ pub(super) async fn run_notification_monitor(
             );
         }
 
-        let candidates: Vec<SilentCandidate> = session_store
+        let candidates: Vec<SilentCandidate> = match session_store
             .silent_candidates(suppression_window, min_notification_interval)
-            .await;
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                // A failed candidate pass must stay visible: never turn it
+                // into "no sessions need attention" for this tick.
+                warn!(
+                    ?err,
+                    "silent candidate evaluation failed; skipping this tick"
+                );
+                continue;
+            }
+        };
 
         if !candidates.is_empty() {
             debug!(count = candidates.len(), "notification candidates detected");

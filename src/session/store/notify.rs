@@ -30,11 +30,15 @@ struct CandidateSnapshot {
 
 impl SessionStore {
     /// Returns silent candidates with their output and latest activity epochs.
+    ///
+    /// Mirrors the store's other off-lock render passes: a broken render
+    /// worker is an explicit error the notification monitor logs and skips,
+    /// never a silently empty candidate list.
     pub async fn silent_candidates(
         &self,
         attach_suppression_window: Duration,
         min_notification_interval: Duration,
-    ) -> Vec<SilentCandidate> {
+    ) -> std::result::Result<Vec<SilentCandidate>, crate::session::SessionError> {
         // Phase 1: walk every live session once, snapshot the
         // silence-detection metadata and a flat byte payload of the
         // engine rows we want to render. The read lock is held only
@@ -158,7 +162,7 @@ impl SessionStore {
         };
 
         if snapshots.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Phase 2: render the excerpts off the lock on the blocking
@@ -187,7 +191,11 @@ impl SessionStore {
                 .collect()
         })
         .await
-        .unwrap_or_default()
+        .map_err(|join_err| {
+            crate::session::SessionError::Internal(format!(
+                "silent candidate render worker join failed: {join_err}"
+            ))
+        })
     }
 
     /// Records a successful notification for `session_id` at `output_epoch`.
@@ -240,6 +248,20 @@ mod tests {
     use crate::session::{SessionError, SessionStatus};
 
     use std::time::{Duration, Instant};
+
+    impl SessionStore {
+        /// Test wrapper: candidate evaluation must succeed; a join failure
+        /// here is a real regression, not a reason to skip assertions.
+        async fn candidates(
+            &self,
+            attach_suppression_window: Duration,
+            min_notification_interval: Duration,
+        ) -> Vec<SilentCandidate> {
+            self.silent_candidates(attach_suppression_window, min_notification_interval)
+                .await
+                .expect("silent candidate render worker must not fail")
+        }
+    }
     #[tokio::test]
     async fn program_status_candidates_override_heuristics_and_deduplicate_redraws() {
         use crate::session::pty::TerminalSignals;
@@ -262,7 +284,7 @@ mod tests {
             rt.write().publish_terminal_signals(signals);
             let store = store_with(vec![rt.clone()], make_test_db().await);
             let candidates = store
-                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .candidates(Duration::from_secs(5), Duration::ZERO)
                 .await;
             assert_eq!(!candidates.is_empty(), candidate_expected, "{state}");
             if candidate_expected {
@@ -273,7 +295,7 @@ mod tests {
                 rt.write().push_output(b"redraw", 6);
                 assert!(
                     store
-                        .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                        .candidates(Duration::from_secs(5), Duration::ZERO)
                         .await
                         .is_empty()
                 );
@@ -296,13 +318,13 @@ mod tests {
         let store = store_with(vec![rt.clone()], make_test_db().await);
         assert!(
             store
-                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .candidates(Duration::from_secs(5), Duration::ZERO)
                 .await
                 .is_empty()
         );
         rt.write().last_input_at = None;
         let candidates = store
-            .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+            .candidates(Duration::from_secs(5), Duration::ZERO)
             .await;
         assert_eq!(candidates.len(), 1);
         assert!(store.mark_notified("ready1", candidates[0].output_epoch, Instant::now()));
@@ -311,7 +333,7 @@ mod tests {
         rt.write().push_output(b"redraw", 6);
         assert!(
             store
-                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .candidates(Duration::from_secs(5), Duration::ZERO)
                 .await
                 .is_empty()
         );
@@ -319,7 +341,7 @@ mod tests {
         rt.write().publish_terminal_signals(signals.clone());
         assert!(
             store
-                .silent_candidates(Duration::ZERO, Duration::ZERO)
+                .candidates(Duration::ZERO, Duration::ZERO)
                 .await
                 .is_empty()
         );
@@ -328,13 +350,13 @@ mod tests {
         rt.write().publish_terminal_signals(signals);
         assert!(
             store
-                .silent_candidates(Duration::from_secs(5), Duration::from_secs(60))
+                .candidates(Duration::from_secs(5), Duration::from_secs(60))
                 .await
                 .is_empty()
         );
         assert_eq!(
             store
-                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .candidates(Duration::from_secs(5), Duration::ZERO)
                 .await
                 .len(),
             1
@@ -354,7 +376,7 @@ mod tests {
         rt.write().publish_terminal_signals(signals.clone());
         let store = store_with(vec![rt.clone()], make_test_db().await);
         let candidates = store
-            .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+            .candidates(Duration::from_secs(5), Duration::ZERO)
             .await;
         assert_eq!(candidates.len(), 1);
         signals.record_osc(b"7501", b"state=error");
@@ -375,7 +397,7 @@ mod tests {
             Some(Duration::from_secs(10)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
         assert!(candidates[0].should_notify);
@@ -395,9 +417,7 @@ mod tests {
         rt.write().last_input_at = Some(input_at);
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert!(!candidates[0].should_notify);
@@ -422,9 +442,7 @@ mod tests {
         rt.write().last_input_at = Some(input_at);
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -449,9 +467,7 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -477,9 +493,7 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(30));
         let store = store_with(vec![rt.clone()], make_test_db().await);
 
-        let first = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let first = store.candidates(suppression_window, min_interval).await;
         assert_eq!(first.len(), 1);
         assert!(!first[0].should_notify);
         store.mark_input_required("abc1234", first[0].output_epoch);
@@ -487,7 +501,7 @@ mod tests {
         // Same epoch → nothing new to report.
         assert!(
             store
-                .silent_candidates(suppression_window, min_interval)
+                .candidates(suppression_window, min_interval)
                 .await
                 .is_empty()
         );
@@ -495,9 +509,7 @@ mod tests {
         // The program prints on its own and then goes quiet.
         rt.write().last_output_epoch = Some(Instant::now() - Duration::from_secs(6));
 
-        let second = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let second = store.candidates(suppression_window, min_interval).await;
         assert_eq!(second.len(), 1);
         assert!(
             second[0].should_notify,
@@ -521,9 +533,7 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].silence_epoch, output_at);
@@ -544,9 +554,7 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_millis(300));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert!(candidates.is_empty());
     }
@@ -564,9 +572,7 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(2));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert!(candidates.is_empty());
     }
@@ -607,7 +613,7 @@ mod tests {
             Some(Duration::from_millis(500)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -631,7 +637,7 @@ mod tests {
             rt.notified_output_epoch = None;
         }
 
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -646,7 +652,7 @@ mod tests {
             Some(Duration::from_secs(10)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -660,7 +666,7 @@ mod tests {
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime("abc1234", SessionStatus::Running, "prompt> ", None);
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -680,7 +686,7 @@ mod tests {
             locked.spawned_at = Instant::now() - Duration::from_secs(10);
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
     }
@@ -698,7 +704,7 @@ mod tests {
             locked.spawned_at = Instant::now() - Duration::from_secs(10);
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -720,7 +726,7 @@ mod tests {
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should suppress re-notification within min_notification_interval"
@@ -742,7 +748,7 @@ mod tests {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
 
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert_eq!(
             candidates.len(),
             1,
@@ -774,7 +780,7 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
@@ -797,7 +803,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         // First call returns a candidate with an output epoch.
-        let first = store.silent_candidates(silence, min_interval).await;
+        let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
@@ -806,7 +812,7 @@ mod tests {
         store.mark_notified(id, epoch, Instant::now());
 
         // Second call: same output epoch → suppressed.
-        let second = store.silent_candidates(silence, min_interval).await;
+        let second = store.candidates(silence, min_interval).await;
         assert!(
             second.is_empty(),
             "should suppress re-notification at same output epoch"
@@ -825,7 +831,7 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let first = store.silent_candidates(silence, min_interval).await;
+        let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
@@ -844,7 +850,7 @@ mod tests {
         }
 
         // New output epoch + expired notification cooldown should re-qualify.
-        let after_output = store.silent_candidates(silence, min_interval).await;
+        let after_output = store.candidates(silence, min_interval).await;
         assert_eq!(after_output.len(), 1);
     }
 
@@ -860,14 +866,14 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let first = store.silent_candidates(silence, min_interval).await;
+        let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
         store.mark_notified(id, epoch, Instant::now());
 
         // Same output epoch -> suppressed.
-        let suppressed = store.silent_candidates(silence, min_interval).await;
+        let suppressed = store.candidates(silence, min_interval).await;
         assert!(suppressed.is_empty());
 
         // Simulate time passing without any new output.
@@ -878,7 +884,7 @@ mod tests {
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(31));
         }
 
-        let still_suppressed = store.silent_candidates(silence, min_interval).await;
+        let still_suppressed = store.candidates(silence, min_interval).await;
         assert!(
             still_suppressed.is_empty(),
             "should remain suppressed until new output advances epoch"
@@ -990,7 +996,7 @@ mod tests {
             locked.last_attach_activity_at = Some(Instant::now());
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should suppress notification while attach activity is inside suppression window"
@@ -1025,9 +1031,7 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -1055,9 +1059,7 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store
-            .silent_candidates(suppression_window, min_interval)
-            .await;
+        let candidates = store.candidates(suppression_window, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -1092,7 +1094,7 @@ mod tests {
 
         assert!(
             store
-                .silent_candidates(suppression_window, min_interval)
+                .candidates(suppression_window, min_interval)
                 .await
                 .is_empty(),
             "a fresh attach should suppress candidacy inside the suppression window"
@@ -1130,7 +1132,7 @@ mod tests {
 
         assert!(
             store
-                .silent_candidates(suppression_window, min_interval)
+                .candidates(suppression_window, min_interval)
                 .await
                 .is_empty(),
             "detach should keep the recent-activity suppression alive"
@@ -1152,7 +1154,7 @@ mod tests {
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval).await;
+        let candidates = store.candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should drop candidates inside cooldown window"

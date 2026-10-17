@@ -76,7 +76,7 @@ pub(crate) enum ServerMessage {
     /// Session ended. `final_offset` is the inclusive end-of-stream
     /// cursor: a client able to apply a partial frame at that offset
     /// has caught up to the moment the daemon signalled end-of-stream.
-    /// `0` when unknown (proxy errors).
+    /// Emitted only after a real completion record; interruptions use Error.
     SessionEnded {
         exit_code: Option<i32>,
         final_offset: u64,
@@ -488,46 +488,22 @@ async fn serve_attach(
 
             // Stream events from the source.
             event = source_source(&mut source) => {
-                match event {
-                    Some(AttachStreamEvent::Chunk { offset, data }) => {
-                        if !send_server_message(&mut socket, &ServerMessage::Data { offset, data }).await {
-                            cleanup_source(&state, &id, &node, &source).await;
-                            return;
-                        }
+                let (message, terminal) = stream_server_message(event);
+                match &message {
+                    ServerMessage::SessionEnded { exit_code, final_offset } => {
+                        info!(session_id = %id, attach_path = init_metrics_label,
+                            ?exit_code, final_offset, "WebSocket session ended");
                     }
-                    Some(AttachStreamEvent::Modes(modes)) => {
-                        if !send_server_message(&mut socket, &ServerMessage::ModeChanged { modes }).await {
-                            cleanup_source(&state, &id, &node, &source).await;
-                            return;
-                        }
+                    ServerMessage::Error { message } => {
+                        warn!(session_id = %id, attach_path = init_metrics_label,
+                            %message, "WebSocket session stream interrupted");
                     }
-                    Some(AttachStreamEvent::Resized { rows, cols }) => {
-                        if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
-                            cleanup_source(&state, &id, &node, &source).await;
-                            return;
-                        }
-                    }
-                    Some(AttachStreamEvent::Done { exit_code, final_offset }) => {
-                        info!(
-                            session_id = %id,
-                            attach_path = init_metrics_label,
-                            ?exit_code,
-                            final_offset,
-                            "WebSocket session ended"
-                        );
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
-                        cleanup_source(&state, &id, &node, &source).await;
-                        return;
-                    }
-                    Some(AttachStreamEvent::Closed) | None => {
-                        let final_offset = pump_current_offset(&source);
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
-                            exit_code: None,
-                            final_offset,
-                        }).await;
-                        cleanup_source(&state, &id, &node, &source).await;
-                        return;
-                    }
+                    _ => {}
+                }
+                let sent = send_server_message(&mut socket, &message).await;
+                if terminal || !sent {
+                    cleanup_source(&state, &id, &node, &source).await;
+                    return;
                 }
             }
 
@@ -552,6 +528,23 @@ async fn serve_attach(
     }
 }
 
+/// One transport-independent completion rule for local and relayed sources.
+/// A confirmed applied prefix is not proof of EOF: only Done may emit an
+/// end cursor. Credit stalls, unrecoverable gaps, and bare closures are errors.
+fn stream_server_message(event: Option<AttachStreamEvent>) -> (ServerMessage, bool) {
+    match event {
+        Some(AttachStreamEvent::Chunk { offset, data }) => (ServerMessage::Data { offset, data }, false),
+        Some(AttachStreamEvent::Modes(modes)) => (ServerMessage::ModeChanged { modes }, false),
+        Some(AttachStreamEvent::Resized { rows, cols }) => (ServerMessage::Resized { rows, cols }, false),
+        Some(AttachStreamEvent::Done { exit_code, final_offset }) =>
+            (ServerMessage::SessionEnded { exit_code, final_offset }, true),
+        Some(AttachStreamEvent::Failed { message }) => (ServerMessage::Error { message }, true),
+        Some(AttachStreamEvent::Closed) | None => (ServerMessage::Error {
+            message: "attach stream closed before completion (credit stall, gap, or source unavailable)".to_string(),
+        }, true),
+    }
+}
+
 /// Drain the source's next event: `AttachPump::next` for local, the
 /// relayed mpsc for proxied. Returns `None` if the relevant primitive has
 /// been dropped (transport-level closure).
@@ -559,15 +552,6 @@ async fn source_source(source: &mut AttachSource) -> Option<AttachStreamEvent> {
     match source {
         AttachSource::Local(local) => local.next_event().await,
         AttachSource::Relayed(relayed) => relayed.next_event().await,
-    }
-}
-
-/// Resolves the pump's `current_offset` for the local arm; the relayed arm
-/// has no concept of a live offset, so this returns `0` for it.
-fn pump_current_offset(source: &AttachSource) -> u64 {
-    match source {
-        AttachSource::Local(local) => local.pump.current_offset(),
-        AttachSource::Relayed(_) => 0,
     }
 }
 
@@ -1027,6 +1011,34 @@ mod tests {
         WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, WsModes, encode_server_message,
         panic_payload_message, seed_web_init_data,
     };
+
+    #[test]
+    fn interrupted_streams_never_encode_a_session_end() {
+        use super::{AttachStreamEvent, WS_FRAME_ERROR, stream_server_message};
+        for event in [
+            None,
+            Some(AttachStreamEvent::Closed),
+            Some(AttachStreamEvent::Failed {
+                message: "relay failed".into(),
+            }),
+        ] {
+            let (message, terminal) = stream_server_message(event);
+            assert!(terminal);
+            assert_eq!(encode_server_message(&message)[0], WS_FRAME_ERROR);
+        }
+        let (message, terminal) = stream_server_message(Some(AttachStreamEvent::Done {
+            exit_code: Some(3),
+            final_offset: 99,
+        }));
+        assert!(terminal);
+        assert!(matches!(
+            message,
+            ServerMessage::SessionEnded {
+                exit_code: Some(3),
+                final_offset: 99
+            }
+        ));
+    }
 
     #[test]
     fn web_init_data_prepends_formatted_scrollback_seed() {

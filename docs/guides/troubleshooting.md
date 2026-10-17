@@ -41,7 +41,7 @@ Inspect before intervening:
 3. If hung, send `oly send <id> key:ctrl+c` or run `oly stop <id> --grace 5` (`--grace 0` kills immediately).
 
 ### Disk usage keeps growing / byte-cap keys fail startup
-Live journal byte caps (`max_journal_bytes_per_session`, `max_output_log_bytes`) were removed in 0.5 and fail startup if present in `config.json`. Remove those keys and use `journal_retention_days` (hourly sweep of stopped/killed/failed sessions) or OS disk quotas.
+Live journal byte caps (`max_journal_bytes_per_session`, `max_output_log_bytes`) were removed in 0.5 and fail startup if present in `config.json`. Remove those keys and use `journal_retention_days` (hourly sweep of stopped/killed/failed sessions) or OS disk quotas. `oly daemon status` reports the state volume's free space plus a journal/uploads/SQLite/logs breakdown; see [Operations](./operations.md#capacity-measurement-and-guard-boundaries) for the opt-in admission guard and its boundaries.
 
 ### Hand-edited `config.json` is ignored or rejected
 `config.json` must be **flat** JSON:

@@ -416,7 +416,8 @@ impl AttachPump {
     }
 
     /// The pump cursor: the stream offset the next [`AttachEvent::Chunk`]
-    /// continues from.
+    /// continues from. Test inspection only: transports use Done for EOF.
+    #[cfg(test)]
     pub fn current_offset(&self) -> u64 {
         self.current_offset
     }

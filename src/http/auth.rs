@@ -387,7 +387,7 @@ pub async fn logout(
 // ── Auth Middleware ──────────────────────────────────────────────────────────
 
 /// Axum middleware: enforce Bearer-token authentication for all `/api/` routes
-/// except `/api/health` and `/api/auth/*`.
+/// except `/api/health`, `/api/ready`, and `/api/auth/*`.
 pub async fn require_auth(
     State(state): State<AppState>,
     request: Request,
@@ -395,7 +395,11 @@ pub async fn require_auth(
 ) -> Response {
     let path = request.uri().path().to_owned();
 
-    if path == "/api/health" || path.starts_with("/api/auth/") || !path.starts_with("/api/") {
+    if path == "/api/health"
+        || path == "/api/ready"
+        || path.starts_with("/api/auth/")
+        || !path.starts_with("/api/")
+    {
         return next.run(request).await;
     }
 

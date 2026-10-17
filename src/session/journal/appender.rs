@@ -467,6 +467,14 @@ pub(crate) struct RollingSegmentWriter {
     part_last_seq: u64,
     /// Running CRC-32 of the active part's exact bytes (manifest).
     part_crc: Crc32,
+    /// Test-only fault injection (constrained test storage): fail the first
+    /// append after this many successful ones, so append-failure paths are
+    /// exercised without filling the operator's disk.
+    #[cfg(test)]
+    pub(crate) fail_append_after_records: Option<u64>,
+    /// Test-only fault injection: fail the next `sync`.
+    #[cfg(test)]
+    pub(crate) fail_next_sync: bool,
 }
 
 impl RollingSegmentWriter {
@@ -486,6 +494,10 @@ impl RollingSegmentWriter {
             part_first_seq: None,
             part_last_seq: 0,
             part_crc: Crc32::new(),
+            #[cfg(test)]
+            fail_append_after_records: None,
+            #[cfg(test)]
+            fail_next_sync: false,
         }
     }
 
@@ -496,6 +508,13 @@ impl RollingSegmentWriter {
         elapsed_ms: u64,
         payload: &[u8],
     ) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_append_after_records.as_mut() {
+            if *remaining == 0 {
+                return Err(io::Error::other("injected append failure"));
+            }
+            *remaining -= 1;
+        }
         let record_bytes = HEADER_LEN as u64 + payload.len() as u64;
         if self.part_bytes > 0 && self.part_bytes + record_bytes > self.max_part_bytes {
             // Seal the current part durable before moving on: after a
@@ -523,6 +542,10 @@ impl RollingSegmentWriter {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(io::Error::other("injected sync failure"));
+        }
         self.writer.sync()
     }
 

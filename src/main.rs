@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod daemon;
 mod db;
+mod disk;
 mod error;
 mod federation_crypto;
 mod http;
@@ -216,7 +217,9 @@ async fn run() -> Result<()> {
                 .await
             }
             DaemonCommand::Stop(stop_args) => daemon::stop(config, stop_args.grace).await,
-            DaemonCommand::Status => daemon::status(config).await,
+            DaemonCommand::Status(status_args) => {
+                daemon::status(config, status_args.node, status_args.json).await
+            }
         },
 
         Commands::List(list_args) => client::run_list(&config, list_args).await,

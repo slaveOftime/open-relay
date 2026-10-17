@@ -345,6 +345,17 @@ impl Database {
             .is_some()
     }
 
+    /// How many sessions currently carry `status` (e.g. `"failed"`). Used by
+    /// the diagnostic summary to report a total beyond its display cap.
+    pub async fn count_sessions_by_status(&self, status: &str) -> Result<u64> {
+        let row = sqlx::query("SELECT COUNT(*) FROM sessions WHERE status=?1")
+            .bind(status)
+            .fetch_one(&self.pool)
+            .await?;
+        let count: i64 = row.try_get(0)?;
+        Ok(count.max(0) as u64)
+    }
+
     /// List all sessions as `SessionSummary` DTOs, applying the `ListQuery` filter.
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
         self.list_summaries_inner(query, true).await

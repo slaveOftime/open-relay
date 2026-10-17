@@ -76,10 +76,16 @@ impl Histogram {
     }
 }
 
+struct Gauge {
+    value: f64,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 struct Registry {
     histograms: BTreeMap<String, Histogram>,
     counters: BTreeMap<String, u64>,
+    gauges: BTreeMap<String, Gauge>,
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -119,6 +125,27 @@ pub fn count(name: &'static str, label: Option<&str>) {
     add(name, label, 1);
 }
 
+/// Set a gauge to `value` (last write wins), e.g. cached disk capacity.
+/// Gauge names carry their unit (`..._bytes`, `..._seconds`) and are
+/// rendered without the counter `_total` suffix. Unknown values must not
+/// be exported as a plausible number: callers write nothing and surface
+/// the reason through diagnostics instead of writing 0.
+/// The observation expires even if its sampler hangs or fails permanently.
+pub fn set_gauge(name: &'static str, label: Option<&str>, value: f64, expires_at: Instant) {
+    let mut reg = registry().lock();
+    reg.gauges
+        .insert(key(name, label), Gauge { value, expires_at });
+}
+
+/// Remove a gauge so its series disappears from the exposition. Used when
+/// a previously known value becomes unknown again: a lingering plausible
+/// number reads as a live measurement, which is exactly the dishonesty the
+/// gauge contract forbids.
+pub fn clear_gauge(name: &'static str, label: Option<&str>) {
+    let mut reg = registry().lock();
+    reg.gauges.remove(&key(name, label));
+}
+
 /// A start/stop guard that observes its lifetime when dropped.
 pub struct Timer {
     name: &'static str,
@@ -152,14 +179,23 @@ fn split_key(key: &str) -> (&str, Option<&str>) {
 
 fn labels_suffix(label: Option<&str>) -> String {
     match label {
-        Some(l) => format!(",label=\"{l}\""),
+        Some(l) => format!("{{label=\"{l}\"}}"),
         None => String::new(),
+    }
+}
+
+fn bucket_labels(label: Option<&str>, bound: &str) -> String {
+    match label {
+        Some(label) => format!("{{label=\"{label}\",le=\"{bound}\"}}"),
+        None => format!("{{le=\"{bound}\"}}"),
     }
 }
 
 /// Render the whole registry as Prometheus text format (0.0.4).
 pub fn render_prometheus() -> String {
-    let reg = registry().lock();
+    let mut reg = registry().lock();
+    let now = Instant::now();
+    reg.gauges.retain(|_, gauge| now <= gauge.expires_at);
     let mut out = String::with_capacity(8 * 1024);
     let mut names: Vec<&str> = reg.histograms.keys().map(|k| split_key(k).0).collect();
     names.sort_unstable();
@@ -174,12 +210,14 @@ pub fn render_prometheus() -> String {
             let suffix = labels_suffix(label);
             for (i, bound) in BUCKETS_SECS.iter().enumerate() {
                 out.push_str(&format!(
-                    "oly_{name}_seconds_bucket{suffix} le=\"{bound}\" {}\n",
+                    "oly_{name}_seconds_bucket{} {}\n",
+                    bucket_labels(label, &bound.to_string()),
                     h.counts[i]
                 ));
             }
             out.push_str(&format!(
-                "oly_{name}_seconds_bucket{suffix} le=\"+Inf\" {}\n",
+                "oly_{name}_seconds_bucket{} {}\n",
+                bucket_labels(label, "+Inf"),
                 h.count
             ));
             out.push_str(&format!(
@@ -198,6 +236,17 @@ pub fn render_prometheus() -> String {
         }
         let suffix = labels_suffix(label);
         out.push_str(&format!("oly_{base}_total{suffix} {v}\n"));
+    }
+    let mut gauges: Vec<(&String, &Gauge)> = reg.gauges.iter().collect();
+    gauges.sort_unstable_by_key(|(k, _)| k.as_str());
+    let mut emitted_gauge_type = std::collections::HashSet::new();
+    for (k, v) in gauges {
+        let (base, label) = split_key(k);
+        if emitted_gauge_type.insert(base.to_string()) {
+            out.push_str(&format!("# TYPE oly_{base} gauge\n"));
+        }
+        let suffix = labels_suffix(label);
+        out.push_str(&format!("oly_{base}{suffix} {}\n", v.value));
     }
     out
 }
@@ -266,15 +315,37 @@ mod tests {
         }
         let text = render_prometheus();
         assert!(
-            text.contains("oly_test_metric_seconds_bucket,label=\"case\" le=\"0.0005\" 1"),
+            text.contains("oly_test_metric_seconds_bucket{label=\"case\",le=\"0.0005\"} 1"),
             "{text}"
         );
         assert!(
-            text.contains("oly_test_metric_seconds_bucket,label=\"case\" le=\"0.0001\" 0"),
+            text.contains("oly_test_metric_seconds_bucket{label=\"case\",le=\"0.0001\"} 0"),
             "{text}"
         );
-        assert!(text.contains("oly_test_counter_total,label=\"case\" 3"));
+        assert!(text.contains("oly_test_counter_total{label=\"case\"} 3"));
         assert!(text.contains("# TYPE oly_test_metric_seconds histogram"));
+    }
+
+    #[test]
+    fn expired_gauges_disappear_without_a_sampler_refresh() {
+        set_gauge(
+            "expired_gauge_test",
+            None,
+            42.0,
+            Instant::now() - Duration::from_secs(1),
+        );
+        let text = render_prometheus();
+        assert!(!text.contains("oly_expired_gauge_test"), "{text}");
+    }
+
+    #[test]
+    fn unlabeled_histogram_buckets_have_valid_label_sets() {
+        observe("unlabeled_bucket_test", None, Duration::ZERO);
+        let text = render_prometheus();
+        assert!(
+            text.contains("oly_unlabeled_bucket_test_seconds_bucket{le=\"+Inf\"} 1\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -292,5 +363,42 @@ mod tests {
         count("counter_test", Some("x"));
         let reg = registry().lock();
         assert_eq!(reg.counters["counter_test|x"], 3);
+    }
+
+    #[test]
+    fn gauges_render_without_total_suffix_and_last_write_wins() {
+        let expires_at = Instant::now() + Duration::from_secs(120);
+        set_gauge("test_disk_free_bytes_gauge", None, 1024.0, expires_at);
+        set_gauge("test_disk_free_bytes_gauge", None, 2048.0, expires_at);
+        set_gauge(
+            "test_disk_breakdown_bytes_gauge",
+            Some("journal"),
+            9.0,
+            expires_at,
+        );
+        let text = render_prometheus();
+        assert!(
+            text.contains("# TYPE oly_test_disk_free_bytes_gauge gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("oly_test_disk_free_bytes_gauge 2048\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("oly_test_disk_breakdown_bytes_gauge{label=\"journal\"} 9\n"),
+            "{text}"
+        );
+        assert!(!text.contains("oly_test_disk_free_bytes_gauge_total"));
+
+        // A value that becomes unknown again must lose its series: keeping
+        // the last number would read as a live measurement.
+        clear_gauge("test_disk_free_bytes_gauge", None);
+        let text = render_prometheus();
+        assert!(!text.contains("oly_test_disk_free_bytes_gauge"), "{text}");
+        assert!(
+            text.contains("oly_test_disk_breakdown_bytes_gauge{label=\"journal\"} 9\n"),
+            "clearing one series must not disturb others: {text}"
+        );
     }
 }

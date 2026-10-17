@@ -1,5 +1,7 @@
 mod auth;
+pub(crate) mod components;
 mod crash;
+pub(crate) mod health;
 mod journal_retention;
 mod lifecycle;
 mod reload;

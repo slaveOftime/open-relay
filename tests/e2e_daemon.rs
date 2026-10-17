@@ -703,6 +703,38 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         );
     }
 
+    // The owning node's capacity, readiness, and component states are
+    // queryable through the relay, and the report describes the node's own
+    // state volume — not the primary's.
+    let node_status = oly_cmd(&primary_tmp)
+        .args(["daemon", "status", "--node", "worker1", "--json"])
+        .output()
+        .expect("`oly daemon status --node` failed to execute");
+    assert!(
+        node_status.status.success(),
+        "`oly daemon status --node` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&node_status.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&node_status.stdout)
+        .expect("`daemon status --json` must emit a single JSON object");
+    assert_eq!(report["alive"], true);
+    assert_eq!(
+        report["ready"], true,
+        "a --no-http secondary is ready: {report}"
+    );
+    assert!(
+        report["components"]
+            .as_array()
+            .expect("components array")
+            .iter()
+            .any(|component| component["name"] == "http" && component["state"] == "disabled"),
+        "http must be reported disabled, not missing: {report}"
+    );
+    assert!(
+        report["disk"]["sampled_at"].is_string() && report["disk"]["free_bytes"].is_u64(),
+        "the owning node must report its own sampled state volume: {report}"
+    );
+
     const REMOTE_MARKER: &str = "oly_federation_remote_marker";
     let input = oly_cmd(&primary_tmp)
         .args([
@@ -2033,6 +2065,99 @@ fn e2e_daemon_status_reports_not_running() {
     );
 }
 
+#[test]
+fn e2e_public_readiness_and_private_status_agree_on_disk_admission() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_disk_readiness");
+    fs::write(
+        tmp.join("oly").join("config.json"),
+        serde_json::to_vec(&json!({
+            "disk_guard_enabled": true,
+            "disk_min_free_bytes": u64::MAX,
+            "disk_warn_free_bytes": u64::MAX,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = pick_free_port();
+    let _daemon = start_daemon_http_authenticated(&tmp, port, "benign-readiness-fixture");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let health = client
+            .get(format!("http://127.0.0.1:{port}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let ready = client
+            .get(format!("http://127.0.0.1:{port}/api/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let public: serde_json::Value =
+            serde_json::from_slice(&ready.bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            public,
+            json!({"ready": false, "unready_reasons": ["disk guard is below_minimum"]})
+        );
+        let metrics = client
+            .get(format!("http://127.0.0.1:{port}/api/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), reqwest::StatusCode::UNAUTHORIZED);
+    });
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let private: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(private["alive"], true);
+    assert_eq!(private["ready"], false);
+    assert!(private["disk"]["free_bytes"].as_u64().is_some());
+    assert_eq!(private["disk"]["guard_decision"], "below_minimum");
+    let start = oly_cmd(&tmp)
+        .args(["start", "--detach", "--", "sh"])
+        .output()
+        .unwrap();
+    assert!(!start.status.success());
+    assert!(String::from_utf8_lossy(&start.stderr).contains("below the floor"));
+    let list = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(list.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()["total"],
+        0
+    );
+}
+
+#[test]
+fn e2e_remote_daemon_status_without_a_relay_is_unknown_not_stopped() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_remote_status_no_relay");
+    for json in [false, true] {
+        let mut cmd = oly_cmd(&tmp);
+        cmd.args(["daemon", "status", "--node", "worker1"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "must not fabricate remote liveness"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot determine status of node")
+        );
+    }
+}
+
 /// The `oly logs` surface: `--wait` gates a read, `--json` shapes any read,
 /// cursors continue a read without repeats, and meaningless combinations
 /// are usage errors instead of silent misreads.
@@ -2773,4 +2898,236 @@ fn e2e_federation_join_start_reports_rejection_on_stderr() {
         "failed attempt reported success"
     );
     let _ = (secondary, secondary_pub, &out.stdout);
+}
+
+// An injected HTTP bind failure must surface as a named, reason-carrying
+// component failure in diagnostics. The port is held by this test process, so
+// the daemon's `http` component cannot bind; IPC session supervision must be
+// unaffected, and `oly daemon status` must distinguish the failure instead of
+// reporting a healthy daemon.
+#[test]
+fn e2e_http_bind_failure_is_a_named_component_failure() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Hold the port for the whole test; std does not set SO_REUSEADDR, so the
+    // daemon's bind fails on every platform.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = held.local_addr().expect("read held port").port();
+
+    let tmp = make_tmp_dir("e2e_bind_conflict");
+    let _daemon = start_daemon_http(&tmp, port);
+
+    // IPC supervision is unaffected: a session still starts and records.
+    let marker = "http-down-still-works";
+    let unix_script = format!("echo {marker}");
+    let id = if cfg!(windows) {
+        start_session(&tmp, &["cmd", "/C", "echo", marker])
+    } else {
+        start_session(&tmp, &["sh", "-c", unix_script.as_str()])
+    };
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains(marker),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "local session supervision must survive an HTTP bind failure.\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+
+    // Poll the diagnostic summary until the bounded restart budget is spent
+    // and the component is `failed` — not vanished, not still restarting.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = oly_cmd(&tmp)
+            .args(["daemon", "status", "--json"])
+            .output()
+            .expect("`oly daemon status --json` failed to execute");
+        assert!(
+            output.status.success(),
+            "`oly daemon status --json` exited non-zero.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("`daemon status --json` must emit a single JSON object");
+
+        let http = report["components"]
+            .as_array()
+            .and_then(|components| {
+                components
+                    .iter()
+                    .find(|component| component["name"] == "http")
+                    .cloned()
+            })
+            .unwrap_or(serde_json::Value::Null);
+        if http["state"] == "failed" {
+            assert_eq!(report["alive"], true, "liveness must stay true: {report}");
+            assert_eq!(report["ready"], false, "readiness must degrade: {report}");
+            assert!(
+                report["unready_reasons"]
+                    .as_array()
+                    .expect("unready reasons array")
+                    .iter()
+                    .any(|reason| reason
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("failed to bind HTTP server")),
+                "unready reasons must name the bind failure: {report}"
+            );
+            assert!(
+                http["last_failure"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("failed to bind HTTP server"),
+                "the component must carry the bind reason: {http}"
+            );
+            assert!(http["failures"].as_u64().unwrap_or(0) >= 1);
+            // Every other ready-critical component still runs.
+            for name in ["activity_sampler", "notification_monitor", "disk_sampler"] {
+                assert!(
+                    report["components"]
+                        .as_array()
+                        .expect("components array")
+                        .iter()
+                        .any(|component| component["name"] == name
+                            && component["state"] == "running"),
+                    "{name} must still be running: {report}"
+                );
+            }
+            break;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "http component never reached `failed`; last report: {report}"
+        );
+        sleep(Duration::from_millis(500));
+    }
+
+    // Human output carries the same distinction.
+    let human = oly_cmd(&tmp)
+        .args(["daemon", "status"])
+        .output()
+        .expect("`oly daemon status` failed to execute");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("DEGRADED"),
+        "human status must not report a failing component as ready.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("failed to bind HTTP server"),
+        "human status must carry the failure reason.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Disk free:"),
+        "human status must include the capacity summary.\n{stdout}"
+    );
+}
+
+// The offline backup/restore drill is reproducible. The
+// daemon is stopped before the copy (offline rule), the state directory is
+// copied whole into an isolated directory, and a daemon started against the
+// copy still serves the recorded metadata and journal.
+#[test]
+fn e2e_offline_backup_restore_drill_recovers_journal_and_metadata() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    fn copy_dir_recursive(source: &std::path::Path, dest: &std::path::Path) {
+        std::fs::create_dir_all(dest).expect("create copy destination");
+        for entry in std::fs::read_dir(source).expect("read copy source") {
+            let entry = entry.expect("read source entry");
+            let target = dest.join(entry.file_name());
+            if entry.file_type().expect("source entry type").is_dir() {
+                copy_dir_recursive(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy state file");
+            }
+        }
+    }
+
+    let tmp = make_tmp_dir("e2e_restore_drill");
+    let daemon = start_daemon(&tmp);
+
+    let marker = "restore-drill-marker";
+    let unix_script = format!("echo {marker}");
+    let id = if cfg!(windows) {
+        start_session(&tmp, &["cmd", "/C", "echo", marker])
+    } else {
+        start_session(&tmp, &["sh", "-c", unix_script.as_str()])
+    };
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains(marker),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the session must record its output before the backup.\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+
+    // Wait for the child to exit so the backup snapshot is a settled state.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let output = oly_cmd(&tmp)
+            .args(["info", &id, "--json"])
+            .output()
+            .expect("`oly info --json` failed to execute");
+        let info: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("`oly info --json` emits JSON");
+        if info["status"] == "stopped" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {id} never reached stopped: {info}"
+        );
+        sleep(Duration::from_millis(250));
+    }
+
+    // Offline rule: no daemon may be running against the source state while
+    // the files are copied (`drop` runs the graceful `daemon stop` RPC).
+    drop(daemon);
+
+    let restored_tmp = make_tmp_dir("e2e_restore_drill_copy");
+    copy_dir_recursive(&tmp.join("oly"), &restored_tmp.join("oly"));
+
+    // The backup must contain the journal, not just the metadata row; the
+    // restored daemon then replays it for `oly logs` and `oly ls`.
+    let restored_journal = restored_tmp
+        .join("oly")
+        .join("sessions")
+        .join(&id)
+        .join("journal");
+    assert!(
+        restored_journal.is_dir(),
+        "offline backup must include the session journal at {}",
+        restored_journal.display()
+    );
+
+    let _restored_daemon = start_daemon(&restored_tmp);
+
+    let list = oly_cmd(&restored_tmp)
+        .args(["ls"])
+        .output()
+        .expect("`oly ls` against the restored state failed to execute");
+    assert!(
+        list.status.success(),
+        "restored `oly ls` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list_stdout.contains(&id),
+        "restored state must list the backed-up session {id}.\n{list_stdout}"
+    );
+
+    let logs = fetch_logs(&restored_tmp, &id);
+    assert!(
+        logs.contains(marker),
+        "restored journal must replay the recorded output.\nLogs:\n{logs}"
+    );
 }

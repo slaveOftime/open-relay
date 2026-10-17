@@ -126,6 +126,9 @@ pub struct SessionStore {
     /// Reloadable rules applied when a completed journal is scanned.
     pub(super) resume_patterns: ArcSwap<Vec<ResumePattern>>,
     pub(super) db: Arc<Database>,
+    /// Disk-guard observer, installed by the daemon after construction.
+    /// Absent in unit tests, so admission behaves exactly as before there.
+    pub(super) disk_monitor: std::sync::OnceLock<Arc<crate::disk::DiskMonitor>>,
     pub(super) event_tx: SessionEventTx,
 }
 
@@ -171,8 +174,38 @@ impl SessionStore {
             )),
             resume_patterns: ArcSwap::from_pointee(Vec::new()),
             db,
+            disk_monitor: std::sync::OnceLock::new(),
             event_tx,
         }
+    }
+
+    /// Install the daemon's disk observer. New sessions then consult it
+    /// before they are admitted; existing sessions are never touched.
+    pub fn set_disk_monitor(&self, monitor: Arc<crate::disk::DiskMonitor>) {
+        let _ = self.disk_monitor.set(monitor);
+    }
+
+    /// Session ids reserved for a start that has not committed yet. Used by
+    /// the diagnostic summary to point at starts interrupted by a crash.
+    pub async fn starting_session_ids(&self) -> Vec<String> {
+        self.mutable
+            .lock()
+            .await
+            .starting_sessions
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Test-only: simulate a start reservation that never committed (the
+    /// state a crash mid-start leaves behind), for diagnostic-report tests.
+    #[cfg(test)]
+    pub(crate) async fn reserve_starting_session_for_test(&self, id: &str) {
+        self.mutable
+            .lock()
+            .await
+            .starting_sessions
+            .insert(id.to_string());
     }
 
     /// Current eviction TTL for completed sessions.

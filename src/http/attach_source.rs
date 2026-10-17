@@ -66,9 +66,14 @@ pub(crate) enum AttachStreamEvent {
         exit_code: Option<i32>,
         final_offset: u64,
     },
-    /// Stream closed without a completion record (relay dropped, broadcast
-    /// closed, store status unavailable). The transport should end the
-    /// stream in whatever way its protocol allows.
+    /// The stream was interrupted before a completion record arrived
+    /// (relay dropped, nested IPC read failure, owning node unreachable).
+    /// Carries the reason; the transport must surface it as an error, never
+    /// as a session end: an unknown cursor must not become `final_offset: 0`.
+    Failed { message: String },
+    /// Stream closed without a completion record (broadcast closed, store
+    /// status unavailable) and no more specific reason is available. The
+    /// transport should end the stream in whatever way its protocol allows.
     Closed,
 }
 
@@ -300,8 +305,15 @@ impl RelayedSource {
     pub(crate) async fn next_event(&mut self) -> Option<AttachStreamEvent> {
         match self.stream_rx.recv().await {
             Some(Ok(resp)) => Some(resp.into_stream_event(&mut self.init_sent)),
-            Some(Err(_err)) => Some(AttachStreamEvent::Closed),
-            None => Some(AttachStreamEvent::Closed),
+            Some(Err(err)) => Some(AttachStreamEvent::Failed {
+                message: format!("relay stream to node '{}' failed: {err}", self.node),
+            }),
+            None => Some(AttachStreamEvent::Failed {
+                message: format!(
+                    "relay stream to node '{}' closed before completion",
+                    self.node
+                ),
+            }),
         }
     }
 }
@@ -313,7 +325,9 @@ impl RelayedSource {
 impl RpcResponse {
     fn into_stream_event(self, _init_sent: &mut bool) -> AttachStreamEvent {
         match self {
-            RpcResponse::AttachStreamInit { .. } => AttachStreamEvent::Closed,
+            RpcResponse::AttachStreamInit { .. } => AttachStreamEvent::Failed {
+                message: "relay stream re-sent an init frame after startup".to_string(),
+            },
             RpcResponse::AttachStreamChunk { offset, data } => {
                 AttachStreamEvent::Chunk { offset, data }
             }
@@ -338,8 +352,10 @@ impl RpcResponse {
                 exit_code,
                 final_offset,
             },
-            RpcResponse::Error { .. } => AttachStreamEvent::Closed,
-            _ => AttachStreamEvent::Closed,
+            RpcResponse::Error { message } => AttachStreamEvent::Failed { message },
+            _ => AttachStreamEvent::Failed {
+                message: "unexpected frame from owning node".to_string(),
+            },
         }
     }
 
@@ -379,7 +395,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relayed_init_into_stream_event_is_closed() {
+    fn relayed_init_into_stream_event_is_failed() {
         let resp = RpcResponse::AttachStreamInit {
             data: b"snap".to_vec(),
             end_offset: 7,
@@ -396,7 +412,11 @@ mod tests {
         };
         let mut init_sent = true;
         let evt = resp.into_stream_event(&mut init_sent);
-        assert!(matches!(evt, AttachStreamEvent::Closed));
+        assert!(matches!(
+            evt,
+            AttachStreamEvent::Failed { ref message }
+                if message.contains("re-sent an init frame")
+        ));
     }
 
     #[test]
@@ -457,13 +477,58 @@ mod tests {
     }
 
     #[test]
-    fn error_response_maps_to_closed() {
+    fn error_response_maps_to_failed() {
         let resp = RpcResponse::Error {
             message: "boom".to_string(),
         };
         let mut init_sent = true;
         let evt = resp.into_stream_event(&mut init_sent);
-        assert!(matches!(evt, AttachStreamEvent::Closed));
+        assert!(matches!(
+            evt,
+            AttachStreamEvent::Failed { ref message } if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn unknown_response_maps_to_failed() {
+        let resp = RpcResponse::Empty;
+        let mut init_sent = true;
+        let evt = resp.into_stream_event(&mut init_sent);
+        assert!(matches!(
+            evt,
+            AttachStreamEvent::Failed { ref message }
+                if message.contains("unexpected frame")
+        ));
+    }
+
+    #[tokio::test]
+    async fn relayed_source_error_and_drop_report_failure_not_closure() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut source = RelayedSource {
+            node: "worker1".to_string(),
+            stream_rpc_id: "rpc-1".to_string(),
+            stream_rx: rx,
+            init_sent: true,
+        };
+        tx.send(Err(crate::error::AppError::NodeNotConnected(
+            "worker1".to_string(),
+        )))
+        .await
+        .unwrap();
+        match source.next_event().await {
+            Some(AttachStreamEvent::Failed { message }) => {
+                assert!(message.contains("worker1"));
+                assert!(message.contains("not connected"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        drop(tx);
+        match source.next_event().await {
+            Some(AttachStreamEvent::Failed { message }) => {
+                assert!(message.contains("closed before completion"))
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]

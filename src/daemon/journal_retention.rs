@@ -114,26 +114,222 @@ pub(super) async fn run_journal_retention_sweeper(
     }
 }
 
-/// Delete one session's journal directory + DB row. The journal
-/// directory is removed first because it's the bulk of the disk cost;
-/// if the DB delete afterwards fails, the next sweep re-runs and
-/// treats the lingering journal as orphaned (no DB row means no
-/// candidate selection, so the orphan is harmless — it just wastes
-/// disk until the operator reruns the sweep with `journal_retention_days=0`
-/// followed by a manual cleanup, or removes it by hand).
+/// Delete one session's journal directory + DB row, directory first: if the
+/// DB delete then fails, the row still selects the session on the next sweep
+/// and the already-missing directory is tolerated (`NotFound`), so a retry
+/// converges without ever presenting a half-deleted session as running.
+///
+/// The id is validated as a single normal path component before any removal:
+/// retention must never recursively delete a directory that a corrupted row
+/// merely appears to name. Failures are counted per stage so the diagnostic
+/// surface can distinguish "could not delete the files" from "could not
+/// delete the row".
 async fn sweep_one(
     db: &Database,
     sessions_dir: &std::path::Path,
     session_id: &str,
 ) -> crate::error::Result<()> {
-    let journal_dir = sessions_dir.join(session_id);
+    let Some(journal_dir) = safe_session_dir(sessions_dir, session_id) else {
+        crate::metrics::count("retention_sweep_failures", Some("unsafe_id"));
+        return Err(crate::error::AppError::Protocol(format!(
+            "refusing to sweep session with an unsafe id: {session_id:?}"
+        )));
+    };
     if let Err(err) = tokio::fs::remove_dir_all(&journal_dir).await {
         // ENOENT means a concurrent manual `oly rm` already cleaned
         // it up; that's the only error we treat as success-on-disk.
         if err.kind() != std::io::ErrorKind::NotFound {
+            crate::metrics::count("retention_sweep_failures", Some("dir"));
             return Err(err.into());
         }
     }
-    db.delete_session_by_id(session_id).await?;
-    Ok(())
+    match db.delete_session_by_id(session_id).await {
+        Ok(_) => {
+            crate::metrics::count("retention_sessions_evicted", None);
+            Ok(())
+        }
+        Err(err) => {
+            crate::metrics::count("retention_sweep_failures", Some("db"));
+            Err(err)
+        }
+    }
+}
+
+/// The session directory for `session_id`, but only when the id is a portable
+/// ASCII identifier in a single normal path component. Reject dots, spaces,
+/// and colons too: Windows normalizes trailing dots/spaces and supports ADS.
+/// Anything
+/// else is rejected rather than joined: `sessions_dir.join(id)` with a
+/// traversal id would name a directory outside the sessions dir.
+fn safe_session_dir(sessions_dir: &std::path::Path, session_id: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let mut components = std::path::Path::new(session_id).components();
+    let first = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    if !matches!(first, Component::Normal(_))
+        || first.as_os_str() != std::ffi::OsStr::new(session_id)
+    {
+        return None;
+    }
+    Some(sessions_dir.join(session_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionMeta, SessionStatus};
+    use chrono::Utc;
+
+    fn meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "cmd".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            resume_command: None,
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+            notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
+        }
+    }
+
+    struct Fixture {
+        db: Arc<Database>,
+        sessions_dir: PathBuf,
+        root: PathBuf,
+    }
+
+    async fn fixture(name: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!(
+            "oly_retention_{name}_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let db = Arc::new(
+            Database::open(&root.join("oly.db"), sessions_dir.clone())
+                .await
+                .expect("open test db"),
+        );
+        Fixture {
+            db,
+            sessions_dir,
+            root,
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_session_dir_and_row() {
+        let fixture = fixture("happy").await;
+        let id = "stopped111";
+        fixture.db.insert_session(&meta(id)).await.unwrap();
+        let session_dir = fixture.sessions_dir.join(id);
+        std::fs::create_dir_all(session_dir.join("journal")).unwrap();
+        std::fs::write(session_dir.join("journal").join("manifest.log"), b"x").unwrap();
+
+        sweep_one(&fixture.db, &fixture.sessions_dir, id)
+            .await
+            .expect("sweep");
+
+        assert!(!session_dir.exists());
+        assert!(fixture.db.get_session(id).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn sweep_converges_when_the_directory_is_already_gone() {
+        let fixture = fixture("retry").await;
+        let id = "stopped222";
+        fixture.db.insert_session(&meta(id)).await.unwrap();
+
+        // Simulates a retry after a previous attempt deleted the directory
+        // but failed before the row was removed.
+        sweep_one(&fixture.db, &fixture.sessions_dir, id)
+            .await
+            .expect("retry must converge");
+
+        assert!(fixture.db.get_session(id).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn sweep_failure_keeps_the_row_for_the_next_interval() {
+        let fixture = fixture("dir_failure").await;
+        let id = "stopped333";
+        fixture.db.insert_session(&meta(id)).await.unwrap();
+        // A file where the session directory belongs makes the directory
+        // removal fail; the row must survive so the next sweep retries.
+        std::fs::write(fixture.sessions_dir.join(id), b"obstacle").unwrap();
+
+        let err = sweep_one(&fixture.db, &fixture.sessions_dir, id)
+            .await
+            .expect_err("directory removal must fail");
+        let _ = err;
+        assert!(
+            fixture.db.get_session(id).await.unwrap().is_some(),
+            "row must remain for the next retry"
+        );
+        assert!(fixture.sessions_dir.join(id).is_file());
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn sweep_refuses_ids_that_escape_the_sessions_dir() {
+        let fixture = fixture("traversal").await;
+        let victim = fixture.root.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let id = "../victim";
+        fixture.db.insert_session(&meta(id)).await.unwrap();
+
+        let err = sweep_one(&fixture.db, &fixture.sessions_dir, id)
+            .await
+            .expect_err("traversal id must be refused");
+        assert!(err.to_string().contains("unsafe id"), "{err}");
+        assert!(victim.is_dir(), "victim directory must survive");
+        assert!(fixture.db.get_session(id).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[test]
+    fn safe_session_dir_accepts_only_single_normal_components() {
+        let base = std::path::Path::new("base");
+        assert_eq!(safe_session_dir(base, "abc123"), Some(base.join("abc123")));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "../x",
+            "abc.",
+            "abc ",
+            "abc:stream",
+        ] {
+            assert_eq!(safe_session_dir(base, bad), None, "accepted {bad:?}");
+        }
+        assert_eq!(
+            safe_session_dir(base, "session-1_a"),
+            Some(base.join("session-1_a"))
+        );
+    }
 }

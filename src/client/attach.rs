@@ -400,6 +400,12 @@ async fn run_attach_inner(
                         stream_cursor.finish(final_offset)?;
                         running = false;
                     }
+                    // A mid-stream error is an interruption, not a
+                    // completion: surface the daemon's reason and fail loudly
+                    // instead of ignoring it and reporting a clean end.
+                    RpcResponse::Error { message } => {
+                        return Err(AppError::RequestFailed(message));
+                    }
                     _ => {}
                 },
             }
@@ -758,6 +764,15 @@ async fn run_attach_inner(
                                             stream_error = Some(err);
                                         }
                                         running = false;
+                                    }
+                                    // A mid-stream error is an interruption,
+                                    // not a completion: keep the reason so the
+                                    // attach fails loudly.
+                                    RpcResponse::Error { message } => {
+                                        stream_error =
+                                            Some(AppError::RequestFailed(message));
+                                        running = false;
+                                        break;
                                     }
                                     _ => {}
                                 }

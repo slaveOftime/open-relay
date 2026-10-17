@@ -92,6 +92,7 @@ impl SessionStore {
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
+
         // `spawn_session` performs mkdir + ShadowJournal recovery scan
         // + fsyncs + PATH walks + PTY spawn, all of which block workers.
         // Run it on the blocking pool so a dirty, large journal can't
@@ -105,7 +106,12 @@ impl SessionStore {
         let runtime = match tokio::task::spawn_blocking({
             let meta = Arc::clone(&meta);
             let event_tx = store_handle.event_tx.clone();
+            let store = Arc::clone(store_handle);
             move || {
+                // Recheck after any blocking-pool queue delay, not before
+                // enqueueing. Filesystem/PTY preparation can still race
+                // external writes: this is admission, not a space reservation.
+                store.check_disk_guard()?;
                 let mut meta_guard = meta.lock();
                 spawn_session(
                     &mut meta_guard,
@@ -269,6 +275,23 @@ impl SessionStore {
         }
     }
 
+    /// Disk admission gate shared by the prepare step and the pre-spawn
+    /// recheck. Records the decision label (bounded set) and turns refusals
+    /// into `AppError::DiskGuard`. Never touches existing sessions: a bad
+    /// sample only stops new growth. With the guard disabled this is a
+    /// no-op.
+    pub(super) fn check_disk_guard(&self) -> Result<()> {
+        let Some(monitor) = self.disk_monitor.get() else {
+            return Ok(());
+        };
+        let decision = monitor.guard_decision();
+        crate::metrics::count("disk_guard_decisions", Some(decision.label()));
+        match decision.refusal_reason() {
+            Some(reason) => Err(AppError::DiskGuard(reason)),
+            None => Ok(()),
+        }
+    }
+
     pub(super) async fn prepare_start_session(
         &self,
         config: &AppConfig,
@@ -286,6 +309,12 @@ impl SessionStore {
                 config.limits.max_running_sessions,
             ));
         }
+
+        // Disk admission runs inside the same lock that reserves the
+        // starting slot. Each start checks the cached sample, but no bytes
+        // are reserved: concurrent starts may pass the same fresh reading.
+        // A second check runs when the blocking spawn worker begins.
+        self.check_disk_guard()?;
 
         let id = generate_session_id(|candidate| {
             sessions.contains_key(candidate) || state.starting_sessions.contains(candidate)
@@ -1526,5 +1555,175 @@ mod tests {
 
         assert!(converted >= before - chrono::TimeDelta::seconds(3));
         assert!(converted <= after - chrono::TimeDelta::seconds(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Disk admission guard
+    // -----------------------------------------------------------------------
+
+    fn guard_limits(
+        enabled: bool,
+        min_free: u64,
+        max_age_secs: u64,
+    ) -> crate::config::LimitsConfig {
+        let mut limits = make_test_config(50).limits;
+        limits.disk_guard_enabled = enabled;
+        limits.disk_min_free_bytes = min_free;
+        limits.disk_warn_free_bytes = min_free.saturating_mul(2);
+        limits.disk_sample_interval_seconds = 30;
+        limits.disk_sample_max_age_seconds = max_age_secs;
+        limits
+    }
+
+    fn install_disk_guard(
+        store: &Arc<SessionStore>,
+        limits: crate::config::LimitsConfig,
+        free: Option<u64>,
+        sampled_at: std::time::SystemTime,
+    ) -> (Arc<crate::disk::DiskMonitor>, crate::config::LiveConfig) {
+        let mut config = make_test_config(50);
+        config.limits = limits;
+        let live = crate::config::LiveConfig::from_arc(Arc::new(config));
+        let monitor = Arc::new(crate::disk::DiskMonitor::new(
+            live.clone(),
+            Box::new(crate::disk::OsSpaceProbe),
+        ));
+        monitor.store_sample_for_test(crate::disk::DiskSample {
+            sampled_at,
+            free_bytes: free,
+            free_unknown_reason: free.is_none().then(|| "injected probe failure".to_string()),
+            breakdown: Default::default(),
+            breakdown_partial_reason: None,
+        });
+        store.set_disk_monitor(Arc::clone(&monitor));
+        (monitor, live)
+    }
+
+    fn fresh_sample(free: Option<u64>) -> crate::disk::DiskSample {
+        crate::disk::DiskSample {
+            sampled_at: std::time::SystemTime::now(),
+            free_bytes: free,
+            free_unknown_reason: free.is_none().then(|| "injected probe failure".to_string()),
+            breakdown: Default::default(),
+            breakdown_partial_reason: None,
+        }
+    }
+
+    fn start_spec(command: &str) -> StartSpec {
+        StartSpec {
+            title: None,
+            tags: vec![],
+            cmd: command.to_string(),
+            args: vec![],
+            cwd: None,
+            rows: None,
+            cols: None,
+            notifications_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_guard_refuses_new_sessions_below_floor_and_when_unknown() {
+        for (free, expected_fragment) in [(Some(1024u64), "below the floor"), (None, "unknown")] {
+            let store = Arc::new(store_with(vec![], make_test_db().await));
+            install_disk_guard(
+                &store,
+                guard_limits(true, 4096, 120),
+                free,
+                std::time::SystemTime::now(),
+            );
+            let mut config = make_test_config(50);
+            config.limits = guard_limits(true, 4096, 120);
+
+            let err = SessionStore::start_session_via_handle(&store, &config, start_spec("cmd"))
+                .await
+                .expect_err("guard must refuse");
+            match err {
+                AppError::DiskGuard(reason) => {
+                    assert!(
+                        reason.contains(expected_fragment),
+                        "reason {reason:?} missing {expected_fragment:?}"
+                    )
+                }
+                other => panic!("expected DiskGuard, got {other:?}"),
+            }
+            // A refused start leaves no reservation behind.
+            assert!(store.mutable.lock().await.starting_sessions.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_guard_refuses_stale_samples_and_hot_disables() {
+        let store = Arc::new(store_with(vec![], make_test_db().await));
+        let (monitor, live) = install_disk_guard(
+            &store,
+            guard_limits(true, 4096, 60),
+            Some(8 * 1024),
+            std::time::SystemTime::now() - Duration::from_secs(600),
+        );
+        match store.check_disk_guard() {
+            Err(AppError::DiskGuard(reason)) => assert!(reason.contains("stale"), "{reason}"),
+            other => panic!("expected stale refusal, got {other:?}"),
+        }
+
+        let mut config = make_test_config(50);
+        config.limits = guard_limits(true, 4096, 60);
+        let err = SessionStore::start_session_via_handle(&store, &config, start_spec("cmd"))
+            .await
+            .expect_err("stale sample must refuse");
+        assert!(matches!(err, AppError::DiskGuard(_)));
+
+        // Fresh sample above the floor: admitted (guard on).
+        monitor.store_sample_for_test(fresh_sample(Some(8 * 1024)));
+        assert!(store.check_disk_guard().is_ok());
+
+        // Fresh sample below the floor again: refused.
+        monitor.store_sample_for_test(fresh_sample(Some(1)));
+        assert!(matches!(
+            store.check_disk_guard(),
+            Err(AppError::DiskGuard(_))
+        ));
+
+        // Disabling the guard in the live config stops refusals without a
+        // restart, even with a stale low sample.
+        monitor.store_sample_for_test(crate::disk::DiskSample {
+            sampled_at: std::time::SystemTime::now() - Duration::from_secs(600),
+            free_bytes: Some(1),
+            free_unknown_reason: None,
+            breakdown: Default::default(),
+            breakdown_partial_reason: None,
+        });
+        let mut disabled = make_test_config(50);
+        disabled.limits = guard_limits(false, 4096, 60);
+        live.replace(disabled);
+        assert!(store.check_disk_guard().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disk_guard_never_touches_existing_sessions() {
+        let rt = make_runtime("keep-running", SessionStatus::Running, "ready\r\n", None);
+        let store = Arc::new(store_with(vec![rt], make_test_db().await));
+        install_disk_guard(
+            &store,
+            guard_limits(true, 4096, 120),
+            Some(1),
+            std::time::SystemTime::now(),
+        );
+
+        let mut config = make_test_config(50);
+        config.limits = guard_limits(true, 4096, 120);
+        let err = SessionStore::start_session_via_handle(&store, &config, start_spec("cmd"))
+            .await
+            .expect_err("guard must refuse the new session");
+        assert!(matches!(err, AppError::DiskGuard(_)));
+
+        // The existing session is untouched: still tracked and not completed.
+        let handle = store
+            .sessions
+            .load()
+            .get("keep-running")
+            .cloned()
+            .expect("existing session survives a guard refusal");
+        assert!(!handle.read().is_completed());
     }
 }

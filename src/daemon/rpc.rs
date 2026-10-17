@@ -19,6 +19,7 @@ use crate::{
 
 use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
 use super::{
+    health::DaemonHealth,
     rpc_attach::{
         handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_mouse,
         handle_attach_resize, handle_attach_subscribe, handle_observe_window,
@@ -43,6 +44,7 @@ pub(super) async fn handle_client(
     session_event_tx: SessionEventTx,
     notification_tx: NotificationTx,
     notifier: NotifierHandle,
+    daemon: DaemonHealth,
 ) -> Result<()> {
     // Peek at the request without consuming the stream so we can decide whether
     // it needs the bidirectional streaming path or the simple req/resp path.
@@ -105,6 +107,7 @@ pub(super) async fn handle_client(
         &session_event_tx,
         &notification_tx,
         &notifier,
+        &daemon,
     )
     .await?;
     ipc::write_response_to_writer(&mut write_half, response).await
@@ -123,11 +126,16 @@ async fn dispatch_request(
     session_event_tx: &SessionEventTx,
     notification_tx: &NotificationTx,
     notifier: &NotifierHandle,
+    daemon: &DaemonHealth,
 ) -> Result<RpcResponse> {
     let response = match request {
         RpcRequest::Health => RpcResponse::Health {
             daemon_pid: std::process::id(),
         },
+        RpcRequest::DaemonStatus => {
+            let status = daemon.report(config, session_store, db).await;
+            RpcResponse::DaemonStatus { status }
+        }
         RpcRequest::DaemonStop { grace_seconds } => {
             handle_daemon_stop(grace_seconds, session_store, shutdown_tx).await
         }
@@ -1002,6 +1010,13 @@ mod tests {
                             let notifier = Arc::new(arc_swap::ArcSwap::from_pointee(
                                 Notifier::with_channels(vec![]),
                             ));
+                            let daemon = crate::daemon::health::DaemonHealth::new(
+                                Arc::new(crate::daemon::components::ComponentRegistry::new()),
+                                Arc::new(crate::disk::DiskMonitor::new(
+                                    live_config.clone(),
+                                    Box::new(crate::disk::OsSpaceProbe),
+                                )),
+                            );
                             let _ = handle_client(
                                 stream,
                                 config,
@@ -1014,6 +1029,7 @@ mod tests {
                                 session_event_tx,
                                 notification_tx,
                                 notifier,
+                                daemon,
                             )
                             .await;
                         });
