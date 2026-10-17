@@ -712,10 +712,36 @@ function SessionDetailPageContent() {
           // Reconnect bookkeeping the effect owns, not the frame table.
           afterOpen: () => {
             connectAttemptStartedAtRef.current = 0
-            lastSentResizeRef.current = null
-            pendingResizeRef.current = null
             resetReconnectAttempts()
             cancelReconnect()
+            // The PTY now holds the handshake viewport (or kept its previous
+            // size when the fit found none). Any size the terminal recomputed
+            // while the socket was connecting was dropped by sendResize (a
+            // no-op until OPEN) or would be cleared below, and xterm only
+            // calls back on the *next* change — so reconcile here, or the PTY
+            // stays on the stale handshake size until some later real resize.
+            // Mirrors the native client's post-handshake resize.
+            if (resizeDebounceRef.current !== null) {
+              clearTimeout(resizeDebounceRef.current)
+              resizeDebounceRef.current = null
+            }
+            pendingResizeRef.current = null
+            // Only a non-degenerate fit is carried as the attach viewport, so
+            // only that can be the size the PTY was just put at.
+            const handshake =
+              initialSize && initialSize.cols > 0 && initialSize.rows > 0 ? initialSize : null
+            const current = termRef.current?.getSize() ?? null
+            const drifted =
+              current !== null &&
+              (handshake === null ||
+                current.cols !== handshake.cols ||
+                current.rows !== handshake.rows)
+            if (drifted && current !== null) {
+              socketRef.current?.sendResize(current.rows, current.cols)
+              lastSentResizeRef.current = current
+            } else {
+              lastSentResizeRef.current = handshake
+            }
           },
           afterClose: (ended, code, reason) => {
             if (ended) return

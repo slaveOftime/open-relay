@@ -171,6 +171,15 @@ primary accent.
   needs an opaque layer beneath _and_ a level above the rows, in both the card
   list and the table (`e2e/sessions-group-collapse.spec.ts` hit-tests the band,
   so only a header that is actually on top passes).
+- **A size remembered at connect time is stale by the time the socket opens.**
+  The attach URL carries the terminal's viewport, but `sendResize` is a no-op
+  until the socket is OPEN and `afterOpen` cleared the pending size; xterm only
+  calls back on the _next_ change, so a refit that landed while connecting (the
+  info bar and the webfont settling) left the PTY drawing for the handshake
+  size until the page was re-entered. Reconcile against the terminal's current
+  size when the socket opens — the native client already did.
+  `e2e/attach-resize.spec.ts` holds a mocked socket in CONNECTING while the
+  viewport changes, so the lost report is deterministic rather than a race.
 
 ## Avoid
 
