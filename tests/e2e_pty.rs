@@ -31,10 +31,23 @@ where
 /// differently from a slow reader, and the daemon log is the only place
 /// that says which; it is not otherwise captured on CI.
 fn transcript_failure_context(tmp: &Path, id: &str, tail: usize) -> String {
-    let journaled = fetch_logs_with_tail(tmp, id, tail);
+    let logs = oly_cmd(tmp)
+        .args(["logs", id, "--tail", &tail.to_string()])
+        .output()
+        .expect("read transcript diagnostics");
+    let info = oly_cmd(tmp)
+        .args(["info", id, "--json"])
+        .output()
+        .expect("read session diagnostics");
+    let journaled = String::from_utf8_lossy(&logs.stdout);
     format!(
-        "journaled lines: {}\nJournaled transcript (tail {tail}):\n{journaled}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
+        "journaled lines: {}\nJournaled transcript (tail {tail}):\n{journaled}\nLogs status: {}\nLogs stderr:\n{}\nSession info ({}):\n{}\nInfo stderr:\n{}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
         journaled.lines().count(),
+        logs.status,
+        String::from_utf8_lossy(&logs.stderr),
+        info.status,
+        String::from_utf8_lossy(&info.stdout),
+        String::from_utf8_lossy(&info.stderr),
         fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default(),
         fs::read_dir(tmp.join("oly/logs"))
             .into_iter()
@@ -823,49 +836,78 @@ fn e2e_windows_exited_producers_keep_tail_through_console_close() {
 
 #[test]
 fn e2e_logs_keep_color_preserves_ansi_codes() {
+    assert!(
+        program_exists("node"),
+        "real-PTY color fixture requires Node.js"
+    );
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_keep_color");
-    let _daemon = start_daemon(&tmp);
-
-    #[cfg(target_os = "windows")]
-    let cmd: &[&str] = &[
-        "powershell.exe",
-        "-NoProfile",
-        "-Command",
-        "Write-Host 'COLOR_TEST' -ForegroundColor Red",
-    ];
-    #[cfg(not(target_os = "windows"))]
-    let cmd: &[&str] = &["sh", "-c", "printf '\\033[31mCOLOR_TEST\\033[0m\\n'"];
-
-    let id = start_session(&tmp, cmd);
-
-    let expected_plain = plain_output(["COLOR_TEST"]);
-    wait_for_exact_log(&tmp, &id, &expected_plain, native_shell_timeout()).unwrap_or_else(|| {
-        panic!(
-            "plain logs did not match exact expected color-stripped output.\nLogs:\n{}",
-            fetch_logs(&tmp, &id)
-        )
-    });
-
-    let plain = normalize_log_text(&fetch_logs(&tmp, &id));
-    assert_eq!(
-        plain, expected_plain,
-        "plain logs should match the exact expected color-stripped output.\nLogs:\n{plain}"
+    let daemon = start_daemon(&tmp);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/color_probe.cjs"
     );
+    let id = start_session(&tmp, &["node", fixture]);
 
-    let colored = oly_cmd(&tmp)
-        .args(["logs", &id, "--tail", "200", "--color", "always"])
+    // Test rendering, not PowerShell startup/Write-Host behavior or a race
+    // with a one-shot producer exiting. Acknowledge only after both reads.
+    assert!(
+        wait_for_exact_log(&tmp, &id, "COLOR_TEST", native_shell_timeout()).is_some(),
+        "color producer did not become ready.\n{}",
+        transcript_failure_context(&tmp, &id, 200)
+    );
+    assert_color_logs(&tmp, &id);
+    send_text_only(&tmp, &id, "x");
+    let ended = oly_cmd(&tmp)
+        .args(["logs", &id, "--wait", "exit", "--timeout", "15s"])
         .output()
-        .expect("`oly logs --color always` failed");
-    let colored_text = String::from_utf8_lossy(&colored.stdout);
+        .unwrap();
     assert!(
-        colored_text.contains("COLOR_TEST"),
-        "colored logs should contain text.\nLogs:\n{colored_text}"
+        ended.status.success(),
+        "color producer did not exit.\n{}",
+        transcript_failure_context(&tmp, &id, 200)
     );
-    assert!(
-        colored_text.contains('\x1b'),
-        "colored logs should contain ANSI escape sequences.\nLogs:\n{colored_text}"
-    );
+    let info = oly_cmd(&tmp)
+        .args(["info", &id, "--json"])
+        .output()
+        .unwrap();
+    assert!(info.status.success());
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info["exit_code"], 0, "color producer failed: {info}");
+
+    // A restarted daemon must recover the same text AND foreground color
+    // from the persisted journal, not an in-memory terminal snapshot.
+    drop(daemon);
+    let _restarted = start_daemon(&tmp);
+    assert_color_logs(&tmp, &id);
+}
+
+fn assert_color_logs(tmp: &Path, id: &str) {
+    for color in ["never", "always"] {
+        let output = oly_cmd(tmp)
+            .args(["logs", id, "--tail", "200", "--color", color])
+            .output()
+            .expect("read color logs");
+        assert!(
+            output.status.success(),
+            "logs --color {color} failed.\n{}",
+            transcript_failure_context(tmp, id, 200)
+        );
+        let text = normalize_log_text(&String::from_utf8_lossy(&output.stdout));
+        if color == "never" {
+            assert_eq!(text, "COLOR_TEST", "plain logs must strip color");
+        } else {
+            assert!(
+                text.contains("COLOR_TEST"),
+                "colored text missing: {text:?}"
+            );
+            // A reset/ConPTY control byte alone doesn't prove color survived.
+            assert!(
+                text.contains("\x1b[0;31mCOLOR_TEST"),
+                "red foreground missing: {text:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -13,6 +13,21 @@ Other embedded skills: `oly skill --subagent` (multi-agent orchestration), `oly 
 - **Use `oly start`** when a command is interactive/TUI, may prompt later, must survive terminal disconnects, or needs durable logs/handoff. Run short, non-interactive commands (`git`, `ls`, `rg`, quick tests) directly in the shell.
 - **Daemon check:** Run `oly daemon status`. Start with `oly daemon start --detach` **only if confirmed stopped**. Never stop/restart a shared running daemon. In a sandbox, `Access is denied` means IPC is blocked while the daemon may still be running — retry the `oly` command with approval/escalation.
 
+### Secondary nodes
+
+`oly join ls` on the secondary reports saved outbound joins and their live
+connection state; `oly node ls` on the primary reports connected secondaries.
+`join ls --primary` lists inbound nodes, not outbound connectors. Both ends
+close links after 45s without authenticated inbound traffic and retry joins
+with backoff (reset after success); socket/channel sends have deadlines.
+Multiple outbound primaries use distinct saved names and independent connectors;
+reusing a name replaces and cancels its old connector. Invalid/unreadable
+`joins.json` fails explicitly instead of silently skipping joins. If local
+saved joins and daemon logs disagree with CLI output, check state/IPC routing
+before restarting anything. Linux defaults are scoped by state path and WSL
+distribution; explicit `OLY_SOCKET_NAME` must match daemon and CLI and be unique
+across independent environments. See `oly skill --daemon` for upgrade cautions.
+
 ## Core workflow
 
 ### 1) Start

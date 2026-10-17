@@ -26,17 +26,29 @@ fn joins_path(config: &AppConfig) -> std::path::PathBuf {
     config.paths.state_dir.join("joins.json")
 }
 
-pub fn load_join_configs(config: &AppConfig) -> Vec<JoinConfig> {
+pub fn load_join_configs(config: &AppConfig) -> Result<Vec<JoinConfig>> {
     let path = joins_path(config);
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(AppError::Protocol(format!(
+                "failed to read join configuration at {}: {err}",
+                path.display()
+            )));
+        }
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    serde_json::from_str(&data).map_err(|err| {
+        AppError::Protocol(format!(
+            "invalid join configuration at {}: {err}",
+            path.display()
+        ))
+    })
 }
 
 pub fn save_join_config(config: &AppConfig, join: &JoinConfig) -> Result<()> {
     let path = joins_path(config);
-    let mut joins = load_join_configs(config);
+    let mut joins = load_join_configs(config)?;
     joins.retain(|j| j.name != join.name);
     joins.push(join.clone());
     let data = serde_json::to_string_pretty(&joins)?;
@@ -50,29 +62,29 @@ pub fn save_join_config(config: &AppConfig, join: &JoinConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_join_config(config: &AppConfig, name: &str) -> bool {
+pub fn remove_join_config(config: &AppConfig, name: &str) -> Result<bool> {
     let path = joins_path(config);
-    let mut joins = load_join_configs(config);
+    let mut joins = load_join_configs(config)?;
     let before = joins.len();
     joins.retain(|j| j.name != name);
     if joins.len() < before {
-        let data = serde_json::to_string_pretty(&joins).unwrap_or_default();
-        let _ = std::fs::write(&path, data);
-        true
+        let data = serde_json::to_string_pretty(&joins)?;
+        std::fs::write(&path, data)?;
+        Ok(true)
     } else {
-        false
+        Ok(false)
     }
 }
 
-pub fn list_join_summaries(config: &AppConfig) -> Vec<JoinSummary> {
-    load_join_configs(config)
+pub fn list_join_summaries(config: &AppConfig) -> Result<Vec<JoinSummary>> {
+    Ok(load_join_configs(config)?
         .into_iter()
         .map(|j| JoinSummary {
             name: j.name,
             primary_url: j.primary_url,
-            connected: false, // live status is known only inside the daemon
+            connected: false, // filled from connector state by the daemon
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +231,7 @@ pub async fn run_join(
 
 /// `oly join stop` — remove persisted config and signal the local daemon to disconnect.
 pub async fn run_join_stop(config: &AppConfig, name: String) -> Result<()> {
-    let removed = remove_join_config(config, &name);
+    let removed = remove_join_config(config, &name)?;
     if !removed {
         eprintln!("warning: no saved join config found for \"{name}\"");
     }
