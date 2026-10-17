@@ -71,10 +71,10 @@ pub(super) async fn handle_attach_subscribe(
     let attachment_id = registration.attachment_id;
     let current_role = registration.role;
 
-    // Local IPC clients ack applied cursors, so their stream is
-    // credit-gated; node-relayed subscriptions arrive with `credited:
-    // false` and run ungated (the relay cannot forward mid-stream credits
-    // — documented limitation until direct remote streams).
+    // Credit-gated only when the client asks for it. Local IPC clients
+    // ack applied cursors; node-relayed subscriptions carry the client's
+    // `credited` flag and the relay forwards `AttachAppliedCursor`
+    // mid-stream, so remote controllers are gated by the owning node too.
     let credit = if credited {
         crate::session::PumpCredit::Credited { attachment_id }
     } else {

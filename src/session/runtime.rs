@@ -204,9 +204,10 @@ pub struct SequencedChunk {
 pub(crate) const JOURNAL_CHECKPOINT_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Atomic-monotonic publication of the last retention sweep's outcome:
-/// `sealing_passes` and the dropped/swept counters are surfaced on the
-/// session list; `bytes_retained` is read on demand. Together they show
-/// whether the byte-budget cap is actually firing.
+/// the sweep count and the dropped/swept counters are surfaced on the
+/// session list; `bytes_retained` is read on demand. The counters remain
+/// useful even though production runs with the byte budget disabled
+/// (`0`), because the sweep still reports the retained prefix size.
 #[derive(Debug)]
 struct RetentionStats {
     bytes_retained: std::sync::atomic::AtomicU64,
@@ -224,9 +225,8 @@ impl Default for RetentionStats {
     }
 }
 
-/// Retention-stats handle + shared byte cap, cloned into the retention
-/// thread so the daemon can hot-reload the cap without touching every
-/// session in place.
+/// Retention-stats handle, cloned into the retention thread so sweep
+/// outcomes are published without taking the runtime write lock.
 #[derive(Debug, Default, Clone)]
 pub struct RetentionHandle {
     stats: Arc<RetentionStats>,
@@ -357,16 +357,14 @@ pub struct SessionRuntime {
     /// `Failed`) instead of continuing to run unrecorded. Atomic because
     /// `journal_event` only holds `&self`.
     pub journal_failed: std::sync::atomic::AtomicBool,
-    /// Pointer into the daemon's shared journal byte cap. The retention
-    /// thread re-loads it on every sweep, so a daemon hot reload
-    /// (`store.set_journal_byte_cap`) is visible to every live
-    /// session without a restart. 0 = unlimited (the historical,
-    /// historical behaviour: 0 = no cap).
+    /// Pointer into the store's journal byte budget. Production passes
+    /// `0` (unlimited): a cap cannot bound the current incarnation, so
+    /// live journal deletion stays disabled and a sweep at `0` deletes
+    /// nothing. Tests configure a non-zero budget to exercise the
+    /// checkpoint-gated primitives.
     pub journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
-    /// Handle to the journal byte cap + lock-free retention stats.
-    /// Populated by `spawn_session` and shared (via the inner `Arc`)
-    /// with the retention thread so a hot-reloaded cap is
-    /// visible without re-spawning the runtime.
+    /// Handle to the retention sweep's lock-free stats, shared with the
+    /// retention thread spawned at each checkpoint.
     pub retention: RetentionHandle,
 }
 
@@ -388,10 +386,11 @@ const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Run one byte-budgeted journal retention sweep.
 ///
 /// Convenience wrapper around `journal::min_incarnation_for_byte_budget` +
-/// `journal::retain_before`. The function never panics on journal I/O:
-/// errors propagate so the runtime can log and retry on the next
-/// checkpoint. The function updates the [`RetentionHandle`] stats after
-/// every successful call so `to_summary()` can publish them later.
+/// `journal::retain_before`. With the production budget `0` this only
+/// refreshes the retained-prefix stats. The function never panics on
+/// journal I/O: errors propagate so the runtime can log and retry on the
+/// next checkpoint. The function updates the [`RetentionHandle`] stats
+/// after every successful call so `to_summary()` can publish them later.
 fn run_retention_sweep(
     session_dir: &Path,
     byte_cap: &Arc<std::sync::atomic::AtomicU64>,

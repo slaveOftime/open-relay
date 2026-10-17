@@ -100,6 +100,50 @@ Source and fixtures are authoritative: `src/protocol.rs`, `src/ipc.rs`,
 `web/src/api/ws-frames.ts`, and `tests/fixtures/ws_frames.json`. Prefer the
 packaged CLI's JSON/cursor/export commands over implementing private IPC.
 
+## Version and storage decisions
+
+These decisions constrain how upcoming capabilities may ship. Nothing
+here extends what 0.5.x already supports, and the per-axis versions stay
+what the sections above state.
+
+- **One version per axis.** External CLI JSON, the private IPC envelope
+  (`Protocol **14**`), the browser WS frame layout, SSE view notifications,
+  the federation handshake, and the journal/SQLite formats are separate
+  contracts. A change on one axis never implies compatibility on another.
+- **New semantic records use a new journal format version.** When the
+  event work lands it extends the record format explicitly and writes it
+  through the existing sequencer. New readers keep reading old recordings;
+  old readers reject an unknown future version instead of presenting empty
+  history; existing journals are never rewritten in place. One journal
+  stays the only recording.
+- **Exclusive control is opt-in.** Shared control and observe mode remain
+  the default. Per-session exclusive mode must be requested explicitly;
+  a client that does not understand it is refused or restricted to a true
+  read-only path, never silently downgraded to an unrestricted controller.
+- **Machine interfaces negotiate before they act.** The planned public
+  supervisor interface answers a version/capability query first, and
+  unsupported operations fail with an explicit error instead of emulating
+  success. Planned capabilities: version/mode query, list/info, output
+  cursors, semantic-event cursors and pending-item snapshots, control
+  request/release, input receipts, and correlated result messages. Only
+  the query itself is a stable promise once shipped.
+- **Federation stays experimental** until identity life cycle (including
+  revocation), upgrade drills, and the storage decisions above are
+  exercised.
+
+Response rules for the unsupported and malformed cases are part of the
+contract:
+
+| Situation | Required response |
+|---|---|
+| Unknown future journal version | explicit unsupported-version error; never empty history |
+| Peer lacks a requested capability (planned) | explicit refusal naming the capability |
+| Unknown optional field in CLI JSON or private IPC JSON | ignored (additions stay forward-compatible) |
+| Unknown field in a federation envelope | rejected on field-bearing variants; unit `joined`, `ping`, and `pong` tolerate extras (serde limit); nested RPC JSON follows the IPC rules — the handshake version is the gate |
+| Unknown IPC type tag or missing required field | protocol error |
+| Wrong-session, stale-incarnation, or past-end cursor | explicit cursor error naming the condition |
+| Delivered request rejected by the daemon | request-failure error; never reported as daemon-unavailable |
+
 ## Before stable 0.5
 
 Freeze the CLI/JSON/config contract deliberately; validate backup/upgrade/rollback

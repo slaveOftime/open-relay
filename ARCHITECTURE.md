@@ -454,6 +454,30 @@ opt-in and observable state/list/prompt/export behavior; Unix keeps query/reply
 coverage. The pi terminal library was separately reproduced with automatic
 failure and successful opt-in on Windows build 26200.
 
+## Version axes
+
+Each contract below evolves on its own axis; a change on one is never
+assumed to be compatible on another. Version mismatch is a loud failure,
+not a best-effort fallback.
+
+| Axis | Where the version lives | Policy |
+|---|---|---|
+| CLI JSON | documented schemas; `v` where the guide says so | additive fields; consumers ignore unknown ones |
+| Private IPC | `{"version":N,"payload":...}` envelope (`PROTOCOL_VERSION`) | exact match; mismatch is an explicit protocol error |
+| Browser WS | binary layout pinned by `tests/fixtures/ws_frames.json` | encoder and decoder conformance vectors must both pass |
+| SSE | bounded view notifications; gaps trigger a REST resync | not a durable cursor or event log |
+| Federation | signed handshake binds `FEDERATION_VERSION` | no mixed-version rollout; unsupported fails closed |
+| Journal | `RECORD_VERSION` in each record header | new readers read old; unknown future versions are rejected, never treated as empty |
+| SQLite | forward-only migrations | rollback by restoring a backup, never by an old binary |
+
+Recorded decisions that constrain upcoming work (not shipped): semantic records
+arrive as a new journal format version through the existing sequencer
+(no in-place rewrite of old journals, no second recording); exclusive
+control is per-session opt-in while shared control stays the default; a
+public machine interface starts with a version/capability query and
+refuses unsupported operations explicitly. See the compatibility policy
+for the response rules.
+
 ## Deliberate trade-offs
 
 - **Journal (ADR-0002/0006):** one ordered recording avoids divergent persisted

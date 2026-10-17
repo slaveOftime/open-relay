@@ -76,11 +76,11 @@ impl CreditPolicy {
 
 /// Whether an attachment's stream is credit-gated.
 ///
-/// Local IPC and WebSocket clients report applied-cursor acks, so their
-/// streams are gated. Node-relayed subscriptions are the documented
-/// exception: the relay carries one request per stream and cannot forward
-/// mid-stream credits, so those pumps run uncredited (fail-open) until
-/// direct remote attachment streams land.
+/// The CLI and web clients report applied-cursor acks, so their streams
+/// (including node-relayed ones) are gated: `AttachAppliedCursor` is a
+/// relayable mid-stream message, so the owning node enforces the budget
+/// for remote controllers too. `Uncredited` is the fail-open choice for
+/// callers that never ack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpCredit {
     Uncredited,
@@ -152,7 +152,7 @@ pub struct AttachPump {
     /// Bounded waits for the async journal flush (see FLUSH_RETRY_MAX).
     flush_retries: u8,
     /// Credit gate: the client's shared applied-cursor cell plus the
-    /// enforcement policy. `None` for uncredited (node-relayed) streams.
+    /// enforcement policy. `None` for uncredited (non-acking) streams.
     credit: Option<(Arc<AtomicU64>, CreditPolicy)>,
 }
 

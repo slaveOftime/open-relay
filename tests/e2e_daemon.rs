@@ -2124,6 +2124,21 @@ fn e2e_logs_waits_prints_and_hands_back_a_cursor() {
     let read: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("baseline read emits one JSON line");
     assert_eq!(read["session"].as_str(), Some(id.as_str()));
+    // Frozen shape: documented keys must exist and `v` stays 1.
+    for key in [
+        "v",
+        "session",
+        "mode",
+        "width",
+        "running",
+        "exit_code",
+        "status",
+        "cursor",
+        "content",
+    ] {
+        assert!(read.get(key).is_some(), "read JSON missing {key}: {read}");
+    }
+    assert_eq!(read["v"], 1);
     assert!(
         read["content"]
             .as_str()
@@ -2208,6 +2223,26 @@ fn e2e_logs_waits_prints_and_hands_back_a_cursor() {
     );
     let window: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    // Frozen stream-page shape: the documented keys and encodings.
+    for key in [
+        "v",
+        "session",
+        "mode",
+        "encoding",
+        "bytes",
+        "start_cursor",
+        "cursor",
+        "has_more",
+        "running",
+        "exit_code",
+    ] {
+        assert!(
+            window.get(key).is_some(),
+            "stream page missing {key}: {window}"
+        );
+    }
+    assert_eq!(window["mode"], "stream");
+    assert_eq!(window["encoding"], "base64");
     let bytes = base64::Engine::decode(
         &base64::prelude::BASE64_STANDARD,
         window["bytes"].as_str().unwrap(),
@@ -2433,6 +2468,49 @@ fn e2e_logs_waits_prints_and_hands_back_a_cursor() {
     assert!(
         !output.status.success(),
         "a cursor from another session must be rejected, not silently ignored"
+    );
+
+    // A stale-incarnation token (an earlier run of this session) fails
+    // explicitly instead of reading a coincidental window.
+    let stale = base64::Engine::encode(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD,
+        format!("v1|{id}|0|0"),
+    );
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--since", &stale])
+        .output()
+        .expect("stale cursor read ran");
+    assert!(!output.status.success(), "a stale cursor must be rejected");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("stale"),
+        "stale cursor error should say so: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A token past the stream end is rejected, not clamped silently.
+    let decoded = base64::Engine::decode(&base64::prelude::BASE64_URL_SAFE_NO_PAD, &token)
+        .expect("decode captured token");
+    let decoded = String::from_utf8(decoded).expect("token is utf-8");
+    let mut fields = decoded.split('|');
+    let version = fields.next().unwrap();
+    let token_session = fields.next().unwrap();
+    let incarnation = fields.next().unwrap();
+    let past_end = base64::Engine::encode(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD,
+        format!("{version}|{token_session}|{incarnation}|{}", u64::MAX),
+    );
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--since", &past_end])
+        .output()
+        .expect("past-end cursor read ran");
+    assert!(
+        !output.status.success(),
+        "a past-end cursor must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("past the stream end"),
+        "past-end error should say so: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

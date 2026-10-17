@@ -103,7 +103,10 @@ class DocsSyncTests(unittest.TestCase):
             with self.subTest(skill=path.parent.name):
                 self.assertTrue(text.startswith(f"---\nname: {path.parent.name}\n"))
                 self.assertRegex(text, r"\ndescription: .+\n---\n")
-                self.assertIn(f'include_str!("../{path.relative_to(ROOT)}")', main)
+                # Rust `include_str!` paths in src/main.rs always use '/'
+                # (rustc resolves them cross-platform), while `Path` renders
+                # with '\' on Windows — compare in the source representation.
+                self.assertIn(f'include_str!("../{path.relative_to(ROOT).as_posix()}")', main)
 
     def test_prompt_defaults_match_source(self):
         source_list = CONFIG.split("const DEFAULT_PROMPT_PATTERNS: &[&str] = &[", 1)[1].split("\n];", 1)[0]
