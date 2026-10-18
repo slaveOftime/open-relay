@@ -125,6 +125,14 @@ primary accent.
   count for a live session and a plain `formatTimestamp` for a finished one, so
   a list of finished sessions runs no timer.
 
+## Terminal theme
+
+- `index.css` resolves the scheme in two steps: an explicit `data-theme` on
+  `<html>` wins, otherwise `prefers-color-scheme`. `components/terminal/xterm-theme.ts`
+  mirrors that resolution and owns the subscription to both sources; `XTerm`
+  only repaints when it fires, so an OS flip or a runtime override rethemes a
+  live terminal instead of waiting for a remount.
+
 ## Lessons — the ones that cost a debugging session
 
 - **Unstable hook dependencies.** An object literal passed into a hook and

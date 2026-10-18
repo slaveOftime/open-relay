@@ -32,6 +32,7 @@ export default defineConfig({
       },
       workbox: {
         globIgnores: ['**/index.html'],
+        navigateFallback: null,
         // Do NOT add runtimeCaching rules for /api/ routes.
         //
         // On iOS PWA (standalone mode) WebKit routes WebSocket upgrade requests
@@ -46,34 +47,12 @@ export default defineConfig({
         // normal network path. Leaving no matching route for /api/ means Workbox
         // never calls respondWith(), so the browser handles those requests
         // natively.
-        runtimeCaching: [
-          {
-            urlPattern: ({ request, sameOrigin, url }) => {
-              if (!sameOrigin) return false
-              if (url.pathname.startsWith('/api/')) return false
-              return ['style', 'script', 'worker'].includes(request.destination)
-            },
-            handler: 'StaleWhileRevalidate',
-            options: {
-              cacheName: 'static-assets',
-            },
-          },
-          {
-            urlPattern: ({ request, sameOrigin, url }) => {
-              if (!sameOrigin) return false
-              if (url.pathname.startsWith('/api/')) return false
-              return ['font', 'image'].includes(request.destination)
-            },
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'media-assets',
-              expiration: {
-                maxEntries: 128,
-                maxAgeSeconds: 60 * 60 * 24 * 30,
-              },
-            },
-          },
-        ],
+        // Runtime Cache Storage strategies do not honor HTTP no-cache/private
+        // directives. They can shadow mutable public media or serve trusted
+        // app scripts after auth is revoked. Only the build's revisioned
+        // precache is worker-owned; all other requests use the browser's HTTP
+        // cache and the daemon's validators. Old runtime caches remain unused.
+        runtimeCaching: [],
       },
     }),
   ],
@@ -122,6 +101,9 @@ export default defineConfig({
     include: ['src/**/*.test.{ts,tsx}'],
   },
   build: {
+    // Proves build provenance to the daemon: copied public files and operator
+    // overrides must not earn immutable caching from filename shape alone.
+    manifest: true,
     target: 'es2020',
     sourcemap: false,
     minify: 'oxc',
@@ -129,6 +111,14 @@ export default defineConfig({
     reportCompressedSize: true,
     rollupOptions: {
       output: {
+        // Every bundle file must keep a content hash in its name: the daemon
+        // caches manifest-listed `assets/<name>-<hash8>.<ext>` immutably in
+        // release builds (see src/http/static_files.rs).
+        // Vite's defaults already hash these, but pinning the pattern here
+        // keeps the contract explicit and covered by review.
+        entryFileNames: 'assets/[name]-[hash:8].js',
+        chunkFileNames: 'assets/[name]-[hash:8].js',
+        assetFileNames: 'assets/[name]-[hash:8][extname]',
         // Keep heavy runtime deps in separate chunks for better browser caching.
         manualChunks(id) {
           if (id.includes('node_modules/@xterm/')) return 'xterm'

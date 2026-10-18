@@ -27,6 +27,27 @@ A daemon is required for real sessions. The release binary embeds `web/dist`;
 debug builds use the development frontend. Use isolated daemon state when
 working on the project; see [Contributing](../CONTRIBUTING.md).
 
+Release builds cache only manifest-listed, content-hashed bundle files under
+`assets/` immutably (`public, max-age=31536000, immutable`). Keep both the
+pinned hash naming and `build.manifest` in `vite.config.ts`; filename shape
+alone is not proof of a generated asset. Unknown names, copied `public/` files,
+`index.html`, and worker scripts use `no-cache`. Debug builds revalidate all
+files. The implementation is in `src/http/static_files.rs`.
+
+Static files support GET/HEAD; other methods return 405. Every successful
+static response has a weak SHA-256 ETag, valid across identity/gzip/br encoding,
+with bodyless 304 revalidation and `Vary: Accept-Encoding`. Disk files are
+hashed from the actual response bytes, not approximate length/mtime metadata.
+Trusted apps and `wwwroot` overrides use `private, no-cache`, regardless of
+their names. Do not reuse generated bundle URLs for mutable overrides: clients
+may already have an immutable public copy under that URL.
+
+The PWA keeps only its build-revisioned precache. Navigations and other runtime
+requests use the network/browser HTTP cache, so mutable media revalidates and
+app requests still reach auth. There is no stale/offline runtime-cache fallback;
+legacy `static-assets`/`media-assets` caches are no longer read. Already installed
+old workers retain their behavior until the updated worker activates.
+
 ## Checks
 
 | Command                                  | What it runs                                         |
@@ -40,7 +61,9 @@ working on the project; see [Contributing](../CONTRIBUTING.md).
 
 Install the matching Playwright browser before E2E (`npx playwright install
 chromium`, or `webkit`). The E2E server builds and previews the UI on port 4173;
-specs mock API transports and do not certify a shipped daemon's auth/PTY behavior.
+most specs mock API transports and do not certify a shipped daemon's auth/PTY
+behavior. `static-cache.spec.ts` explicitly enables the built worker against an
+isolated HTTP fixture to check precaching, revalidation, and uncached 401s.
 CI runs Chromium; mobile Safari and actual phone/PWA behavior need separate evidence.
 
 ## Layout

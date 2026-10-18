@@ -5,6 +5,7 @@ pub mod nodes;
 mod reverse_proxy;
 pub mod sessions;
 pub mod sse;
+mod static_files;
 pub mod ws;
 
 use axum::{
@@ -17,7 +18,6 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use std::{
-    io,
     path::{Component, Path},
     sync::Arc,
 };
@@ -37,6 +37,7 @@ use crate::{
 };
 
 pub use sse::{EncodedSessionEvent, run_event_encoder};
+use static_files::{StaticAsset, read_local_asset, read_static_file};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -308,8 +309,8 @@ async fn serve_static_or_proxy(
             {
                 return response;
             }
-            match try_read_static_file(&candidate).await {
-                Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
+            match read_static_file(&candidate).await {
+                Ok(Some(file)) => return file.into_response(&method, &candidate, &headers),
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(err) => {
                     error!(%err, path = %candidate.display(), "failed to read app static file");
@@ -371,8 +372,8 @@ async fn serve_static_or_proxy(
         {
             return response;
         }
-        match try_read_local_asset(&wwwroot_dir, &candidate).await {
-            Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
+        match read_local_asset(&wwwroot_dir, &candidate).await {
+            Ok(Some(file)) => return file.into_response(&method, &candidate, &headers),
             Ok(None) => {}
             Err(err) => {
                 error!(%err, path = %candidate, "failed to read static file from wwwroot");
@@ -383,7 +384,8 @@ async fn serve_static_or_proxy(
 
     for candidate in &candidates {
         if let Some(asset) = WebAssets::get(candidate) {
-            return build_bytes_response(candidate, asset.data.into_owned());
+            return StaticAsset::embedded(candidate, asset)
+                .into_response(&method, candidate, &headers);
         }
     }
 
@@ -398,15 +400,23 @@ async fn serve_static_or_proxy(
 
     let default_asset_name = "index.html";
     if let Some(asset) = WebAssets::get(default_asset_name) {
-        return build_bytes_response(default_asset_name, asset.data.into_owned());
+        return StaticAsset::embedded(default_asset_name, asset).into_response(
+            &method,
+            default_asset_name,
+            &headers,
+        );
     }
 
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn serve_login_page() -> Response {
+async fn serve_login_page(method: Method, headers: HeaderMap) -> Response {
     match WebAssets::get("index.html") {
-        Some(asset) => build_bytes_response("index.html", asset.data.into_owned()),
+        Some(asset) => StaticAsset::embedded("index.html", asset).into_response(
+            &method,
+            "index.html",
+            &headers,
+        ),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -523,36 +533,6 @@ fn normalize_static_path(path: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
-}
-
-async fn try_read_local_asset(wwwroot: &Path, relative_path: &str) -> io::Result<Option<Vec<u8>>> {
-    let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    try_read_static_file(&full_path).await
-}
-
-async fn try_read_static_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let full_path = path;
-    match tokio::fs::metadata(&full_path).await {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(None),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    }
-
-    Ok(Some(tokio::fs::read(full_path).await?))
-}
-
-fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::response::Response {
-    let path = path.as_ref();
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            mime.essence_str().to_owned(),
-        )],
-        bytes,
-    )
-        .into_response()
 }
 
 /// `GET /api/ready` — readiness probe: 200 only while every

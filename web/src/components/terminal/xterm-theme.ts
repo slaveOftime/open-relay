@@ -1,16 +1,51 @@
 /**
  * The xterm color palette for light and dark.
  *
- * xterm applies one theme at a time, so `getTerminalTheme()` reads the media
- * query when the terminal is created; the app calls it again when the scheme
- * changes. Moved out of XTerm.tsx as pure data so the renderer holds
- * rendering only.
+ * xterm applies one theme at a time, so `getTerminalTheme()` resolves the
+ * scheme exactly like `index.css` does — an explicit `data-theme` on <html>
+ * wins over `prefers-color-scheme`. `subscribeTerminalColorScheme()` reports
+ * either source changing, so an attached terminal repaints with the rest of
+ * the app. Moved out of XTerm.tsx as data so the renderer holds rendering only.
  */
 
 import type { ITheme } from '@xterm/xterm'
 
+export type TerminalColorScheme = 'light' | 'dark'
+
+/** The scheme the app's tokens are rendering under right now. */
+export function resolveTerminalColorScheme(): TerminalColorScheme {
+  const explicit = document.documentElement.dataset.theme
+  if (explicit === 'light' || explicit === 'dark') return explicit
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+/**
+ * Calls `onChange` when the resolved scheme changes: the OS preference flips,
+ * or `data-theme` is set, changed, or removed. The scheme in force at
+ * subscribe time is not reported.
+ */
+export function subscribeTerminalColorScheme(
+  onChange: (scheme: TerminalColorScheme) => void
+): () => void {
+  let previous = resolveTerminalColorScheme()
+  const report = () => {
+    const next = resolveTerminalColorScheme()
+    if (next === previous) return
+    previous = next
+    onChange(next)
+  }
+  const media = window.matchMedia('(prefers-color-scheme: dark)')
+  media.addEventListener('change', report)
+  const observer = new MutationObserver(report)
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
+  return () => {
+    media.removeEventListener('change', report)
+    observer.disconnect()
+  }
+}
+
 export function getTerminalTheme(): ITheme {
-  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
+  const dark = resolveTerminalColorScheme() === 'dark'
   if (dark) {
     return {
       background: '#030712',

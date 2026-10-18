@@ -31,6 +31,12 @@ Create `<ROOT>/wwwroot/apps/<app-name>/oly.app.json`:
 
 - `app_type: "spa"` is a display hint only; use hash routing or `"redirect_files": ["index.html"]` for history-route fallback (prefer `/apps/<app-name>/` asset paths so deep links resolve assets cleanly).
 - Every path in `redirect_files` must already exist on disk or the manifest is rejected.
+- Local app files support GET/HEAD and always use `private, no-cache` with
+  content-based ETags, even for hash-shaped filenames. Conditional requests
+  still require auth. Other static methods return 405; proxies keep their
+  own method/cache behavior. The built-in PWA does not runtime-cache apps.
+- Keep app assets under `/apps/<app-name>/`; do not replace generated UI bundle
+  URLs with mutable files, since a browser may already have an immutable copy.
 
 ### Loopback service proxy (`oly.app.json`)
 
