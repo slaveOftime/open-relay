@@ -191,8 +191,12 @@ primary accent.
   the scroll offset is `sessionStorage` and is applied after the rows render —
   a `scrollTop` write against the loading skeleton just clamps. The hidden list
   is `display:none` and would clamp the same write to 0, so the restore picks
-  the element with an `offsetParent`. `sessions-scroll.spec.ts` covers both
-  scrollports.
+  the element with an `offsetParent`. The offset is read once per mount and the
+  restore retries until it lands, because a foreground reload blanks the list
+  while it runs — taking the rows away cancels the pending frame, and the
+  collapsed content clamps the old offset to 0. Scrolls seen while the list has
+  no rows are that clamp, not the user, and are not saved. `sessions-scroll.spec.ts`
+  covers both scrollports and the interrupting reload.
 
 ## Avoid
 
