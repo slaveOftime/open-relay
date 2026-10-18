@@ -27,6 +27,12 @@ A daemon is required for real sessions. The release binary embeds `web/dist`;
 debug builds use the development frontend. Use isolated daemon state when
 working on the project; see [Contributing](../CONTRIBUTING.md).
 
+Every bundle filename keeps a content hash under `assets/` (pinned in
+`vite.config.ts`). The daemon caches those immutable and revalidates everything
+else (`index.html`, the service worker, and files copied from `public/`), so
+keep the hashed output naming when changing the build; the matching rule is
+`is_content_hashed_asset` in `src/http/mod.rs`.
+
 ## Checks
 
 | Command                                  | What it runs                                         |

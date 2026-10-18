@@ -309,7 +309,11 @@ async fn serve_static_or_proxy(
                 return response;
             }
             match try_read_static_file(&candidate).await {
-                Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
+                Ok(Some(file)) => {
+                    return build_bytes_response(
+                        &method, &candidate, file.bytes, &file.etag, &headers,
+                    );
+                }
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(err) => {
                     error!(%err, path = %candidate.display(), "failed to read app static file");
@@ -372,7 +376,9 @@ async fn serve_static_or_proxy(
             return response;
         }
         match try_read_local_asset(&wwwroot_dir, &candidate).await {
-            Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
+            Ok(Some(file)) => {
+                return build_bytes_response(&method, &candidate, file.bytes, &file.etag, &headers);
+            }
             Ok(None) => {}
             Err(err) => {
                 error!(%err, path = %candidate, "failed to read static file from wwwroot");
@@ -383,7 +389,14 @@ async fn serve_static_or_proxy(
 
     for candidate in &candidates {
         if let Some(asset) = WebAssets::get(candidate) {
-            return build_bytes_response(candidate, asset.data.into_owned());
+            let etag = etag_from_sha256(asset.metadata.sha256_hash());
+            return build_bytes_response(
+                &method,
+                candidate,
+                asset.data.into_owned(),
+                &etag,
+                &headers,
+            );
         }
     }
 
@@ -398,15 +411,31 @@ async fn serve_static_or_proxy(
 
     let default_asset_name = "index.html";
     if let Some(asset) = WebAssets::get(default_asset_name) {
-        return build_bytes_response(default_asset_name, asset.data.into_owned());
+        let etag = etag_from_sha256(asset.metadata.sha256_hash());
+        return build_bytes_response(
+            &method,
+            default_asset_name,
+            asset.data.into_owned(),
+            &etag,
+            &headers,
+        );
     }
 
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn serve_login_page() -> Response {
+async fn serve_login_page(headers: HeaderMap) -> Response {
     match WebAssets::get("index.html") {
-        Some(asset) => build_bytes_response("index.html", asset.data.into_owned()),
+        Some(asset) => {
+            let etag = etag_from_sha256(asset.metadata.sha256_hash());
+            build_bytes_response(
+                &Method::GET,
+                "index.html",
+                asset.data.into_owned(),
+                &etag,
+                &headers,
+            )
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -525,34 +554,192 @@ fn normalize_static_path(path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-async fn try_read_local_asset(wwwroot: &Path, relative_path: &str) -> io::Result<Option<Vec<u8>>> {
+async fn try_read_local_asset(
+    wwwroot: &Path,
+    relative_path: &str,
+) -> io::Result<Option<StaticFile>> {
     let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     try_read_static_file(&full_path).await
 }
 
-async fn try_read_static_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let full_path = path;
-    match tokio::fs::metadata(&full_path).await {
-        Ok(metadata) if metadata.is_file() => {}
+/// A static file read from disk, paired with the weak validator that lets a
+/// revalidating client get a `304` instead of the body.
+struct StaticFile {
+    bytes: Vec<u8>,
+    etag: HeaderValue,
+}
+
+async fn try_read_static_file(path: &Path) -> io::Result<Option<StaticFile>> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return Ok(None),
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
-    }
+    };
 
-    Ok(Some(tokio::fs::read(full_path).await?))
+    Ok(Some(StaticFile {
+        bytes: tokio::fs::read(path).await?,
+        etag: local_etag(&metadata),
+    }))
 }
 
-fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::response::Response {
+/// Cache policy for static responses. The daemon is upgraded in place, so only
+/// names that change with their content may be cached without revalidation.
+///
+/// Vite emits the web bundle as `assets/<name>-<hash8>.<ext>` (pinned by
+/// `web/vite.config.ts`); a rebuilt file never reuses an old name, so clients
+/// may keep it for a year.
+const IMMUTABLE_ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// Everything else — `index.html` (the SPA shell), the service worker, the
+/// manifest, and files copied verbatim from `public/` — can change while
+/// keeping its URL, so a cached copy must be revalidated before reuse. Every
+/// static response carries an `ETag`, so that revalidation is answered with a
+/// `304` instead of a full refetch.
+const REVALIDATE_CACHE: &str = "no-cache";
+
+fn cache_control_for(path: &Path) -> &'static str {
+    if is_content_hashed_asset(path) {
+        IMMUTABLE_ASSET_CACHE
+    } else {
+        REVALIDATE_CACHE
+    }
+}
+
+/// Strong validator for an embedded build file. rust-embed computes the
+/// SHA-256 while compiling, so this costs nothing per request and changes
+/// exactly whenever the bytes change.
+fn etag_from_sha256(hash: [u8; 32]) -> HeaderValue {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    HeaderValue::try_from(format!("\"{}\"", URL_SAFE_NO_PAD.encode(hash)))
+        .expect("base64url is a visible-ASCII header value")
+}
+
+/// Weak validator for a file served from disk: length plus modification time.
+/// The file can be replaced between the stat and the read, so this is not a
+/// strong byte-equality claim; it is exact enough to turn a revalidation into
+/// a `304` until the file actually changes.
+fn local_etag(metadata: &std::fs::Metadata) -> HeaderValue {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+
+    HeaderValue::try_from(format!("W/\"{:x}-{:x}\"", metadata.len(), modified))
+        .expect("hex etag is a visible-ASCII header value")
+}
+
+/// Weak comparison of one `If-None-Match` request header (RFC 9110 §8.8.3.2):
+/// the weakness prefix is ignored and both lists and the `*` wildcard form are
+/// accepted. The tag list is split on commas outside quotes, because an opaque
+/// tag may itself contain a comma.
+fn etag_matches(if_none_match: &HeaderValue, etag: &HeaderValue) -> bool {
+    let (Ok(candidates), Ok(target)) = (if_none_match.to_str(), etag.to_str()) else {
+        return false;
+    };
+    let target = target.strip_prefix("W/").unwrap_or(target);
+
+    split_etag_list(candidates).into_iter().any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == target
+    })
+}
+
+fn split_etag_list(value: &str) -> Vec<&str> {
+    let mut tags = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                tags.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    tags.push(value[start..].trim());
+    tags
+}
+
+fn build_bytes_response(
+    method: &Method,
+    path: impl AsRef<Path>,
+    bytes: Vec<u8>,
+    etag: &HeaderValue,
+    request_headers: &HeaderMap,
+) -> axum::response::Response {
     let path = path.as_ref();
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            mime.essence_str().to_owned(),
-        )],
-        bytes,
-    )
-        .into_response()
+    // `If-None-Match` turns safe requests into a 304; on anything else it is
+    // ignored rather than answered with a bodyless 304.
+    let not_modified = (method == Method::GET || method == Method::HEAD)
+        && request_headers
+            .get(axum::http::header::IF_NONE_MATCH)
+            .is_some_and(|candidate| etag_matches(candidate, etag));
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                mime.essence_str().to_owned(),
+            )],
+            bytes,
+        )
+            .into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control_for(path)),
+    );
+    headers.insert(axum::http::header::ETAG, etag.clone());
+    response
+}
+
+/// True for content-hashed bundle output under an `assets/` directory:
+/// `assets/index-BV0Ld5m9.js`, `assets/radix-vendor-CdGYLb-D.js`. The hash is
+/// Vite's eight-character base64url token, so the check takes the trailing
+/// eight characters instead of splitting on the last dash (the token itself
+/// may contain dashes).
+///
+/// The `assets/` parent check is what keeps similarly shaped names out of the
+/// immutable path: `fonts/JetBrainsMono-Regular.ttf` also ends in eight
+/// letters, but unhashed `public/` files keep their names across builds and
+/// must be revalidated. Anything unrecognized is revalidated too — the safe
+/// fallback when a later Vite changes its naming.
+fn is_content_hashed_asset(path: &Path) -> bool {
+    const HASH_LEN: usize = 8;
+
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        != Some("assets")
+        || path.extension().is_none()
+    {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(hash_start) = stem.len().checked_sub(HASH_LEN) else {
+        return false;
+    };
+    let Some(prefix) = stem.get(..hash_start) else {
+        return false;
+    };
+    let Some(hash) = stem.get(hash_start..) else {
+        return false;
+    };
+    prefix.ends_with('-')
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// `GET /api/ready` — readiness probe: 200 only while every
@@ -705,13 +892,15 @@ fn resolve_route_label(matched: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        METRIC_ROUTES, names_asset_file, redirect_unauthorized_proxy_navigation,
-        resolve_route_label, static_request_candidates,
+        IMMUTABLE_ASSET_CACHE, METRIC_ROUTES, REVALIDATE_CACHE, build_bytes_response,
+        cache_control_for, etag_from_sha256, etag_matches, local_etag, names_asset_file,
+        redirect_unauthorized_proxy_navigation, resolve_route_label, static_request_candidates,
     };
     use axum::{
-        http::{HeaderMap, Method, StatusCode, Uri, header},
+        http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
         response::IntoResponse,
     };
+    use std::path::Path;
 
     /// Regression guard: a previous version of `METRIC_ROUTES` had
     /// `/api/push/subscribe` while the router served `/api/push/subscriptions`,
@@ -850,5 +1039,199 @@ mod tests {
         let result = static_request_candidates(&uri);
 
         assert!(result.is_err());
+    }
+
+    /// Only the content-hashed bundle layout earns `immutable`: a rebuild
+    /// changes the name, so a stale copy cannot shadow new bytes.
+    #[test]
+    fn content_hashed_bundle_assets_are_cached_immutably() {
+        for asset in [
+            "assets/index-BV0Ld5m9.js",
+            "assets/index-CoUxclTT.css",
+            "assets/xterm-sLQPUA_C.css",
+            "assets/radix-vendor-CdGYLb-D.js",
+            "assets/rolldown-runtime-Bh1tDfsg.js",
+            "assets/SessionDetailPage-CXLxYF5q.js",
+        ] {
+            assert_eq!(
+                cache_control_for(Path::new(asset)),
+                IMMUTABLE_ASSET_CACHE,
+                "{asset} is content-hashed and must be cacheable without revalidation"
+            );
+        }
+    }
+
+    /// The entry document and every unhashed file keep their names across
+    /// daemon upgrades, so a cached copy must be revalidated. `-Regular.ttf` is
+    /// the regression case: its stem ends in the same eight-character shape a
+    /// Vite hash has, but it lives outside `assets/` and is never renamed.
+    /// `workbox-<hash>.js` is at the dist root, not the pinned `assets/`
+    /// layout, so it revalidates too (always safe, just less aggressive).
+    #[test]
+    fn entry_document_and_unhashed_assets_revalidate() {
+        for path in [
+            "index.html",
+            "manifest.webmanifest",
+            "sw.js",
+            "sw-push.js",
+            "workbox-fed2bdfe.js",
+            "icon.svg",
+            "splash-dark.svg",
+            "fonts/JetBrainsMono-Regular.ttf",
+            "fonts/JetBrainsMono-BoldItalic.ttf",
+            "fonts/OpenRelayTerminalSymbols.woff2",
+            "command-logos/claude.svg",
+            "assets",
+        ] {
+            assert_eq!(
+                cache_control_for(Path::new(path)),
+                REVALIDATE_CACHE,
+                "{path} must revalidate before a cached copy is reused"
+            );
+        }
+    }
+
+    fn test_etag() -> HeaderValue {
+        etag_from_sha256([7; 32])
+    }
+
+    #[test]
+    fn static_responses_carry_content_type_and_cache_policy() {
+        let etag = test_etag();
+        let hashed = build_bytes_response(
+            &Method::GET,
+            "assets/index-BV0Ld5m9.js",
+            b"console.log(1)".to_vec(),
+            &etag,
+            &HeaderMap::new(),
+        );
+        assert_eq!(hashed.status(), StatusCode::OK);
+        assert_eq!(
+            hashed.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+            IMMUTABLE_ASSET_CACHE
+        );
+        assert_eq!(
+            hashed.headers()[header::ETAG].to_str().unwrap(),
+            etag.to_str().unwrap()
+        );
+
+        let shell = build_bytes_response(
+            &Method::GET,
+            "index.html",
+            b"<html></html>".to_vec(),
+            &etag,
+            &HeaderMap::new(),
+        );
+        assert_eq!(shell.status(), StatusCode::OK);
+        assert_eq!(
+            shell.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+            REVALIDATE_CACHE
+        );
+        assert_eq!(
+            shell.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+            "text/html"
+        );
+    }
+
+    /// A revalidating GET/HEAD gets a bodyless 304 that still carries the
+    /// cache policy and the validator; other methods keep the body, because
+    /// `If-None-Match` is not a caching question for them.
+    #[tokio::test]
+    async fn matching_if_none_match_returns_a_bodyless_304_for_safe_requests() {
+        let etag = test_etag();
+        for method in [Method::GET, Method::HEAD] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, etag.clone());
+            let response = build_bytes_response(
+                &method,
+                "index.html",
+                b"<html></html>".to_vec(),
+                &etag,
+                &headers,
+            );
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+                REVALIDATE_CACHE
+            );
+            assert_eq!(
+                response.headers()[header::ETAG].to_str().unwrap(),
+                etag.to_str().unwrap()
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty(), "304 must not carry a body");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
+        let posted = build_bytes_response(
+            &Method::POST,
+            "index.html",
+            b"<html></html>".to_vec(),
+            &etag,
+            &headers,
+        );
+        assert_eq!(posted.status(), StatusCode::OK);
+    }
+
+    /// `If-None-Match` uses weak comparison (RFC 9110 §8.8.3.2): the `W/`
+    /// prefix is ignored, lists are parsed, and `*` matches any existing file.
+    #[test]
+    fn if_none_match_matches_weakly_and_parses_lists() {
+        let strong = HeaderValue::from_static("\"abc123\"");
+        let weak = HeaderValue::from_static("W/\"xyz\"");
+
+        assert!(etag_matches(
+            &HeaderValue::from_static("W/\"abc123\""),
+            &strong
+        ));
+        assert!(etag_matches(&HeaderValue::from_static("\"xyz\""), &weak));
+        assert!(etag_matches(
+            &HeaderValue::from_static("\"a,b\", W/\"abc123\""),
+            &strong
+        ));
+        assert!(etag_matches(&HeaderValue::from_static("*"), &strong));
+        assert!(!etag_matches(
+            &HeaderValue::from_static("  \"nope\" "),
+            &strong
+        ));
+        assert!(!etag_matches(&HeaderValue::from_static(""), &strong));
+    }
+
+    #[test]
+    fn embedded_etags_are_quoted_content_hashes() {
+        let first = etag_from_sha256([0; 32]);
+        let second = etag_from_sha256([1; 32]);
+
+        let text = first.to_str().unwrap();
+        assert!(text.starts_with('"') && text.ends_with('"'));
+        assert_ne!(first, second, "different content must not share a tag");
+    }
+
+    #[test]
+    fn local_etags_track_file_metadata() {
+        let dir = std::env::temp_dir().join(format!("oly-http-etag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asset.txt");
+        std::fs::write(&path, "one").unwrap();
+
+        let first = local_etag(&std::fs::metadata(&path).unwrap());
+        assert!(first.to_str().unwrap().starts_with("W/\""));
+        assert_eq!(
+            first,
+            local_etag(&std::fs::metadata(&path).unwrap()),
+            "an unchanged file must keep its validator"
+        );
+
+        std::fs::write(&path, "one plus more bytes").unwrap();
+        assert_ne!(
+            first,
+            local_etag(&std::fs::metadata(&path).unwrap()),
+            "a changed file must invalidate its validator"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

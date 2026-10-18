@@ -16,6 +16,12 @@ fn trusted_apps_require_opt_in_and_auth_and_can_be_disabled_live() {
     )
     .unwrap();
     std::fs::write(tmp.join("oly/wwwroot/custom.txt"), "operator override").unwrap();
+    std::fs::create_dir_all(tmp.join("oly/wwwroot/assets")).unwrap();
+    std::fs::write(
+        tmp.join("oly/wwwroot/assets/main-abc12345.js"),
+        "console.log('hashed');",
+    )
+    .unwrap();
     let port = pick_free_port();
     let daemon = start_daemon_http_authenticated(&tmp, port, "test-app-password");
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -127,18 +133,64 @@ fn trusted_apps_require_opt_in_and_auth_and_can_be_disabled_live() {
                 .unwrap()
                 .contains("script-src 'self';")
         );
+        let custom = client
+            .get(format!("{base}/custom.txt"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
-            client
-                .get(format!("{base}/custom.txt"))
-                .bearer_auth(token)
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            "operator override"
+            custom.headers()["cache-control"].to_str().unwrap(),
+            "no-cache"
         );
+        let custom_etag = custom.headers()["etag"].to_str().unwrap().to_string();
+        assert!(
+            custom_etag.starts_with("W/\""),
+            "disk-served files use a weak validator, got {custom_etag}"
+        );
+        assert_eq!(custom.text().await.unwrap(), "operator override");
+
+        // Cache policy over real HTTP: content-hashed bundle names may be
+        // cached without revalidation; `index.html`-like and unhashed files
+        // must be revalidated so an upgraded daemon cannot be shadowed.
+        let hashed = client
+            .get(format!("{base}/assets/main-abc12345.js"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hashed.status(), 200);
+        assert_eq!(
+            hashed.headers()["cache-control"].to_str().unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        let hashed_etag = hashed.headers()["etag"].to_str().unwrap().to_string();
+        assert_eq!(hashed.text().await.unwrap(), "console.log('hashed');");
+
+        // The validator turns revalidation into a bodyless 304, not a refetch.
+        let custom_revalidated = client
+            .get(format!("{base}/custom.txt"))
+            .bearer_auth(token)
+            .header("if-none-match", custom_etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(custom_revalidated.status(), 304);
+        assert!(custom_revalidated.bytes().await.unwrap().is_empty());
+
+        let hashed_revalidated = client
+            .get(format!("{base}/assets/main-abc12345.js"))
+            .bearer_auth(token)
+            .header("if-none-match", hashed_etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hashed_revalidated.status(), 304);
+        assert_eq!(
+            hashed_revalidated.headers()["etag"].to_str().unwrap(),
+            hashed_etag
+        );
+        assert!(hashed_revalidated.bytes().await.unwrap().is_empty());
 
         // A benign local upstream verifies actual proxy delivery and credential isolation.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

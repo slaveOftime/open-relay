@@ -129,6 +129,14 @@ export default defineConfig({
     reportCompressedSize: true,
     rollupOptions: {
       output: {
+        // Every bundle file must keep a content hash in its name: the daemon
+        // caches `assets/<name>-<hash8>.<ext>` immutably and revalidates
+        // everything else (see `is_content_hashed_asset` in src/http/mod.rs).
+        // Vite's defaults already hash these, but pinning the pattern here
+        // keeps the contract explicit and covered by review.
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
         // Keep heavy runtime deps in separate chunks for better browser caching.
         manualChunks(id) {
           if (id.includes('node_modules/@xterm/')) return 'xterm'
