@@ -707,7 +707,11 @@ function SessionDetailPageContent() {
           setExitCode: setExitCode,
           setConnected: setWsConnected,
           setEverConnected: () => setWsEverConnected(true),
-          openLogsView: () => setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }),
+          // The session ending is not a user navigation: replace the attach
+          // entry. Pushing would leave Back pointing at the attach URL, which
+          // ends again and switches right back — the list becomes unreachable.
+          openLogsView: () =>
+            setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }, { replace: true }),
           setSession,
           // Reconnect bookkeeping the effect owns, not the frame table.
           afterOpen: () => {
@@ -1728,19 +1732,6 @@ function SessionDetailPageContent() {
             )}
           </div>
         </ScrollArea>
-
-        {/* Navigate back button (hide in logs mode to avoid overlap with scrubber controls) */}
-        {mode !== 'attach' && mode !== 'logs' && (
-          <Button
-            variant="outline"
-            size="icon"
-            className="sm:hidden fixed bottom-4 left-4 z-50 h-10 w-10 rounded-full shadow-lg"
-            onClick={() => navigate('/')}
-            aria-label="Back to sessions"
-          >
-            ←
-          </Button>
-        )}
 
         <SessionActionConfirmDialog
           action={pendingAction}

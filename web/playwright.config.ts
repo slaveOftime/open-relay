@@ -51,8 +51,10 @@ export default defineConfig({
       // exactly the class of thing that differs on WebKit.
       // `sessions-group-collapse` is the same shape: the group header's tap and
       // its `position: sticky` (including on a table cell) are where WebKit has
-      // historically diverged.
-      testMatch: /(attach|quick-keys|sessions-group|sessions-search)[^/]*\.spec\.ts/,
+      // historically diverged. `sessions-scroll` drives the card list's
+      // scrollport and reads it back after a round trip — the mobile path.
+      testMatch:
+        /(attach|quick-keys|sessions-group|sessions-scroll|sessions-search)[^/]*\.spec\.ts/,
       use: { ...MOBILE_SAFARI },
     },
   ],

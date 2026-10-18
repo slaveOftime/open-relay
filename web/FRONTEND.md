@@ -180,6 +180,23 @@ primary accent.
   size when the socket opens — the native client already did.
   `e2e/attach-resize.spec.ts` holds a mocked socket in CONNECTING while the
   viewport changes, so the lost report is deterministic rather than a race.
+- **An automatic view switch must replace its history entry, not push one.**
+  When a session ended while attached, the page pushed the logs URL over the
+  attach URL; Back then stepped onto the attach URL, which reconnected, ended
+  again, and switched right back — the sessions list became unreachable.
+  Anything the app does on its own (session end, a fallback view) belongs in
+  the entry it replaces; only user-initiated navigation earns a new one.
+- **Restore the list once the rows are real, and only the visible scrollport.**
+  Collapsed groups are a `localStorage` preference (a reload keeps them), while
+  the scroll offset is `sessionStorage` and is applied after the rows render —
+  a `scrollTop` write against the loading skeleton just clamps. The hidden list
+  is `display:none` and would clamp the same write to 0, so the restore picks
+  the element with an `offsetParent`. The offset is read once per mount and the
+  restore retries until it lands, because a foreground reload blanks the list
+  while it runs — taking the rows away cancels the pending frame, and the
+  collapsed content clamps the old offset to 0. Scrolls seen while the list has
+  no rows are that clamp, not the user, and are not saved. `sessions-scroll.spec.ts`
+  covers both scrollports and the interrupting reload.
 
 ## Avoid
 
