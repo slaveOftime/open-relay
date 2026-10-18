@@ -28,7 +28,7 @@ It is suitable for early adopters who can back up state and coordinate upgrades.
 
 Pinned-identity federation uses the trust model below; setup is in
 [Remote access](../guides/remote-access.md#connect-machines). **Current redesign
-(not attributed to a shipped beta):** `oly node` replaces top-level `oly join`
+(first shipped in 0.5.0-beta.3):** `oly node` replaces top-level `oly join`
 and `oly node accept` without backward compatibility. Exact-version release
 notes describe historical behavior; follow the [migration steps](./migration-0.5.md#current-node-redesign)
 when moving from those builds. The cryptographic handshake is unchanged.

@@ -17,12 +17,13 @@
 | [Upgrade from 0.3.x to 0.5.x](./releases/migration-0.5.md) | Breaking changes, current node redesign, backup, and rollback |
 | [What's new in 0.5.x](./releases/whats-new-0.5.md) | Features and improvements, separate from migration |
 | [Compatibility for 0.5](./releases/compatibility-0.5.md) | Supported contracts, node federation trust limits, and private interfaces |
+| [0.5.0-beta.3 release notes](./releases/release-notes-0.5.0-beta.3.md) | Published scope, known limits, and verification |
 | [0.5.0-beta.2 release notes](./releases/release-notes-0.5.0-beta.2.md) | Published scope, known limits, and verification |
 | [0.5.0-beta.1 release notes](./releases/release-notes-0.5.0-beta.1.md) | Published scope, known limits, and verification |
 
 Ongoing guides describe the current checkout. The node CLI redesign in migration,
-compatibility, and what’s-new is not attributed to a shipped beta; exact-version
-release notes remain the historical record.
+compatibility, and what’s-new first shipped in 0.5.0-beta.3; earlier beta notes
+remain the historical record.
 
 ## Contributing and maintaining
 

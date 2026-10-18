@@ -1,7 +1,7 @@
 # How to publish an oly release
 
 For maintainers. Upgrading an installation? Use [Migration to 0.5](../releases/migration-0.5.md).
-For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0-beta.2.md).
+For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0-beta.3.md).
 
 ## 1. Choose the version and channel
 
@@ -12,7 +12,7 @@ The **tag**, not the branch name or GitHub release checkbox, determines publicat
 | `vX.Y.Z-beta.N` or `vX.Y.Z-rc.N` | Prerelease, not latest | `beta` | Skipped |
 | `vX.Y.Z` | Stable, latest | `latest` | Publish / update formula |
 
-For example, fixes after `v0.5.0-beta.1` can ship as `v0.5.0-beta.2`.
+For example, fixes after `v0.5.0-beta.2` can ship as `v0.5.0-beta.3`.
 Promotion to `v0.5.0` is a separate maintainer decision, not an automatic step.
 Confirm registry credentials (`NPM_TOKEN`, and stable-only `CARGO_REGISTRY_TOKEN`)
 and stable-only permission to push the Homebrew update to the default branch.
@@ -24,7 +24,7 @@ and stable-only permission to push the Homebrew update to the default branch.
 - Keep `Cargo.toml` and the root `oly` entry in `Cargo.lock` at the same version.
   For a **stable** release, commit the intended version in both before tagging:
   `cargo publish --locked` rejects uncommitted version changes. A beta may use
-  the base source version (for example, `0.5.0` for `v0.5.0-beta.2`).
+  the base source version (for example, `0.5.0` for `v0.5.0-beta.3`).
 - Validate the updated PR head, not an older green commit. Review source/config,
   docs/workflow contracts, Rust tests/Clippy, and frontend tests/build/Chromium.
 - Test shipped artifacts and upgrade/rollback with isolated or backed-up state.
@@ -50,8 +50,8 @@ git switch main
 git pull --ff-only origin main
 # Verify this SHA is the intended merged release commit.
 git log -1 --oneline
-git tag -a v0.5.0-beta.2 <merged-SHA> -m "oly 0.5.0-beta.2"
-git push origin refs/tags/v0.5.0-beta.2
+git tag -a v0.5.0-beta.3 <merged-SHA> -m "oly 0.5.0-beta.3"
+git push origin refs/tags/v0.5.0-beta.3
 ```
 
 Do not move or reuse a published tag. No manual GitHub release creation is

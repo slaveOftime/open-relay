@@ -61,11 +61,11 @@ The npm package bundles binaries for **Linux x64, Linux arm64, macOS Apple
 Silicon, and Windows x64**. No GitHub asset download is needed during
 installation.
 
-> **0.5.0-beta.2 is available:** a breaking preview, not the stable channel.
+> **0.5.0-beta.3 is available:** a breaking preview, not the stable channel.
 > Stable installs still use the 0.3 line. Try `npm install -g @slaveoftime/oly@beta`
-> or the [GitHub prerelease](https://github.com/slaveOftime/open-relay/releases/tag/v0.5.0-beta.2).
+> or the [GitHub prerelease](https://github.com/slaveOftime/open-relay/releases/tag/v0.5.0-beta.3).
 > Back up state and read the [migration guide](./docs/releases/migration-0.5.md) before upgrading.
-> See the [release notes and verification](./docs/releases/release-notes-0.5.0-beta.2.md).
+> See the [release notes and verification](./docs/releases/release-notes-0.5.0-beta.3.md).
 
 <details>
 <summary>Other installation options</summary>

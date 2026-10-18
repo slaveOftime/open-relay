@@ -2,9 +2,9 @@
 
 0.5 is currently a **breaking beta**. Back up state before upgrading.
 For features, see [What's new in 0.5](./whats-new-0.5.md).
-This guide includes the **current node redesign**, not attributed to a shipped
-beta. Exact-version release notes remain historical; installing the published
-beta does not by itself establish that it contains this redesign.
+This guide includes the **current node redesign**, first shipped in
+**0.5.0-beta.3**. Exact-version release notes remain historical; earlier betas do
+not contain this redesign.
 
 ## Breaking changes and required actions
 
@@ -27,8 +27,9 @@ not a live byte quota; keep backups outside the active state directory.
 
 ### Current node redesign
 
-These changes apply when moving to the redesigned checkout, **not retroactively
-to 0.5.0-beta.1 or beta.2**. There are no legacy command aliases.
+These changes apply when moving to the redesigned checkout shipped in
+**0.5.0-beta.3**, **not retroactively to 0.5.0-beta.1 or beta.2**. There are no
+legacy command aliases.
 
 | Previous interface | Replacement/action |
 |---|---|

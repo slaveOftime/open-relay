@@ -29,6 +29,15 @@ See [Logs and continuation](../guides/cli.md#logs-views-waits-and-byte-continuat
   in the web UI. It is app-reported state, not process status or approval.
 - The session list stays responsive with thousands of sessions. Measurement
   recipes are in [Performance](../../PERFORMANCE.md).
+- `oly daemon status [--node NAME] [--json]` summarises version, readiness and
+  its reasons, component state, disk capacity, and affected sessions from
+  metadata only. `/api/ready` reports readiness; `/api/health` stays
+  liveness-only, and supervised loops report `failed` with a reason instead of
+  silently stopping.
+- Disk capacity is sampled in the background and reported explicitly: free
+  bytes plus a journal/uploads/SQLite/logs breakdown, an always-on warning
+  threshold, and an opt-in admission guard that refuses new sessions below the
+  floor. It is not a quota and never kills an existing session.
 - Bundled skills cover session supervision, workers, daemon configuration,
   and trusted apps.
 
@@ -40,6 +49,15 @@ See [CLI guide](../guides/cli.md) and [Agent skills](../../skills/oly/SKILL.md).
 - Improved paste boundaries, mouse input, scrollback, and mobile controls.
 - Windows named-pipe and console teardown fixes improve disconnect and final
   output handling.
+- Session groups are sticky and collapsible, and the list remembers its scroll
+  position and collapsed groups across reloads.
+- The attach panel collapses to reclaim terminal width; the terminal theme
+  follows a live OS flip or an explicit `data-theme` override; and the attach
+  size is reconciled when the socket opens instead of holding a stale handshake
+  viewport.
+- Content-hashed bundle files are cached immutably while the shell and other
+  files revalidate with `no-cache` and an ETag/`304`, so an in-place upgrade is
+  not shadowed by a stale bundle.
 - Password login, origin checks, token revocation, and opt-in trusted apps
   constrain browser access.
 
@@ -53,7 +71,7 @@ traffic replace the old federation credential paths. Verify public identities
 independently and upgrade nodes together. Federation has **no forward secrecy**;
 later seed compromise can expose recorded federation traffic.
 
-### Current node redesign (not attributed to a shipped beta)
+### Current node redesign (first shipped in 0.5.0-beta.3)
 
 - Unified `oly node add/ls/info/update/enable/disable/rm` manages both roles.
   Names identify the remote peer; outbound primary entries use `--as` for the
@@ -68,8 +86,8 @@ later seed compromise can expose recorded federation traffic.
 
 This replaces `oly join` and `oly node accept` without aliases. See
 [Migration](./migration-0.5.md#current-node-redesign) for script/state changes.
-Exact-version release notes below remain the record of shipped scope, not proof
-that the redesign is included or verified in those artifacts.
+It first shipped in **0.5.0-beta.3**; earlier betas keep the old commands, and
+exact-version release notes remain the record of each shipped scope.
 
 ## Platforms
 
@@ -79,5 +97,5 @@ Windows x64; the npm launcher selects one. Linux arm64 joined the matrix in
 
 See [Node setup](../guides/remote-access.md#connect-machines),
 [Compatibility](./compatibility-0.5.md), and
-[0.5.0-beta.2 release notes](./release-notes-0.5.0-beta.2.md) for shipped scope
+[0.5.0-beta.3 release notes](./release-notes-0.5.0-beta.3.md) for shipped scope
 and verification.
