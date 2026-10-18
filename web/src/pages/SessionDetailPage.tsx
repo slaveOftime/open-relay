@@ -69,6 +69,7 @@ import {
   TrackNextIcon,
   TrashIcon,
 } from '@radix-ui/react-icons'
+import { PanelRightCloseIcon, PanelRightOpenIcon } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/attach/AttachPanel'
 import { ingestSessionSummary } from '@/lib/session-events'
@@ -132,6 +133,10 @@ function SessionDetailPageContent() {
   )
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
   const [isAttachPanelOpen, setIsAttachPanelOpen] = useState(false)
+  // Desktop (`sm`+) collapse of the attach panel, toggled from the info bar so
+  // the panel column can disappear entirely; `isAttachPanelOpen` above is the
+  // mobile drawer and keeps its own state.
+  const [isAttachPanelCollapsed, setIsAttachPanelCollapsed] = useState(false)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
   const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
@@ -1500,7 +1505,7 @@ function SessionDetailPageContent() {
         {/* ── Info bar ── */}
         {session && (
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
-            <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
+            <span className="inline-flex min-w-0 flex-1 items-start gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
               <div
                 className={`mt-0.5 space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
@@ -1541,6 +1546,30 @@ function SessionDetailPageContent() {
                 )}
               </div>
             </span>
+            {mode === 'attach' && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="hidden sm:inline-flex h-6 w-6 shrink-0"
+                    aria-label={isAttachPanelCollapsed ? 'Show input panel' : 'Hide input panel'}
+                    aria-expanded={!isAttachPanelCollapsed}
+                    onClick={() => setIsAttachPanelCollapsed((collapsed) => !collapsed)}
+                  >
+                    {isAttachPanelCollapsed ? (
+                      <PanelRightOpenIcon className="h-3.5 w-3.5" />
+                    ) : (
+                      <PanelRightCloseIcon className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {isAttachPanelCollapsed ? 'Show input panel' : 'Hide input panel'}
+                </TooltipContent>
+              </Tooltip>
+            )}
           </div>
         )}
 
@@ -1713,6 +1742,7 @@ function SessionDetailPageContent() {
                     showKeyError={showKeyError}
                     uploadFile={handleUploadFile}
                     onDrawerOpenChange={setIsAttachPanelOpen}
+                    collapsed={isAttachPanelCollapsed}
                   />
                 </div>
                 <div className="sm:hidden flex items-center justify-center h-8 relative">

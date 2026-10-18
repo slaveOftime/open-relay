@@ -54,6 +54,12 @@ interface AttachPanelProps {
   showKeyError: (message: string) => void
   uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
   onDrawerOpenChange?: (open: boolean) => void
+  /**
+   * Desktop (`sm`) collapse, toggled from the session info bar. Below `sm` the
+   * MobileKeyBar's drawer owns visibility instead, so this only reads `sm:`
+   * classes.
+   */
+  collapsed?: boolean
 }
 
 const popularKeys = [
@@ -89,6 +95,7 @@ export default function AttachPanel({
   showKeyError,
   uploadFile,
   onDrawerOpenChange,
+  collapsed = false,
 }: AttachPanelProps) {
   // Per-session persisted UI state is split between two sync sites:
   //   1. The lazy initializer below populates state on initial mount (covers
@@ -447,7 +454,9 @@ export default function AttachPanel({
   return (
     <div ref={rootRef}>
       <div
-        className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible sm:w-[200px] md:w-[300px]'} overflow-hidden transition-all`}
+        className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible'} ${
+          collapsed ? 'sm:w-0' : 'sm:w-[200px] md:w-[300px]'
+        } overflow-hidden transition-all`}
       >
         <div className={`flex flex-col gap-4 p-3 `}>
           <div>
