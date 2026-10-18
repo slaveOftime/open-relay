@@ -168,4 +168,5 @@ jobs:
       # Only release tests exercise the compiled-in immutable asset inventory.
       - name: Check embedded static caching contracts
         working-directory: ${{ github.workspace }}
-        run: cargo test --release --locked --bin oly http::static_files:: -- --test-threads=1
+        run: |
+          cargo test --release --locked --bin oly http::static_files:: -- --test-threads=1
