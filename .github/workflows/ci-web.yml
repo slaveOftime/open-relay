@@ -163,3 +163,9 @@ jobs:
       - name: Build release with the embedded bundle
         working-directory: ${{ github.workspace }}
         run: cargo build --release --locked
+
+      # Debug rust-embed reads the live dist tree and deliberately revalidates.
+      # Only release tests exercise the compiled-in immutable asset inventory.
+      - name: Check embedded static caching contracts
+        working-directory: ${{ github.workspace }}
+        run: cargo test --release --locked --bin oly http::static_files:: -- --test-threads=1

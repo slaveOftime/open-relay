@@ -592,6 +592,11 @@ for the response rules.
   agent reports. App routes permit inline scripts; normal UI routes do not.
   Proxy targets are loopback IP literals only, and joined paths cannot change
   origin. Security middleware covers fallback responses as well as named routes.
+  Static cache handling lives in `http/static_files.rs`: only manifest-listed
+  generated release assets are public/immutable; operator files are always
+  private and revalidated. Weak content hashes describe actual bytes across
+  compression variants, and 304s retain `Vary`. The PWA uses only revisioned
+  build precaching, not runtime caches that bypass revalidation or app auth.
   Federation uses pinned identities and sealed traffic but has no forward secrecy.
   Node disable/rm contain or revoke a configured peer without killing its sessions;
   the [compatibility policy](./docs/releases/compatibility-0.5.md#node-federation)
