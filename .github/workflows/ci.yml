@@ -1,15 +1,15 @@
 name: CI
 
 # Trigger policy: CI owns what the Rust build, the Rust test suite and the
-# release tooling consume. It deliberately does NOT list README.md or docs/:
-# documentation contracts run in CI-DOCS, so a docs-only PR never pays for the
-# four-target matrix. It DOES list web/** (see below) because the web bundle is
-# compiled into the binary: CI-WEB proves the bundle builds, and this workflow
-# proves the release build still embeds it.
+# release tooling consume. It deliberately lists neither docs/README.md
+# (CI-DOCS owns those) nor web/** — CI-WEB's `embed` job proves the release
+# build still embeds the bundle — so docs-only and web-only PRs never pay for
+# the four-target matrix.
 #
 # Adding a new top-level directory that build.rs, `include_str!`,
-# `sqlx::migrate!`, `rust-embed` or the manifest reads means adding it here.
-# An omitted input fails silently as a coverage gap, not as a red build.
+# `sqlx::migrate!`, `rust-embed` or the manifest reads means adding it here
+# unless it has a check of its own. An omitted input fails silently as a
+# coverage gap, not as a red build.
 #
 # The `paths` list is duplicated under both events because GitHub applies the
 # filter per event and supports no shared reference; keep the two in sync.
@@ -32,17 +32,6 @@ on:
       - skills/**
       - src/**
       - tests/**
-      # The web bundle is compiled into the binary: `build.rs` runs
-      # `npm install && npm run build` for release profiles and
-      # `src/http/mod.rs` embeds `web/dist` via rust-embed, so a web change
-      # can break the release build. Mirrors the web entries among the
-      # `cargo:rerun-if-changed` lines in `build.rs`.
-      - web/src/**
-      - web/index.html
-      - web/package.json
-      - web/package-lock.json
-      - web/vite.config.*
-      - web/tsconfig*.json
   pull_request:
     branches: [main]
     paths:
@@ -61,17 +50,6 @@ on:
       - skills/**
       - src/**
       - tests/**
-      # The web bundle is compiled into the binary: `build.rs` runs
-      # `npm install && npm run build` for release profiles and
-      # `src/http/mod.rs` embeds `web/dist` via rust-embed, so a web change
-      # can break the release build. Mirrors the web entries among the
-      # `cargo:rerun-if-changed` lines in `build.rs`.
-      - web/src/**
-      - web/index.html
-      - web/package.json
-      - web/package-lock.json
-      - web/vite.config.*
-      - web/tsconfig*.json
   # Manual re-run for a flaky PTY test or a workflow-only change: neither
   # re-triggers this workflow reliably from a push. Dispatch ignores filters.
   workflow_dispatch:
