@@ -7,7 +7,7 @@ import { cn } from '@/utils/cn'
 import QuickKeysMenu from './QuickKeysMenu'
 import QuickKeysDialog from './QuickKeysDialog'
 import { markOwnedTerminalWheel, wheelOrigin } from './scroll-wheel'
-import { getTerminalTheme } from './xterm-theme'
+import { getTerminalTheme, subscribeTerminalColorScheme } from './xterm-theme'
 import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
 import {
@@ -387,16 +387,14 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     // listing it keeps this effect running once per mount.
   }, [autoFit, restartKeyboardSync])
 
-  // Update terminal theme when OS color scheme changes
+  // Repaint when the scheme the app renders changes: the OS preference flips,
+  // or an explicit `data-theme` override is set, changed, or removed.
   useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const handler = () => {
+    return subscribeTerminalColorScheme(() => {
       if (termRef.current) {
         termRef.current.options.theme = getTerminalTheme()
       }
-    }
-    mq.addEventListener('change', handler)
-    return () => mq.removeEventListener('change', handler)
+    })
   }, [])
 
   // Mobile scroll handle: dragging it vertically emits synthetic wheel
