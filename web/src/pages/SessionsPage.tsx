@@ -86,8 +86,14 @@ import { useSseConnectionState } from '@/hooks/use-session-events'
 import { useSessionTableColumns } from '@/hooks/use-session-table-columns'
 import { useSessionListGestures } from '@/hooks/use-session-list-gestures'
 import { useSessionLoaders } from './sessions-page-loaders'
+import { useSessionsScrollRestoration } from './sessions-page-scroll'
 import { SessionGroupHeader } from '@/components/sessions/SessionGroupHeader'
-import { collapsedGroupKey, type GroupBy } from '@/components/sessions/group-by'
+import {
+  collapsedGroupKey,
+  loadCollapsedGroupKeys,
+  saveCollapsedGroupKeys,
+  type GroupBy,
+} from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
 import { SessionRow } from '@/components/sessions/SessionRow'
 import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
@@ -122,9 +128,13 @@ export default function SessionsPage() {
   const [search, setSearch] = useState(initialPrefs.search)
   const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>(initialPrefs.statusFilter)
   const [groupBy, setGroupBy] = useState<GroupBy>(initialPrefs.groupBy)
-  // Groups the user collapsed, by `collapsedGroupKey`. Browser-local and not a
-  // saved preference: a fresh visit starts with every group open.
-  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(new Set())
+  // Groups the user collapsed, by `collapsedGroupKey`. Browser-local and
+  // persisted, so a reload or a return from a session detail page keeps the
+  // groups as the user left them; a fresh browser profile starts with every
+  // group open.
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(
+    () => new Set(loadCollapsedGroupKeys())
+  )
   const [sortField, setSortField] = useState<SessionSortField>(initialPrefs.sortField)
   const [sortOrder, setSortOrder] = useState<SortOrder>(initialPrefs.sortOrder)
   const [pageSize, setPageSize] = useState<number>(initialPrefs.pageSize)
@@ -155,6 +165,10 @@ export default function SessionsPage() {
   const pendingTerminationRef = useRef(new Map<string, SessionStatus>())
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
+  // The two list scrollports (mobile cards and desktop table); the scroll
+  // offset is shared, because only the visible one can be scrolled.
+  const mobileListRef = useRef<HTMLDivElement | null>(null)
+  const desktopListRef = useRef<HTMLDivElement | null>(null)
   const sseStatus = useSseConnectionState()
 
   // Ids currently rendered on the page (the SSE handler must not invent rows).
@@ -352,6 +366,14 @@ export default function SessionsPage() {
   useEffect(() => {
     savePinnedSessionKeys(pinnedKeys)
   }, [pinnedKeys])
+
+  useEffect(() => {
+    saveCollapsedGroupKeys(collapsedGroups)
+  }, [collapsedGroups])
+
+  // Put the list back where the user left it after a trip into a session
+  // detail page.
+  useSessionsScrollRestoration(mobileListRef, desktopListRef, !loading && sessions.length > 0)
 
   useEffect(() => {
     if (!selectedNode) {
@@ -1042,6 +1064,7 @@ export default function SessionsPage() {
         <div
           className="flex-1 overflow-y-auto overflow-x-clip md:hidden"
           data-testid="mobile-session-list"
+          ref={mobileListRef}
           onPointerDownCapture={(event) => {
             if (event.pointerType !== 'touch') noteNonTouchGesture()
           }}
@@ -1129,7 +1152,11 @@ export default function SessionsPage() {
         </div>
 
         {/* ── Desktop table ── */}
-        <div className="flex-1 h-full shrink overflow-x-auto hidden md:block">
+        <div
+          className="flex-1 h-full shrink overflow-x-auto hidden md:block"
+          data-testid="desktop-session-list"
+          ref={desktopListRef}
+        >
           {loading && sessions.length === 0 && (
             <Table className="w-full border-collapse table-fixed">
               <TableBody>

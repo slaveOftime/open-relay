@@ -102,6 +102,16 @@ function SessionDetailPageContent() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
 
+  // Back to the sessions list. Pop the entry that led here when the history
+  // has one, so the list keeps its filters and scroll position and the
+  // forward button still returns to this session; a deep link straight into a
+  // session has nothing to pop, so it lands on the list instead.
+  const backToSessions = useCallback(() => {
+    const idx = (window.history.state as { idx?: number } | null)?.idx ?? 0
+    if (idx > 0) navigate(-1)
+    else navigate('/')
+  }, [navigate])
+
   const mode = (searchParams.get('mode') ?? 'logs') as 'attach' | 'logs'
   const logsView = searchParams.get('view') === 'replay' ? 'replay' : 'tail'
   const isTailMode = logsView === 'tail'
@@ -707,7 +717,11 @@ function SessionDetailPageContent() {
           setExitCode: setExitCode,
           setConnected: setWsConnected,
           setEverConnected: () => setWsEverConnected(true),
-          openLogsView: () => setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }),
+          // The session ending is not a user navigation: replace the attach
+          // entry. Pushing would leave Back pointing at the attach URL, which
+          // ends again and switches right back — the list becomes unreachable.
+          openLogsView: () =>
+            setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }, { replace: true }),
           setSession,
           // Reconnect bookkeeping the effect owns, not the frame table.
           afterOpen: () => {
@@ -1303,6 +1317,17 @@ function SessionDetailPageContent() {
       <div className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh">
         {/* ── Header ── */}
         <header className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
+          {/* iOS standalone has no browser chrome to go back with, so the way
+              out of a session is an explicit button, not just the logo. */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="shrink-0 -ml-1"
+            onClick={backToSessions}
+            aria-label="Back to sessions"
+          >
+            <ChevronLeftIcon className="h-5 w-5" />
+          </Button>
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
@@ -1728,19 +1753,6 @@ function SessionDetailPageContent() {
             )}
           </div>
         </ScrollArea>
-
-        {/* Navigate back button (hide in logs mode to avoid overlap with scrubber controls) */}
-        {mode !== 'attach' && mode !== 'logs' && (
-          <Button
-            variant="outline"
-            size="icon"
-            className="sm:hidden fixed bottom-4 left-4 z-50 h-10 w-10 rounded-full shadow-lg"
-            onClick={() => navigate('/')}
-            aria-label="Back to sessions"
-          >
-            ←
-          </Button>
-        )}
 
         <SessionActionConfirmDialog
           action={pendingAction}

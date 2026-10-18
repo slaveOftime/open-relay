@@ -120,6 +120,41 @@ test('tapping a group header hides its group, and tapping again brings it back',
   await expect(bashHeader).toHaveAttribute('aria-expanded', 'true')
 })
 
+test('a collapsed group stays collapsed across a reload, and an expanded one stays expanded', async ({
+  page,
+}) => {
+  await seedGrouping(page, 'command')
+  await mockSessions(page, [
+    makeSession('s-bash-1', 'alpha bash session', 'bash', { ageSeconds: 10 }),
+    makeSession('s-node-1', 'gamma node session', 'node', { ageSeconds: 30 }),
+  ])
+  await page.goto('/')
+
+  const bashHeader = list(page).getByRole('button', { name: 'Bash', exact: true })
+  await bashHeader.click()
+  await expect(list(page).getByText('alpha bash session')).toHaveCount(0)
+
+  // The collapse is a browser-local preference, not mount state: a reload
+  // comes back to the same list.
+  await page.reload()
+  await expect(list(page).getByRole('button', { name: 'Bash', exact: true })).toHaveAttribute(
+    'aria-expanded',
+    'false'
+  )
+  await expect(list(page).getByText('alpha bash session')).toHaveCount(0)
+  await expect(list(page).getByText('gamma node session')).toBeVisible()
+
+  // Expanding is remembered too — the stored set is what the user last chose,
+  // not a one-way "collapsed" latch.
+  await list(page).getByRole('button', { name: 'Bash', exact: true }).click()
+  await page.reload()
+  await expect(list(page).getByRole('button', { name: 'Bash', exact: true })).toHaveAttribute(
+    'aria-expanded',
+    'true'
+  )
+  await expect(list(page).getByText('alpha bash session')).toBeVisible()
+})
+
 test('the header sticks to the list top while its group scrolls under it', async ({ page }) => {
   const bash = Array.from({ length: 12 }, (_, i) =>
     makeSession(`s-bash-${i}`, `bash session ${String(i).padStart(2, '0')}`, 'bash', {
