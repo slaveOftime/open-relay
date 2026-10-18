@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Page, type Response } from '@playwright/test'
 
 /**
  * Coming back to the sessions list should land on the rows the user left, not
@@ -154,6 +154,131 @@ test('the desktop table comes back to its offset after a session round trip', as
   await page.getByRole('button', { name: 'Back to sessions' }).click()
   await expect(page).toHaveURL('/')
   await expect(row).toBeInViewport()
+
+  await expect
+    .poll(() => list.evaluate((element) => element.scrollTop))
+    .toBeGreaterThanOrEqual(Math.floor(before) - 1)
+  expect(await list.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(before + 1)
+})
+
+/** The list fetch, as opposed to the per-session fetches that share the prefix. */
+function isSessionListRequest(response: Response) {
+  return new URL(response.url()).pathname === '/api/sessions'
+}
+
+/** Whether the rendered page still shows `text`; a blank reload takes it away. */
+function pageHasText(page: Page, text: string) {
+  return page.evaluate((needle) => document.body.innerText.includes(needle), text)
+}
+
+/**
+ * Click the first visible element matching `selector` whose text or aria-label
+ * contains `label`.
+ *
+ * Playwright's own clicks wait for actionability by polling animation frames,
+ * and the reload race test below holds frames on purpose, so clicks inside the
+ * held window are dispatched through the DOM instead. React listens at the
+ * root, so a bubbling `MouseEvent` reaches the handler a real click would.
+ */
+async function clickByText(page: Page, selector: string, label: string) {
+  await page.evaluate(
+    ({ selector, label: needle }) => {
+      const target = [...document.querySelectorAll(selector)].find((node) => {
+        const visible = node.getClientRects().length > 0
+        const named =
+          (node.textContent?.includes(needle) ?? false) ||
+          (node.getAttribute('aria-label')?.includes(needle) ?? false)
+        return visible && named
+      })
+      target?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    },
+    { selector, label }
+  )
+}
+
+/**
+ * Hold every animation frame until `releaseAnimationFrames` runs them.
+ *
+ * The restore lands on a frame, so a test that needs to interrupt it before it
+ * lands cannot let frames run. Frames the app queues while held (sparklines,
+ * xterm, the delayed terminal disposal of the page left behind) simply wait
+ * and run at the release.
+ */
+async function holdAnimationFrames(page: Page) {
+  await page.evaluate(() => {
+    const held = new Map<number, FrameRequestCallback>()
+    let nextId = 1
+    const originalRaf = window.requestAnimationFrame.bind(window)
+    const originalCancel = window.cancelAnimationFrame.bind(window)
+    window.requestAnimationFrame = (callback: FrameRequestCallback) => {
+      const id = nextId++
+      held.set(id, callback)
+      return id
+    }
+    window.cancelAnimationFrame = (id: number) => {
+      held.delete(id)
+    }
+    ;(window as unknown as { __olyFlushFrames?: () => void }).__olyFlushFrames = () => {
+      window.requestAnimationFrame = originalRaf
+      window.cancelAnimationFrame = originalCancel
+      for (const [id, callback] of [...held]) {
+        held.delete(id)
+        callback(performance.now())
+      }
+    }
+  })
+}
+
+async function releaseAnimationFrames(page: Page) {
+  await page.evaluate(() => {
+    ;(window as unknown as { __olyFlushFrames?: () => void }).__olyFlushFrames?.()
+  })
+}
+
+/**
+ * Coming back to the list and hitting a reload before the restore lands must
+ * still end at the saved offset. A foreground reload hides the rows while it
+ * runs: `hasRows` dips back to false (the pending restore frame is cancelled),
+ * the content collapse clamps the list to the top, and only the rows coming
+ * back can put the offset in place. Frames are held from before that dip until
+ * the reload's rows return, which makes the window deterministic instead of a
+ * 16ms race.
+ */
+test('the offset survives a reload that interrupts the restore', async ({ page }) => {
+  await mockSessions(page, scrollSessions())
+  // Delay the list fetches so the reload's blank state is a window the test
+  // can observe rather than a blink it has to outrun.
+  await page.route('**/api/sessions**', async (route) => {
+    if (new URL(route.request().url()).pathname !== '/api/sessions') return route.fallback()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    return route.fallback()
+  })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const list = page.getByTestId('desktop-session-list')
+  const row = page.getByRole('row').filter({ hasText: 'scroll session 20' })
+  await row.scrollIntoViewIfNeeded()
+  const before = await list.evaluate((element) => element.scrollTop)
+  expect(before).toBeGreaterThan(200)
+
+  await row.getByRole('link', { name: 'Logs' }).click()
+  await expect(page).toHaveURL(new RegExp(`/session/${TARGET_ID}\\?mode=logs$`))
+
+  await holdAnimationFrames(page)
+
+  const backResponse = page.waitForResponse(isSessionListRequest)
+  await clickByText(page, 'button', 'Back to sessions')
+  await backResponse
+  await expect.poll(() => pageHasText(page, 'scroll session 20')).toBe(true)
+
+  const reloadResponse = page.waitForResponse(isSessionListRequest)
+  await clickByText(page, 'span', 'Open Relay')
+  await expect.poll(() => pageHasText(page, 'scroll session 20')).toBe(false)
+  await reloadResponse
+  await expect.poll(() => pageHasText(page, 'scroll session 20')).toBe(true)
+
+  await releaseAnimationFrames(page)
 
   await expect
     .poll(() => list.evaluate((element) => element.scrollTop))
