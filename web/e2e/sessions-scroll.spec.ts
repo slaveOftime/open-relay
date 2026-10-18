@@ -125,9 +125,8 @@ test('the card list comes back to its offset after a session round trip', async 
 
   await card.getByRole('link', { name: 'Logs' }).click()
   await expect(page).toHaveURL(new RegExp(`/session/${TARGET_ID}\\?mode=logs$`))
-  await expect(page.getByRole('button', { name: 'Back to sessions' })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Back to sessions' }).click()
+  await page.goBack()
   await expect(page).toHaveURL('/')
   await expect(card).toBeInViewport()
 
@@ -151,7 +150,7 @@ test('the desktop table comes back to its offset after a session round trip', as
   await row.getByRole('link', { name: 'Logs' }).click()
   await expect(page).toHaveURL(new RegExp(`/session/${TARGET_ID}\\?mode=logs$`))
 
-  await page.getByRole('button', { name: 'Back to sessions' }).click()
+  await page.goBack()
   await expect(page).toHaveURL('/')
   await expect(row).toBeInViewport()
 
@@ -268,7 +267,7 @@ test('the offset survives a reload that interrupts the restore', async ({ page }
   await holdAnimationFrames(page)
 
   const backResponse = page.waitForResponse(isSessionListRequest)
-  await clickByText(page, 'button', 'Back to sessions')
+  await page.goBack()
   await backResponse
   await expect.poll(() => pageHasText(page, 'scroll session 20')).toBe(true)
 

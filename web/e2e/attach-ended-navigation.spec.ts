@@ -8,9 +8,9 @@ import { test, expect, type Page } from '@playwright/test'
  * Back pointing at the attach URL, which reconnects, ends again and switches
  * right back — the sessions list becomes unreachable.
  *
- * The header's back button is the in-app way out (a standalone PWA has no
- * browser chrome to go back with), so it is covered from the list and from a
- * deep link, where there is no history entry to pop.
+ * The header logo is the in-app way out (a standalone PWA has no browser
+ * chrome to go back with), so leaving the page is covered from the list and
+ * from a deep link, where there is no history entry to pop.
  *
  * The file runs on Chromium and mobile Safari: the history and the PWA back
  * affordance are exactly the class of thing the engines differ on.
@@ -166,12 +166,11 @@ async function attachFromList(page: Page) {
   await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
 }
 
-test('the header back button returns from a live attach view to the list', async ({ page }) => {
+test('the header logo returns from a live attach view to the list', async ({ page }) => {
   await openAttach(page)
   await attachFromList(page)
 
-  await expect(page.getByRole('button', { name: 'Back to sessions' })).toBeVisible()
-  await page.getByRole('button', { name: 'Back to sessions' }).click()
+  await page.locator('header a[href="/"]').click()
 
   await expect(page).toHaveURL('/')
   await expect(page.getByTestId('session-card')).toBeVisible()
@@ -200,8 +199,7 @@ test('a deep link into a session still reaches the list', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
 
   await page.goto(`/session/${SESSION_ID}?mode=logs`)
-  await expect(page.getByRole('button', { name: 'Back to sessions' })).toBeVisible()
-  await page.getByRole('button', { name: 'Back to sessions' }).click()
+  await page.locator('header a[href="/"]').click()
 
   await expect(page).toHaveURL('/')
   await expect(page.getByTestId('session-card')).toBeVisible()
