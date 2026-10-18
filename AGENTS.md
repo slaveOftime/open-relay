@@ -50,8 +50,10 @@
 ## CI layout
 Workflows are scoped by change area, so a PR only runs what its diff can break:
 - `CI` (`ci.yml`) — Rust: fmt, clippy, the four-target test matrix, audit, and the release-workflow regressions.
-- `CI-WEB` (`ci-web.yml`) — `web/**`: lint, vitest, build, Playwright.
+- `CI-WEB` (`ci-web.yml`) — `web/**`: lint, vitest, build, Playwright, and `embed` — the release build that compiles the bundle into the binary.
 - `CI-DOCS` (`ci-docs.yml`) — Markdown, `docs/`, `skills/`, `src/**`: the offline documentation contracts.
 
-`CI-DOCS` is separate from `CI` because `docs_sync.py` cross-checks `src/**` and `skills/**` against the docs, so a docs-only change must be checked without waking the Rust matrix. `CI-WEB` covers the web bundle, but `CI` also lists `web/**`: `build.rs` runs the npm build for release profiles and `src/http/mod.rs` embeds `web/dist`, so only `CI` proves the bundle is still embeddable — mirror `build.rs`'s web `cargo:rerun-if-changed` entries there. When a new top-level directory becomes a compile-time input (`include_str!`, `sqlx::migrate!`, a `rust-embed` folder, or a `build.rs` resource), add it to the `ci.yml` trigger lists: an omitted input is a silent coverage gap, not a failure. Every workflow also accepts `workflow_dispatch`, which ignores filters.
+`CI-DOCS` is separate from `CI` because `docs_sync.py` cross-checks `src/**` and `skills/**` against the docs, so a docs-only change must be checked without waking the Rust matrix. `CI` deliberately lists no `web/**` so a web-only PR never pays for the three-OS matrix/clippy/audit, and that proof now lives in CI-WEB's `embed` job (one ubuntu release build reusing the shared cargo cache).
+
+When a new top-level directory becomes a compile-time input (`include_str!`, `sqlx::migrate!`, a `rust-embed` folder, or a `build.rs` resource), add it to the `ci.yml` trigger lists unless it has a check of its own — the web bundle is the example: CI-WEB's `embed` job. An omitted input is a silent coverage gap, not a failure. Every workflow also accepts `workflow_dispatch`, which ignores filters.
 

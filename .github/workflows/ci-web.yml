@@ -130,3 +130,36 @@ jobs:
       # here would fail with "Executable doesn't exist" for the WebKit binary.
       - name: Playwright e2e
         run: npm run e2e -- --project=chromium
+
+  # The Rust workflow (ci.yml) deliberately lists no web/**, so this is where a
+  # web change proves the release build still compiles the bundle into the
+  # binary: build.rs runs `npm install` + `npm run build` for release profiles
+  # and src/http/mod.rs embeds web/dist via rust-embed.
+  embed:
+    name: embed
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Same shared key as ci.yml so both workflows reuse one cache family.
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-oly
+          cache-on-failure: true
+
+      # `defaults.run.working-directory` points at web/, but cargo runs at the
+      # workspace root; build.rs runs the web build itself for release.
+      - name: Build release with the embedded bundle
+        working-directory: ${{ github.workspace }}
+        run: cargo build --release --locked
