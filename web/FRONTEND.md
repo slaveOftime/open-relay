@@ -207,6 +207,15 @@ primary accent.
   collapsed content clamps the old offset to 0. Scrolls seen while the list has
   no rows are that clamp, not the user, and are not saved. `sessions-scroll.spec.ts`
   covers both scrollports and the interrupting reload.
+- **A hidden textarea is not an append-only log.** xterm reads a soft keyboard
+  by diffing `.xterm-helper-textarea`, and the diff (`newValue.replace(oldValue, '')`)
+  only handles appends: an auto-paired quote, or a correction that edits in
+  place, makes it miss and re-send the whole buffer on every later key — the
+  reported `"""d"` on Android. `components/terminal/soft-keyboard-input.ts`
+  keeps the textarea empty on touch platforms (cancel the insertion, send its
+  data once, sweep silent residue before xterm samples the next key) and
+  defers its post-composition clear past xterm's 0ms read of the textarea;
+  `e2e/attach-soft-keyboard.spec.ts` holds the report.
 
 ## Avoid
 
