@@ -65,6 +65,32 @@ pub(crate) fn handle_clipboard_paste_with(
     read_text()
 }
 
+/// True when `payload` is the outer terminal's own text for a clipboard file.
+///
+/// A file copied in Explorer puts `CF_HDROP` on the clipboard without text, so
+/// the terminal's paste binding renders it as the first file's client-local
+/// path (double-quoted when it contains spaces). That path names the client
+/// machine's file, not the session's copy, so attach replaces the paste with
+/// the session-local upload path instead of forwarding it.
+pub fn paste_is_clipboard_file_path(payload: &str) -> Result<bool> {
+    let Some(paths) = read_clipboard_files()? else {
+        return Ok(false);
+    };
+
+    Ok(pastes_clipboard_file(payload, &paths))
+}
+
+/// Path comparison for [`paste_is_clipboard_file_path`], separated from OS
+/// clipboard access so the match policy is testable without a clipboard.
+fn pastes_clipboard_file(payload: &str, paths: &[PathBuf]) -> bool {
+    let payload = payload.trim();
+    let unquoted = payload.trim_matches('"');
+    paths.iter().any(|path| {
+        let path = path.to_string_lossy();
+        payload == path || unquoted == path
+    })
+}
+
 pub enum RemoteClipboardTransfer {
     Text(String),
     Files(Vec<RemoteClipboardFile>),
@@ -299,5 +325,25 @@ mod tests {
     fn test_format_saved_paths_joins_with_newlines() {
         let paths = vec![PathBuf::from("one.txt"), PathBuf::from("two.txt")];
         assert_eq!(format_saved_paths(&paths), "one.txt\ntwo.txt");
+    }
+
+    #[test]
+    fn test_pastes_clipboard_file_matches_terminal_path_rendering() {
+        let paths = vec![
+            PathBuf::from(r"C:\Users\me\screenshot.png"),
+            PathBuf::from(r"C:\Program Files\report.txt"),
+        ];
+        assert!(pastes_clipboard_file(r"C:\Users\me\screenshot.png", &paths));
+        assert!(pastes_clipboard_file(
+            "\"C:\\Program Files\\report.txt\"",
+            &paths
+        ));
+        assert!(pastes_clipboard_file(
+            "  C:\\Users\\me\\screenshot.png \r\n",
+            &paths
+        ));
+        assert!(!pastes_clipboard_file(r"C:\Users\me\other.png", &paths));
+        assert!(!pastes_clipboard_file("", &paths));
+        assert!(!pastes_clipboard_file(r"C:\Users\me\screenshot.png", &[]));
     }
 }

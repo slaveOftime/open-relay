@@ -528,6 +528,11 @@ async fn run_attach_inner(
             }
         });
 
+        // Windows Terminal pastes the client-local path of a clipboard file
+        // and then reports the shortcut release; the release is consumed here
+        // instead of uploading the file again.
+        let mut clipboard_file_paste = ClipboardFilePasteHandoff::default();
+
         while running {
             tokio::select! {
                     biased;
@@ -564,12 +569,26 @@ async fn run_attach_inner(
                                 // Explicit bracketed-paste boundaries: send the
                                 // paste as one bounded transaction, bytes
                                 // exactly as the terminal delivered them
-                                // (no CRLF rewriting).
+                                // (no CRLF rewriting). A clipboard file is the
+                                // exception: the terminal renders it as the
+                                // client-local path, which is replaced by the
+                                // session-local upload below.
                                 if can_drive {
+                                    let replaced = maybe_replace_clipboard_file_paste(
+                                        config,
+                                        id,
+                                        node,
+                                        &data,
+                                        child_bracketed_paste_mode,
+                                    )
+                                    .await?;
+                                    clipboard_file_paste.record_paste(replaced.is_some());
                                     send_attach_input(
                                         &mut write_half,
                                         &id_owned,
-                                        wrap_paste_input(data, child_bracketed_paste_mode),
+                                        replaced.unwrap_or_else(|| {
+                                            wrap_paste_input(data, child_bracketed_paste_mode)
+                                        }),
                                         false,
                                     )
                                     .await?;
@@ -627,23 +646,23 @@ async fn run_attach_inner(
                                     // and send the paste in one bounded
                                     // transaction. An empty or unavailable
                                     // clipboard swallows the shortcut rather than
-                                    // leaking a stray ^V into the session.
-                                    if let Some(data) = maybe_collect_clipboard_paste(
-                                        config,
-                                        id,
-                                        node,
-                                        key,
-                                        child_bracketed_paste_mode,
-                                    )
-                                    .await?
-                                    {
-                                        send_attach_input(
-                                            &mut write_half,
-                                            &id_owned,
-                                            data,
-                                            true,
+                                    // leaking a stray ^V into the session. When
+                                    // the terminal's own file-path paste was
+                                    // already replaced by the upload, this paired
+                                    // key-up is consumed instead of uploading a
+                                    // second copy.
+                                    if !clipboard_file_paste.claim_shortcut()
+                                        && let Some(data) = maybe_collect_clipboard_paste(
+                                            config,
+                                            id,
+                                            node,
+                                            key,
+                                            child_bracketed_paste_mode,
                                         )
-                                        .await?;
+                                        .await?
+                                    {
+                                        send_attach_input(&mut write_half, &id_owned, data, true)
+                                            .await?;
                                     }
                                 } else if !matches!(key.kind, KeyEventKind::Press) {
                                     // Key release/repeat events: not sent.
@@ -974,6 +993,31 @@ fn normalize_clipboard_text(data: String) -> String {
     data.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Pairs the terminal's clipboard-file paste with the shortcut key-up that
+/// follows it. Windows Terminal renders a copied file as the file's
+/// client-local path and then reports the Ctrl+V/Shift+Insert release. Attach
+/// replaces the paste with the session-local upload, and the paired release
+/// must be consumed instead of uploading the same file a second time.
+#[derive(Default)]
+struct ClipboardFilePasteHandoff {
+    replaced_paste: bool,
+}
+
+impl ClipboardFilePasteHandoff {
+    /// Record one terminal paste; `replaced` marks a clipboard-file path that
+    /// was replaced by the session-local upload.
+    fn record_paste(&mut self, replaced: bool) {
+        self.replaced_paste = replaced;
+    }
+
+    /// Claim the shortcut key that produced a replaced paste, if any. A later
+    /// ordinary paste clears the pairing, so a stale claim never suppresses a
+    /// fresh shortcut.
+    fn claim_shortcut(&mut self) -> bool {
+        std::mem::take(&mut self.replaced_paste)
+    }
+}
+
 async fn maybe_collect_clipboard_paste(
     config: &AppConfig,
     id: &str,
@@ -985,6 +1029,18 @@ async fn maybe_collect_clipboard_paste(
         return Ok(None);
     }
 
+    collect_clipboard_paste(config, id, node, bracketed_paste_mode).await
+}
+
+/// Read the clipboard the way the explicit paste shortcut does — files are
+/// copied into the session file area, images become PNGs, text is left to the
+/// terminal's own paste — and wrap the uploads as one bounded paste frame.
+async fn collect_clipboard_paste(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+    bracketed_paste_mode: bool,
+) -> Result<Option<Vec<u8>>> {
     let data = match node {
         Some(node) => handle_remote_clipboard_paste(config, id, node).await?,
         None => clipboard::handle_clipboard_paste(config, id, true)?,
@@ -993,6 +1049,32 @@ async fn maybe_collect_clipboard_paste(
     Ok(data
         .map(normalize_clipboard_text)
         .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
+}
+
+/// Replace the terminal's own paste of a clipboard file's client-local path
+/// with the session-local upload path. Returns `None` when `payload` is not a
+/// clipboard file, so ordinary text pastes pass through unchanged.
+async fn maybe_replace_clipboard_file_paste(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+    payload: &str,
+    bracketed_paste_mode: bool,
+) -> Result<Option<Vec<u8>>> {
+    // Only the Windows terminal paste binding renders a clipboard file as the
+    // copied file's client-local path (bitmap-only clipboards produce an empty
+    // paste that the shortcut key-up recovers).
+    if !cfg!(windows) || payload.is_empty() || !clipboard::paste_is_clipboard_file_path(payload)? {
+        return Ok(None);
+    }
+
+    match collect_clipboard_paste(config, id, node, bracketed_paste_mode).await? {
+        Some(data) => Ok(Some(data)),
+        // The clipboard changed between matching and uploading. The paste was
+        // still recognized as a client-local file path: suppress it rather
+        // than forward a path the child cannot open.
+        None => Ok(Some(Vec::new())),
+    }
 }
 
 async fn handle_remote_clipboard_paste(
@@ -1716,6 +1798,37 @@ mod tests {
             normalize_clipboard_text("line1\rline2\rline3".to_string()),
             "line1\nline2\nline3"
         );
+    }
+
+    #[test]
+    fn clipboard_file_paste_handoff_consumes_exactly_one_paired_shortcut() {
+        let mut handoff = ClipboardFilePasteHandoff::default();
+
+        // A replaced clipboard-file paste consumes the shortcut key-up that
+        // the terminal reports after it — and only that one.
+        handoff.record_paste(true);
+        assert!(handoff.claim_shortcut());
+        assert!(!handoff.claim_shortcut());
+
+        // Ordinary pastes never claim a shortcut.
+        handoff.record_paste(false);
+        assert!(!handoff.claim_shortcut());
+    }
+
+    #[test]
+    fn clipboard_file_paste_handoff_forgets_a_stale_replacement() {
+        let mut handoff = ClipboardFilePasteHandoff::default();
+
+        // Right-click file paste: replaced, but no shortcut key follows. A
+        // later ordinary paste or a fresh shortcut must not be suppressed.
+        handoff.record_paste(true);
+        handoff.record_paste(false);
+        assert!(!handoff.claim_shortcut());
+
+        handoff.record_paste(true);
+        assert!(handoff.claim_shortcut());
+        handoff.record_paste(true);
+        assert!(handoff.claim_shortcut());
     }
 
     #[test]
