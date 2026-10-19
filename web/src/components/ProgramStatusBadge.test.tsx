@@ -35,12 +35,14 @@ describe('ProgramStatusBadge', () => {
           'text-xs',
           'tabular-nums',
           'max-w-full',
-          'rounded-md',
+          'rounded-full',
           'px-2',
-          'whitespace-normal',
+          // One-line pill, like every other Badge: `max-w-full` clamps the box
+          // and the status cell/card header own the width, so the label must
+          // never wrap the badge into a taller shape.
+          'whitespace-nowrap',
         ])
       )
-      expect(classes).not.toContain('whitespace-nowrap')
       expect(classes).not.toContain('font-light')
       expect(classes).not.toContain('font-semibold')
       expect(markup).toContain(`>${label}</div>`)
