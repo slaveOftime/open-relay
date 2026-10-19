@@ -193,7 +193,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   return (
     <div
       ref={rootRef}
-      className={cn('absolute right-5 bottom-70 z-10 h-12 w-12 md:hidden', open && 'z-30')}
+      className={cn('absolute right-5 bottom-70 z-100 h-12 w-12 md:hidden', open && 'z-30')}
       style={reposition.style}
     >
       {/* The bar: trigger-sized when closed, grown out of the trigger's right
