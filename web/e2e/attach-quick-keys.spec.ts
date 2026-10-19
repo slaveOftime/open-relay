@@ -196,6 +196,28 @@ test('holding a quick key repeats and keeps focus', async ({ page }) => {
   expect(await focusState(page)).toBe('button[Left]')
 })
 
+test('the key composer hint explains the rules for touch and keyboard', async ({ page }) => {
+  const inputs: string[] = []
+  await stubApi(page, inputs)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/session/${SESSION_ID}?mode=attach`)
+  await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
+
+  // The composer is in the drawer, collapsed on the phone viewport.
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  const hint = page.getByRole('button', { name: 'Key input rules' })
+  await expect(hint).toBeVisible()
+
+  // Focus, not hover: Radix ignores touch pointer-moves, so focus is the path
+  // that behaves identically on Chromium and the mobile-Safari profile.
+  await hint.focus()
+  const tooltip = page.getByRole('tooltip')
+  await expect(tooltip).toBeVisible()
+  await expect(tooltip).toContainText('each extra space sends a Space')
+  await expect(tooltip).toContainText('Named keys')
+})
+
 test('a hold-then-drag moves the scroll handle and remembers it', async ({ page }) => {
   const inputs: string[] = []
   await stubApi(page, inputs)

@@ -24,6 +24,7 @@ import {
   type SessionImagePreviews,
 } from './attach-panel-image-preview'
 import ImagePreviewDialog from '@/components/dialogs/ImagePreviewDialog'
+import KeyInputRulesHint from '@/components/KeyInputRulesHint'
 import {} from '@radix-ui/react-icons'
 import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
 import { MobileKeyBar } from './attach-mobile-key-bar'
@@ -585,6 +586,7 @@ export default function AttachPanel({
               <ClearableInput
                 id="custom-keys"
                 className="text-sm"
+                containerClassName="min-w-0 flex-1"
                 placeholder="Keys separated by spaces. Two spaces send a Space. Enter sends."
                 clearLabel="Clear keys"
                 value={customKeys}
@@ -596,6 +598,7 @@ export default function AttachPanel({
                   }
                 }}
               />
+              <KeyInputRulesHint />
             </div>
           </div>
           <div>

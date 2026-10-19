@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { cn } from '@/utils/cn'
+import KeyInputRulesHint from '@/components/KeyInputRulesHint'
 import {
   getQuickKeys,
   resetQuickKeys,
@@ -325,6 +326,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
               aria-label="Button label"
               maxLength={4}
             />
+            <KeyInputRulesHint side="top" />
           </div>
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
