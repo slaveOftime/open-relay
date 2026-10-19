@@ -7,6 +7,7 @@ import { cn } from '@/utils/cn'
 import QuickKeysMenu from './QuickKeysMenu'
 import QuickKeysDialog from './QuickKeysDialog'
 import { markOwnedTerminalWheel, wheelOrigin } from './scroll-wheel'
+import { attachSoftKeyboardInput } from './soft-keyboard-input'
 import { getTerminalTheme, subscribeTerminalColorScheme } from './xterm-theme'
 import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
@@ -362,6 +363,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     container.addEventListener('touchend', handleTouchEnd, { passive: true })
     term.textarea?.addEventListener('focus', handleTerminalFocus)
     term.textarea?.addEventListener('paste', handlePaste, true)
+    // Keep the soft keyboard's hidden textarea empty: see the module comment
+    // for the replay bug this prevents on Android and iOS.
+    const detachSoftKeyboardInput = attachSoftKeyboardInput(term, container)
 
     return () => {
       // Null refs immediately so any in-flight callbacks become no-ops
@@ -379,6 +383,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       container.removeEventListener('touchend', handleTouchEnd)
       term.textarea?.removeEventListener('focus', handleTerminalFocus)
       term.textarea?.removeEventListener('paste', handlePaste)
+      detachSoftKeyboardInput()
       // Defer dispose by TWO frames so xterm's own internally-scheduled
       // RAFs can fully drain before _renderService is torn down.
       requestAnimationFrame(() => requestAnimationFrame(() => term.dispose()))
