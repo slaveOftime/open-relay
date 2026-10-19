@@ -95,6 +95,18 @@ describe('sendCustomKeys', () => {
     expect(calls.sendInput).toHaveBeenCalledWith('\x03')
   })
 
+  it('sends a Space for every space past the first in a run', () => {
+    const { t, calls } = target()
+
+    sendCustomKeys({ text: 'a  b', onSent: () => {}, ...t })
+
+    expect(calls.sendInput).toHaveBeenCalledTimes(3)
+    expect(calls.sendInput).toHaveBeenNthCalledWith(1, 'a')
+    expect(calls.sendInput).toHaveBeenNthCalledWith(2, ' ')
+    expect(calls.sendInput).toHaveBeenNthCalledWith(3, 'b')
+    expect(calls.showKeyError).not.toHaveBeenCalled()
+  })
+
   it('clears the composer only after every spec was accepted', () => {
     const onSent = vi.fn()
     const { t, calls } = target()

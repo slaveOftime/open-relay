@@ -27,7 +27,9 @@ src/
 
 `components/` also holds a handful of singletons that belong to no group:
 `Logo`, `CommandLogo`, `StatusBadge`, `NodeSelector`, `SseStatusDot`,
-`NotificationToggle`, `ErrorBoundary`. `StatusBadge` composes a separate
+`NotificationToggle`, `KeyInputRulesHint`, `ErrorBoundary`. `KeyInputRulesHint`
+owns the popup that explains the key composer's rules (space counting, named
+keys, combos) wherever a composer appears. `StatusBadge` composes a separate
 `ProgramStatusBadge` for optional OSC 7501 app state. The backend `input_needed`
 flag includes live idle/done readiness and blocked/error attention. Do not hide
 that flag when an explicit report exists: live idle/done show **Ready for Input**

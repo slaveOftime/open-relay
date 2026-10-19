@@ -258,6 +258,35 @@ export function parseKeyInputSpecs(specs: string[]): string[] {
   return parsed
 }
 
+/**
+ * Split composer text into key specs.
+ *
+ * A single run of whitespace separates two specs and produces no output, but
+ * the run is also how a literal Space is typed: the first space separates,
+ * and every space after it presses Space once. `a b` therefore sends `a`, `b`,
+ * while `a  b` sends `a`, Space, `b` and `a   b` sends `a`, Space, Space, `b`.
+ * The named `space` word still works when a caller prefers to be explicit.
+ *
+ * Only the runs *between* specs are counted; leading and trailing whitespace
+ * is ignored, so an accidental space at an edge does not fire a keypress.
+ */
 export function splitKeyInput(input: string): string[] {
-  return input.trim().split(/\s+/).filter(Boolean)
+  const specs: string[] = []
+  const trimmed = input.trim()
+  let index = 0
+
+  while (index < trimmed.length) {
+    const wordStart = index
+    while (index < trimmed.length && !/\s/.test(trimmed[index])) index += 1
+    specs.push(trimmed.slice(wordStart, index))
+
+    let spaces = 0
+    while (index < trimmed.length && /\s/.test(trimmed[index])) {
+      spaces += 1
+      index += 1
+    }
+    for (let extra = 1; extra < spaces; extra += 1) specs.push('space')
+  }
+
+  return specs
 }
