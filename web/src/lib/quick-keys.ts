@@ -144,6 +144,10 @@ export function encodeCombo(raw: string): string | null {
  * `space`, `tab`, ...); otherwise it is expanded into its individual
  * characters, mirroring AttachPanel's custom-keys input. Unknown words
  * therefore send their letters rather than being rejected.
+ *
+ * Spaces follow the composer's rule: one space separates specs, and each
+ * additional space is a literal Space, so `a  b` sends `a b`. The `space`
+ * word keeps working for callers that want it spelled out.
  */
 export function encodeQuickKeyCombo(raw: string): string | null {
   const trimmed = raw.trim()

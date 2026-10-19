@@ -585,7 +585,7 @@ export default function AttachPanel({
               <ClearableInput
                 id="custom-keys"
                 className="text-sm"
-                placeholder="Keys separated by whitespace. Press enter to send."
+                placeholder="Keys separated by spaces. Two spaces send a Space. Enter sends."
                 clearLabel="Clear keys"
                 value={customKeys}
                 onChange={(e) => updateCustomKeys(e.target.value)}

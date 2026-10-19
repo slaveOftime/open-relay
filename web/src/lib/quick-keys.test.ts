@@ -66,6 +66,11 @@ describe('encodeQuickKeyCombo', () => {
     expect(encodeQuickKeyCombo('ls -al enter')).toBe('ls-al\r')
     expect(encodeQuickKeyCombo('hello space world')).toBe('hello world')
   })
+
+  it('treats extra spaces as literal Space keys', () => {
+    expect(encodeQuickKeyCombo('hello  world')).toBe('hello world')
+    expect(encodeQuickKeyCombo('a   b')).toBe('a  b')
+  })
 })
 
 describe('parseCombo', () => {

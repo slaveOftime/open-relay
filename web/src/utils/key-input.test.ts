@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { namedKeySequence, parseKeySpec, parseKeyInputSpecs, modifierToken } from './key-input'
+import {
+  namedKeySequence,
+  parseKeySpec,
+  parseKeyInputSpecs,
+  modifierToken,
+  splitKeyInput,
+} from './key-input'
 
 // ── namedKeySequence ──────────────────────────────────────────────────────────
 
@@ -287,6 +293,35 @@ describe('parseKeyInputSpecs', () => {
 
   it('consecutive modifiers is an error', () => {
     expect(() => parseKeyInputSpecs(['ctrl', 'alt', 'c'])).toThrow()
+  })
+})
+
+// ── splitKeyInput ─────────────────────────────────────────────────────────────
+
+describe('splitKeyInput', () => {
+  it('uses a single space as a separator with no output', () => {
+    expect(splitKeyInput('a b')).toEqual(['a', 'b'])
+    expect(splitKeyInput('ctrl c ctrl d')).toEqual(['ctrl', 'c', 'ctrl', 'd'])
+  })
+
+  it('turns every space past the first in a run into a Space', () => {
+    expect(splitKeyInput('a  b')).toEqual(['a', 'space', 'b'])
+    expect(splitKeyInput('a   b')).toEqual(['a', 'space', 'space', 'b'])
+  })
+
+  it('counts each run between specs independently', () => {
+    expect(splitKeyInput('a  b   c')).toEqual(['a', 'space', 'b', 'space', 'space', 'c'])
+  })
+
+  it('ignores leading and trailing whitespace', () => {
+    expect(splitKeyInput('  a  ')).toEqual(['a'])
+    expect(splitKeyInput('a  ')).toEqual(['a'])
+    expect(splitKeyInput('   ')).toEqual([])
+    expect(splitKeyInput('')).toEqual([])
+  })
+
+  it('feeds the Space tokens through the spec parser as literal spaces', () => {
+    expect(parseKeyInputSpecs(splitKeyInput('a  b'))).toEqual(['a', ' ', 'b'])
   })
 })
 

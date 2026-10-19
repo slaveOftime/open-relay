@@ -312,7 +312,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
               containerClassName="flex-1 min-w-0"
               value={combo}
               onChange={(event) => setCombo(event.target.value)}
-              placeholder="Combo, e.g. ctrl+c or enter space"
+              placeholder="Combo, e.g. ctrl+c or a  b (two spaces = Space)"
               clearLabel="Clear combo"
               className="h-11 w-full"
               aria-label="Key combo"
@@ -330,7 +330,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
             <span className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
               {preview
                 ? `Sends: ${describeData(preview).replaceAll(' ', '␣')}`
-                : 'e.g. ctrl+c, shift+tab, alt+f, text, enter, or space'}
+                : 'e.g. ctrl+c, shift+tab, alt+f, text, enter, or two spaces for Space'}
             </span>
             <Button type="submit" size="sm" variant="outline" disabled={!combo.trim()}>
               <Plus className="h-4 w-4" />
