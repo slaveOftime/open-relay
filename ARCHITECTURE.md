@@ -153,7 +153,11 @@ Design points worth knowing before touching this code:
   Terminal can consume Ctrl+V/Shift+Insert key-down for its paste binding;
   bitmap-only paste emits no text, so an unmatched shortcut key-up must
   recover the clipboard action once. Key-up after an observed press must
-  not duplicate it. Shortcut bytes inside bracketed paste remain literal.
+  not duplicate it. A clipboard file is rendered as its client-local path:
+  attach matches that paste against the clipboard file list, replaces it with
+  the session-local upload, and consumes the paired shortcut key-up so the
+  file is uploaded and typed exactly once. Shortcut bytes inside bracketed
+  paste remain literal.
   Teardown disables mode 9001 before returning control to the parent shell.
 - **Stop keys precede signal escalation.** The shared stop path (CLI/TUI,
   HTTP/RPC/federation, daemon shutdown) queues Ctrl-C, repeated Ctrl-C at
