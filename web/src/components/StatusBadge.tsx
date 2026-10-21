@@ -61,7 +61,7 @@ export default function StatusBadge({ status, inputNeeded, showDot = true, progr
   return (
     <span className="inline-flex max-w-full items-center gap-1">
       {programStatus && <ProgramStatusBadge report={programStatus} />}
-      {!programStatus && <Badge
+      <Badge
         key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
         variant={variant}
         className="whitespace-nowrap text-xs font-light"
@@ -73,7 +73,7 @@ export default function StatusBadge({ status, inputNeeded, showDot = true, progr
           />
         )}
         <span>{label}</span>
-      </Badge>}
+      </Badge>
     </span>
   )
 }
