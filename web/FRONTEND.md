@@ -213,11 +213,13 @@ primary accent.
   terminal pinned to the bottom: `scrollBy` is a no-op and the IME paints over
   the cursor row. The layout viewport does not shrink for the keyboard, so
   `hooks/use-soft-keyboard-inset.ts` measures the `visualViewport` overlap and
-  the page reserves that strip at the bottom; FitAddon then drops rows and
-  reports the smaller grid to the PTY. Differences below a keyboard's size are
-  browser chrome and must not trigger a refit.
-  `e2e/attach-soft-keyboard-viewport.spec.ts` fakes the viewport height, holds
-  the terminal's last row above the keyboard, and types through the refit.
+  the page shifts its body up by that strip. The terminal keeps its grid: do
+  not shrink its container for the IME, because focus/blur would then make
+  FitAddon report a new size and send a PTY resize on every keyboard toggle.
+  Differences below a keyboard's size are browser chrome and must not move the
+  body. `e2e/attach-soft-keyboard-viewport.spec.ts` fakes the viewport height,
+  holds the terminal's last row above the keyboard, asserts the rows and resize
+  frames stay unchanged, and types through the shift.
 - **A hidden textarea is not an append-only log.** xterm reads a soft keyboard
   by diffing `.xterm-helper-textarea`, and the diff (`newValue.replace(oldValue, '')`)
   only handles appends: an auto-paired quote, or a correction that edits in

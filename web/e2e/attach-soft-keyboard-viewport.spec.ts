@@ -6,8 +6,9 @@ import { devices, expect, test, type Page } from '@playwright/test'
  * The reported regression: after tapping the terminal, the on-screen keyboard
  * covers the bottom rows; with the cursor parked at the bottom, the user cannot
  * see what they type. The page is a full-height flex layout, so there is no
- * scroll range to reveal the terminal — the only fix is to fit the shell to
- * `window.visualViewport`, let FitAddon drop rows and report the smaller grid.
+ * scroll range to reveal the terminal. Shift the body up by the overlap
+ * instead: resizing the terminal would make FitAddon report a new grid and
+ * send a PTY resize every time focus opens or closes the keyboard.
  *
  * Playwright cannot raise a real IME, so the test replaces the visual
  * viewport's height (the one signal the browser gives the page) and dispatches
@@ -166,7 +167,7 @@ function lastVisibleRow(page: Page): Promise<string> {
   })
 }
 
-/** Let the ResizeObserver -> FitAddon -> debounced resize report settle. */
+/** Let the initial FitAddon layout settle. */
 async function settleRows(page: Page): Promise<number> {
   let previous = await terminalRows(page)
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -178,20 +179,22 @@ async function settleRows(page: Page): Promise<number> {
   return previous
 }
 
-function lastResize(harness: ViewportHarness): { rows: number; cols: number } | null {
-  return (
-    (harness.messages.filter((message) => message.type === 'resize').at(-1) as
-      { rows: number; cols: number } | undefined) ?? null
-  )
+function resizeCount(harness: ViewportHarness): number {
+  return harness.messages.filter((message) => message.type === 'resize').length
 }
 
-test('the keyboard viewport keeps the terminal cursor above the IME', async ({ page }) => {
+test('the keyboard viewport moves the terminal above the IME without resizing it', async ({
+  page,
+}) => {
   const harness: ViewportHarness = { inputs: [], messages: [] }
   await openAttach(page, harness)
 
   const layoutHeight = await page.evaluate(() => document.documentElement.clientHeight)
   const fullRows = await settleRows(page)
   expect(fullRows).toBeGreaterThan(0)
+  // Let the initial fit and its debounced resize report settle.
+  await page.waitForTimeout(300)
+  const resizesBeforeKeyboard = resizeCount(harness)
   // The fixture ends in a shell prompt; that row is the cursor's row.
   expect(await lastVisibleRow(page)).toContain('$')
 
@@ -201,31 +204,25 @@ test('the keyboard viewport keeps the terminal cursor above the IME', async ({ p
 
   await setKeyboardHeight(page, KEYBOARD_HEIGHT)
 
-  const shrunkRows = await settleRows(page)
   const keyboardTop = layoutHeight - KEYBOARD_HEIGHT
   // Nothing may be left under the keyboard — least of all the cursor row.
   await expect.poll(() => terminalBottom(page)).toBeLessThanOrEqual(keyboardTop + 1)
-  expect(shrunkRows).toBeLessThan(fullRows)
-  // The row being typed on is still rendered — the refit may not leave the
-  // viewport parked on older scrollback.
+  // The body shifts, not the terminal: same grid, same PTY size.
+  expect(await terminalRows(page)).toBe(fullRows)
+  expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
+  // The row being typed on is still rendered.
   expect(await lastVisibleRow(page)).toContain('$')
 
-  // The PTY has to learn the new grid, or programs keep drawing for rows the
-  // user cannot see.
-  await expect
-    .poll(() => lastResize(harness)?.rows ?? -1, {
-      message: 'the PTY must be resized to the grid above the keyboard',
-    })
-    .toBe(shrunkRows)
-
-  // Typing still reaches the session, and focus is not lost to the refit.
+  // Typing still reaches the session, and focus is not lost to the shift.
   await expect(page.locator('.xterm-helper-textarea')).toBeFocused()
   await page.keyboard.type('hi')
   await expect.poll(() => harness.inputs.join('')).toBe('hi')
 
-  // Dismissing the keyboard gives the rows back.
+  // Dismissing the keyboard restores the layout without a resize either.
   await setKeyboardHeight(page, 0)
   await expect.poll(() => terminalBottom(page)).toBeGreaterThan(layoutHeight - KEYBOARD_HEIGHT)
-  expect(await settleRows(page)).toBe(fullRows)
+  await page.waitForTimeout(300)
+  expect(await terminalRows(page)).toBe(fullRows)
+  expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
   expect(await lastVisibleRow(page)).toContain('$')
 })

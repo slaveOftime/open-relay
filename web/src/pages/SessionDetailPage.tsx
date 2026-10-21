@@ -110,8 +110,8 @@ function SessionDetailPageContent() {
   const node = searchParams.get('node')
   const liveSession = useLiveSessionSummary(id, node)
   // The mobile keyboard is painted over the layout viewport, not included in
-  // it. Reserve the covered strip at the bottom of this full-height page so the
-  // terminal fits above the IME and keeps its cursor row visible while typing.
+  // it. Shift the body up by the covered strip so the terminal stays above the
+  // IME without changing its grid or sending a PTY resize on focus/blur.
   const keyboardInset = useSoftKeyboardInset()
 
   const [session, setSession] = useState<SessionSummary | null>(null)
@@ -1314,10 +1314,7 @@ function SessionDetailPageContent() {
   )
   return (
     <TooltipProvider>
-      <div
-        style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
-        className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh"
-      >
+      <div className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh">
         {/* ── Header ── */}
         <header className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
           <Link to="/">
@@ -1601,7 +1598,11 @@ function SessionDetailPageContent() {
             redundant scroll container. On sm+ the panel is a fixed sidebar, so
             clip instead of scroll.
           */}
-          <div id="main-container" className="h-full sm:flex sm:overflow-hidden">
+          <div
+            id="main-container"
+            style={keyboardInset > 0 ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
+            className="h-full sm:flex sm:overflow-hidden"
+          >
             {/* Terminal area */}
             <div
               className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}

@@ -3,10 +3,9 @@
  *
  * `window.innerHeight` keeps the keyboard's height on Android Chrome (and
  * WebKit), so a layout rooted in `100dvh` stays full-screen and paints its
- * bottom rows underneath the IME. Subtracting this inset from the page shell
- * gives the terminal the visible height: FitAddon drops rows, ResizeObserver
- * reports the new size, and the bottom row — where the cursor sits while you
- * type — is restored above the keyboard.
+ * bottom rows underneath the IME. Shifting the page body up by this inset
+ * keeps the bottom row — where the cursor sits while you type — above the
+ * keyboard without changing the terminal's grid or resizing the PTY.
  *
  * The reading comes from `visualViewport`, the only cross-browser report of
  * the area the keyboard has not covered. It is a numeric snapshot so

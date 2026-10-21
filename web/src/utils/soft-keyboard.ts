@@ -9,7 +9,8 @@
  * cursor underneath the keyboard.
  *
  * Small differences are browser chrome (the URL bar animating in and out), not
- * a keyboard, and fitting the app to those would refit the PTY on every scroll.
+ * a keyboard, and shifting the body for those would make the layout jump on
+ * every scroll.
  */
 
 /**
