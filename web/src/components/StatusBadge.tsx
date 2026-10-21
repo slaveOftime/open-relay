@@ -47,20 +47,25 @@ function dotColor(status: SessionStatus, inputNeeded: boolean): string {
 }
 
 export default function StatusBadge({ status, inputNeeded, showDot = true, programStatus }: Props) {
-  // Lifecycle remains authoritative; retained reports cannot make an ended
-  // process ready for input. Show readiness without implying a blocked prompt.
+  // A program report replaces the lifecycle badge: the report is the single
+  // visible status, while the lifecycle remains available from the API.
+  if (programStatus) {
+    return (
+      <span className="inline-flex max-w-full items-center gap-1">
+        <ProgramStatusBadge report={programStatus} />
+      </span>
+    )
+  }
+
+  // Without a report the lifecycle is authoritative; a stale flag cannot make
+  // an ended process ready for input.
   inputNeeded = status === 'running' && inputNeeded
-  const readyForInput =
-    inputNeeded && (programStatus?.state === 'idle' || programStatus?.state === 'done')
   const variant = statusVariant(status, inputNeeded)
-  const label = readyForInput ? 'Ready for Input' : statusLabel(status, inputNeeded)
-  const shouldPulseDot =
-    (inputNeeded && !readyForInput) ||
-    (status === 'running' && (!programStatus || programStatus.state === 'working'))
+  const label = statusLabel(status, inputNeeded)
+  const shouldPulseDot = status === 'running'
 
   return (
     <span className="inline-flex max-w-full items-center gap-1">
-      {programStatus && <ProgramStatusBadge report={programStatus} />}
       <Badge
         key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
         variant={variant}

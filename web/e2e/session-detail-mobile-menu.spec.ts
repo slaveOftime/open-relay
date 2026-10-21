@@ -121,8 +121,8 @@ test('the mobile header scrolls its metadata instead of squeezing the session id
   // of the scrolling part so it cannot be pushed off the right edge.
   const sessionId = 'b7f2c9d4-8a1e-4c3b-9f2d-5e6a7b8c9d0e'
   await page.setViewportSize({ width: 375, height: 667 })
-  // Running with an agent report is the busiest the header gets: the id, the
-  // status badge and the program badge, all in one row.
+  // Running with an agent report is the busiest the header gets: the id and the
+  // program badge, which replaces the lifecycle badge, all in one row.
   await seedSessionDetail(page, sessionId, {
     program_status: { state: 'working', app: 'claude', progress: 42 },
   })

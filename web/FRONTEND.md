@@ -30,14 +30,14 @@ src/
 `NotificationToggle`, `KeyInputRulesHint`, `ErrorBoundary`. `KeyInputRulesHint`
 owns the popup that explains the key composer's rules (space counting, named
 keys, combos) wherever a composer appears. `StatusBadge` composes a separate
-`ProgramStatusBadge` for optional OSC 7501 app state. The backend `input_needed`
-flag includes live idle/done readiness and blocked/error attention. Do not hide
-that flag when an explicit report exists: live idle/done show **Ready for Input**
-without a busy pulse; blocked/error keep **Input Needed** and the app's reason.
-Process lifecycle remains in the primary badge tooltip and API. A non-running
-process must never display ready/input-needed, even if a stale flag arrives.
-These are plain-text, untrusted reports from the owning session, not verified
-completion or approval authority. Program-state colors use dedicated `program-*`
+`ProgramStatusBadge` for optional OSC 7501 app state. When a report exists,
+render only the program badge: the report replaces the lifecycle label, while
+the process lifecycle remains available from the API. Without a report, the
+lifecycle badge remains authoritative, including **Input Needed** when the
+backend `input_needed` attention flag is set. A non-running process must never
+display ready/input-needed, even if a stale flag arrives. These are plain-text,
+untrusted reports from the owning session, not verified completion or approval
+authority. Program-state colors use dedicated `program-*`
 Badge variants and `--program-status-*` theme tokens rather than lifecycle
 variants, so retheming reports does not change process status badges.
 `sameSessionSummary` must compare their fields so status-only SSE updates reach

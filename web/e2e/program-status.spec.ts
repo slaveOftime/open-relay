@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test'
 import type { Locator, Page } from '@playwright/test'
 
 for (const mobile of [false, true]) {
-  test(`OSC 7501 status changes update ${mobile ? 'cards' : 'rows'} without changing lifecycle`, async ({
+  test(`OSC 7501 status changes replace the ${mobile ? 'card' : 'row'} lifecycle label`, async ({
     page,
   }) => {
     await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1280, height: 800 })
@@ -52,6 +52,7 @@ for (const mobile of [false, true]) {
     const view = mobile ? page.getByTestId('mobile-session-content') : page.getByRole('table')
     await expect(view.getByText('status fixture', { exact: true })).toBeVisible()
     await expect(view.getByText('Working 10%', { exact: true })).toBeVisible()
+    await expect(view.getByText('Running', { exact: true })).toHaveCount(0)
     await expect
       .poll(() =>
         page.evaluate(() => typeof (window as Window & { emitStatus?: unknown }).emitStatus)
@@ -77,21 +78,12 @@ for (const mobile of [false, true]) {
         { ...session, input_needed: report.state !== 'working', program_status: report }
       )
       await expect(view.getByText(label, { exact: true })).toBeVisible()
-      const ready = report.state === 'idle' || report.state === 'done'
-      const primary = ready
-        ? 'Ready for Input'
-        : report.state === 'working'
-          ? 'Running'
-          : 'Input Needed'
-      await expect(view.getByText(primary, { exact: true })).toBeVisible()
-      await expect(view.getByTitle('Process: Running', { exact: true })).toBeVisible()
-      if (report.state !== 'working') {
-        await expect(view.getByText('Running', { exact: true })).toHaveCount(0)
-      }
-      await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(ready ? 1 : 0)
-      await expect(view.getByTitle('Process: Running').locator('.animate-pulse')).toHaveCount(
-        ready ? 0 : 1
-      )
+      // The report replaces the lifecycle badge, so no lifecycle label or
+      // tooltip remains while a report is present.
+      await expect(view.getByTitle('Process: Running', { exact: true })).toHaveCount(0)
+      await expect(view.getByText('Running', { exact: true })).toHaveCount(0)
+      await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(0)
+      await expect(view.getByText('Input Needed', { exact: true })).toHaveCount(0)
     }
     await page.evaluate(
       (data) => {
@@ -102,14 +94,16 @@ for (const mobile of [false, true]) {
     await expect(view.getByText('Task Done', { exact: true })).toHaveCount(0)
     await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(0)
     await expect(view.getByText('Running', { exact: true })).toBeVisible()
+    await expect(view.getByTitle('Process: Running', { exact: true })).toBeVisible()
     await page.evaluate(
       (data) => {
         ;(window as Window & { emitStatus?: (data: unknown) => void }).emitStatus?.(data)
       },
       { ...session, status: 'stopped', input_needed: false, program_status: { state: 'done' } }
     )
-    await expect(view.getByText('Stopped', { exact: true })).toBeVisible()
     await expect(view.getByText('Task Done', { exact: true })).toBeVisible()
+    await expect(view.getByText('Stopped', { exact: true })).toHaveCount(0)
+    await expect(view.getByTitle('Process: Stopped', { exact: true })).toHaveCount(0)
     await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(0)
     await expect(view.getByText('Input Needed', { exact: true })).toHaveCount(0)
   })
@@ -117,35 +111,30 @@ for (const mobile of [false, true]) {
 
 // Color regressions are intentionally separate from the SSE lifecycle tests above.
 
-// `lifecycle` becomes the fixture's session status; `lifecycleLabel` is what the
-// status badge renders beside the program badge. They differ for a blocked
-// report: it marks the session input-needed, and the lifecycle badge stays
-// authoritative, so it reads "Input Needed" while the process is still running.
+// `lifecycle` becomes the fixture's session status and stays in the API. A
+// program report replaces the visible lifecycle badge, so these fixtures never
+// render a lifecycle label even when the process is running, stopped, or failed.
 const colorReports = [
-  { report: { state: 'idle' }, label: 'Idle', lifecycle: 'stopped', lifecycleLabel: 'Stopped' },
+  { report: { state: 'idle' }, label: 'Idle', lifecycle: 'stopped' },
   {
     report: { state: 'working', progress: 42 },
     label: 'Working 42%',
     lifecycle: 'running',
-    lifecycleLabel: 'Running',
   },
   {
     report: { state: 'done' },
     label: 'Task Done',
     lifecycle: 'stopped',
-    lifecycleLabel: 'Stopped',
   },
   {
     report: { state: 'blocked', kind: 'permission', progress: 67 },
     label: 'Permission Required 67%',
     lifecycle: 'running',
-    lifecycleLabel: 'Input Needed',
   },
   {
     report: { state: 'error' },
     label: 'Task Error',
     lifecycle: 'failed',
-    lifecycleLabel: 'Failed',
   },
 ] as const
 
@@ -282,13 +271,13 @@ async function readBadgeAppearance(badge: Locator, state: ProgramState) {
 
 async function expectReadableProgramColors(view: Locator) {
   await expect(view.locator('[title^="Agent-reported (OSC 7501)"]')).toHaveCount(5)
+  await expect(view.locator('[title^="Process:"]')).toHaveCount(0)
   const appearances: Awaited<ReturnType<typeof readBadgeAppearance>>[] = []
-  for (const { report, label, lifecycleLabel } of colorReports) {
+  for (const { report, label } of colorReports) {
     const badge = view.getByText(label, { exact: true })
     await badge.scrollIntoViewIfNeeded()
     await expect(badge).toBeVisible()
     await expect(badge).toHaveAttribute('title', 'Agent-reported (OSC 7501)')
-    await expect(badge.locator('..').getByText(lifecycleLabel, { exact: true })).toBeVisible()
 
     // Wait for finite badge/ancestor transitions and entrance animations, not the
     // lifecycle dot's infinite pulse. Cancelled transitions are normal on retheme;
