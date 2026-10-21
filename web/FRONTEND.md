@@ -207,6 +207,17 @@ primary accent.
   collapsed content clamps the old offset to 0. Scrolls seen while the list has
   no rows are that clamp, not the user, and are not saved. `sessions-scroll.spec.ts`
   covers both scrollports and the interrupting reload.
+- **A full-height layout has nothing to scroll, so the keyboard can cover it.**
+  `useTerminalKeyboardSync` reveals a focused terminal by scrolling its nearest
+  scroll container, but the session detail shell is already `h-dvh` with the
+  terminal pinned to the bottom: `scrollBy` is a no-op and the IME paints over
+  the cursor row. The layout viewport does not shrink for the keyboard, so
+  `hooks/use-soft-keyboard-inset.ts` measures the `visualViewport` overlap and
+  the page reserves that strip at the bottom; FitAddon then drops rows and
+  reports the smaller grid to the PTY. Differences below a keyboard's size are
+  browser chrome and must not trigger a refit.
+  `e2e/attach-soft-keyboard-viewport.spec.ts` fakes the viewport height, holds
+  the terminal's last row above the keyboard, and types through the refit.
 - **A hidden textarea is not an append-only log.** xterm reads a soft keyboard
   by diffing `.xterm-helper-textarea`, and the diff (`newValue.replace(oldValue, '')`)
   only handles appends: an auto-paired quote, or a correction that edits in
