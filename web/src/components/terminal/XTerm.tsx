@@ -90,6 +90,11 @@ export interface XTermHandle {
   getSize(): { cols: number; rows: number } | null
   /** Force FitAddon to compute the correct size immediately and return it. */
   fit(): { cols: number; rows: number } | null
+  /**
+   * The cursor's current viewport row and the xterm screen's geometry, both
+   * relative to the browser viewport. Null until xterm has opened.
+   */
+  getCursorViewport(): { row: number; rows: number; top: number; height: number } | null
 }
 
 interface Props {
@@ -100,6 +105,8 @@ interface Props {
   onPaste?: (event: ClipboardEvent) => void
   /** Called when the terminal is resized by FitAddon (cols, rows) */
   onResize?: (cols: number, rows: number) => void
+  /** Called when the terminal cursor moves within its viewport. */
+  onCursorMove?: () => void
   /**
    * Called when the user's pinned-to-bottom state changes: live
    * output may only auto-scroll while the user is already at the bottom —
@@ -110,7 +117,7 @@ interface Props {
 }
 
 const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
-  { autoFit, onData, onPaste, onResize, onScrollBottomChange, className },
+  { autoFit, onData, onPaste, onResize, onCursorMove, onScrollBottomChange, className },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -122,6 +129,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   const onDataRef = useRef(onData)
   const onPasteRef = useRef(onPaste)
   const onResizeRef = useRef(onResize)
+  const onCursorMoveRef = useRef(onCursorMove)
   const onScrollBottomChangeRef = useRef(onScrollBottomChange)
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null)
   const scrollDragRef = useRef<{
@@ -174,6 +182,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     onResizeRef.current = onResize
   }, [onResize])
   useEffect(() => {
+    onCursorMoveRef.current = onCursorMove
+  }, [onCursorMove])
+  useEffect(() => {
     onScrollBottomChangeRef.current = onScrollBottomChange
   }, [onScrollBottomChange])
 
@@ -215,6 +226,22 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     getSize() {
       if (!termRef.current) return null
       return { cols: termRef.current.cols, rows: termRef.current.rows }
+    },
+    getCursorViewport() {
+      const term = termRef.current
+      const screen = term?.element?.querySelector<HTMLElement>('.xterm-screen')
+      if (!term || !screen) return null
+
+      const rect = screen.getBoundingClientRect()
+      const buffer = term.buffer.active
+      return {
+        // `cursorY` is relative to the bottom page; subtracting `viewportY`
+        // makes it relative to what is currently on screen.
+        row: buffer.baseY + buffer.cursorY - buffer.viewportY,
+        rows: term.rows,
+        top: rect.top,
+        height: rect.height,
+      }
     },
     fit() {
       if (!termRef.current || !fitRef.current) return null
@@ -315,6 +342,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     }
     const scrollDisposable = term.onScroll(reportBottomState)
     const writeDisposable = term.onWriteParsed(reportBottomState)
+    const cursorDisposable = term.onCursorMove(() => {
+      onCursorMoveRef.current?.()
+    })
 
     const dataDisposable = term.onData((data) => {
       onDataRef.current?.(data)
@@ -379,6 +409,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       dataDisposable.dispose()
       scrollDisposable.dispose()
       writeDisposable.dispose()
+      cursorDisposable.dispose()
       ro.disconnect()
       container.removeEventListener('touchend', handleTouchEnd)
       term.textarea?.removeEventListener('focus', handleTerminalFocus)

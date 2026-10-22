@@ -3,9 +3,9 @@
  *
  * `window.innerHeight` keeps the keyboard's height on Android Chrome (and
  * WebKit), so a layout rooted in `100dvh` stays full-screen and paints its
- * bottom rows underneath the IME. Shifting the page body up by this inset
- * keeps the bottom row — where the cursor sits while you type — above the
- * keyboard without changing the terminal's grid or resizing the PTY.
+ * bottom rows underneath the IME. The page uses this inset to shift the body
+ * only as far as the cursor needs, keeping the cursor row above the keyboard
+ * without changing the terminal's grid or resizing the PTY.
  *
  * The reading comes from `visualViewport`, the only cross-browser report of
  * the area the keyboard has not covered. It is a numeric snapshot so

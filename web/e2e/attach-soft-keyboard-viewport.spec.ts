@@ -6,9 +6,11 @@ import { devices, expect, test, type Page } from '@playwright/test'
  * The reported regression: after tapping the terminal, the on-screen keyboard
  * covers the bottom rows; with the cursor parked at the bottom, the user cannot
  * see what they type. The page is a full-height flex layout, so there is no
- * scroll range to reveal the terminal. Shift the body up by the overlap
- * instead: resizing the terminal would make FitAddon report a new grid and
- * send a PTY resize every time focus opens or closes the keyboard.
+ * scroll range to reveal the terminal. Shift the body just far enough to bring
+ * the cursor above the IME instead: resizing the terminal would make FitAddon
+ * report a new grid and send a PTY resize every time focus opens or closes the
+ * keyboard, and shifting by the full overlap would push a middle/top cursor
+ * out of the top of the screen.
  *
  * Playwright cannot raise a real IME, so the test replaces the visual
  * viewport's height (the one signal the browser gives the page) and dispatches
@@ -18,6 +20,8 @@ import { devices, expect, test, type Page } from '@playwright/test'
 
 const SESSION_ID = 'soft-keyboard-viewport'
 const KEYBOARD_HEIGHT = 320
+/** A row near the middle of the terminal, with plenty of output below it. */
+const ABOVE_KEYBOARD_CURSOR_ROW = 20
 
 /** A Pixel 7 reports Android and has touch, so the mobile layout is active. */
 test.use({ ...devices['Pixel 7'] })
@@ -54,9 +58,19 @@ function initFrame(data: string): Buffer {
   return Buffer.concat([header, Buffer.from(data)])
 }
 
+/** DATA frame: `[tag=2][offset:u64][data]`. */
+function dataFrame(offset: number, data: string): Buffer {
+  const header = Buffer.alloc(9)
+  header[0] = 2
+  header.writeBigUInt64BE(BigInt(offset), 1)
+  return Buffer.concat([header, Buffer.from(data)])
+}
+
 interface ViewportHarness {
   inputs: string[]
   messages: Array<Record<string, unknown>>
+  /** Send more terminal output through the mocked attach socket. */
+  sendData?: (data: string) => void
 }
 
 /**
@@ -91,7 +105,7 @@ async function setKeyboardHeight(page: Page, keyboardHeight: number): Promise<vo
   }, keyboardHeight)
 }
 
-async function stubApi(page: Page, harness: ViewportHarness): Promise<void> {
+async function stubApi(page: Page, harness: ViewportHarness, output: string): Promise<void> {
   await page.addInitScript(() => {
     class OpenEventSource extends EventTarget {
       onopen: ((event: Event) => void) | null = null
@@ -135,14 +149,25 @@ async function stubApi(page: Page, harness: ViewportHarness): Promise<void> {
         // Non-JSON or unrelated frame.
       }
     })
+    // The init frame's snapshot ends at offset 0; later DATA frames start
+    // there and advance by the bytes they carry.
+    let offset = 0
+    harness.sendData = (data: string) => {
+      ws.send(dataFrame(offset, data))
+      offset += Buffer.byteLength(data)
+    }
     // Enough content that the cursor starts on the last rendered row.
-    ws.send(initFrame(`${'line\r\n'.repeat(80)}$ `))
+    ws.send(initFrame(output))
   })
 }
 
-async function openAttach(page: Page, harness: ViewportHarness): Promise<void> {
+async function openAttach(
+  page: Page,
+  harness: ViewportHarness,
+  output = `${'line\r\n'.repeat(80)}$ `
+): Promise<void> {
   await installVisualViewportProbe(page)
-  await stubApi(page, harness)
+  await stubApi(page, harness, output)
   await page.goto(`/session/${SESSION_ID}?mode=attach`)
   await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
   await page.locator('.xterm').click({ position: { x: 40, y: 40 } })
@@ -157,6 +182,24 @@ function terminalRows(page: Page): Promise<number> {
 /** The bottom edge of the terminal surface, in viewport coordinates. */
 function terminalBottom(page: Page): Promise<number> {
   return page.evaluate(() => document.querySelector('.xterm')?.getBoundingClientRect().bottom ?? -1)
+}
+
+/** The painted cursor cell, in viewport coordinates. */
+function cursorRect(page: Page): Promise<{ top: number; bottom: number } | null> {
+  return page.evaluate(() => {
+    const cursor = document.querySelector('.xterm-rows .xterm-cursor')
+    if (!cursor) return null
+    const rect = cursor.getBoundingClientRect()
+    return { top: rect.top, bottom: rect.bottom }
+  })
+}
+
+/** The body transform the keyboard shift currently applies, if any. */
+function mainTransform(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const main = document.querySelector('#main-container')
+    return main ? getComputedStyle(main).transform : ''
+  })
 }
 
 /** Text on the last rendered row — where the cursor sits in this fixture. */
@@ -183,7 +226,7 @@ function resizeCount(harness: ViewportHarness): number {
   return harness.messages.filter((message) => message.type === 'resize').length
 }
 
-test('the keyboard viewport moves the terminal above the IME without resizing it', async ({
+test('the keyboard shifts only enough to reveal a bottom cursor without resizing it', async ({
   page,
 }) => {
   const harness: ViewportHarness = { inputs: [], messages: [] }
@@ -197,16 +240,25 @@ test('the keyboard viewport moves the terminal above the IME without resizing it
   const resizesBeforeKeyboard = resizeCount(harness)
   // The fixture ends in a shell prompt; that row is the cursor's row.
   expect(await lastVisibleRow(page)).toContain('$')
+  const bottomBeforeKeyboard = await terminalBottom(page)
 
   // The terminal starts at the bottom of the page, underneath where the
   // keyboard will be. This is the setup for the report.
-  expect(await terminalBottom(page)).toBeGreaterThan(layoutHeight - KEYBOARD_HEIGHT)
+  expect(bottomBeforeKeyboard).toBeGreaterThan(layoutHeight - KEYBOARD_HEIGHT)
 
   await setKeyboardHeight(page, KEYBOARD_HEIGHT)
 
   const keyboardTop = layoutHeight - KEYBOARD_HEIGHT
-  // Nothing may be left under the keyboard — least of all the cursor row.
+  // The cursor row must clear the keyboard; the body shift is what moves it.
   await expect.poll(() => terminalBottom(page)).toBeLessThanOrEqual(keyboardTop + 1)
+  const cursor = await cursorRect(page)
+  expect(cursor).not.toBeNull()
+  expect(cursor!.bottom).toBeLessThanOrEqual(keyboardTop + 1)
+  // ...and just above it: the page moves by the cursor's shortfall, not the
+  // whole keyboard height.
+  expect(cursor!.bottom).toBeGreaterThan(keyboardTop - 32)
+  // The shift is driven by the cursor, not the full keyboard inset.
+  expect(await mainTransform(page)).not.toBe('none')
   // The body shifts, not the terminal: same grid, same PTY size.
   expect(await terminalRows(page)).toBe(fullRows)
   expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
@@ -225,4 +277,60 @@ test('the keyboard viewport moves the terminal above the IME without resizing it
   expect(await terminalRows(page)).toBe(fullRows)
   expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
   expect(await lastVisibleRow(page)).toContain('$')
+})
+
+test('the keyboard leaves the view alone when the cursor is already above it', async ({ page }) => {
+  const harness: ViewportHarness = { inputs: [], messages: [] }
+  await openAttach(page, harness, `${'line\r\n'.repeat(80)}\x1b[${ABOVE_KEYBOARD_CURSOR_ROW};1H$ `)
+
+  const layoutHeight = await page.evaluate(() => document.documentElement.clientHeight)
+  const fullRows = await settleRows(page)
+  expect(fullRows).toBeGreaterThan(0)
+  await page.waitForTimeout(300)
+  const resizesBeforeKeyboard = resizeCount(harness)
+  const keyboardTop = layoutHeight - KEYBOARD_HEIGHT
+  const bottomBeforeKeyboard = await terminalBottom(page)
+  const cursorBeforeKeyboard = await cursorRect(page)
+  expect(cursorBeforeKeyboard).not.toBeNull()
+  expect(cursorBeforeKeyboard!.bottom).toBeLessThan(keyboardTop)
+
+  await setKeyboardHeight(page, KEYBOARD_HEIGHT)
+  // Give the inset subscription and its layout effect time to run.
+  await page.waitForTimeout(200)
+
+  // The cursor was already visible above the IME, so nothing may move. The
+  // keyboard is allowed to cover the bottom of the terminal.
+  expect(await mainTransform(page)).toBe('none')
+  expect(await terminalBottom(page)).toBe(bottomBeforeKeyboard)
+  expect(await terminalBottom(page)).toBeGreaterThan(keyboardTop)
+  const cursorAfterKeyboard = await cursorRect(page)
+  expect(cursorAfterKeyboard).not.toBeNull()
+  expect(cursorAfterKeyboard!.bottom).toBeLessThanOrEqual(keyboardTop)
+
+  // The terminal grid and PTY size are still untouched.
+  expect(await terminalRows(page)).toBe(fullRows)
+  expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
+
+  // Output can move the cursor after the keyboard is already open; the shift
+  // must follow it so the line being typed never disappears under the IME.
+  harness.sendData?.(`\x1b[${fullRows};1H$ `)
+  await expect.poll(() => mainTransform(page)).not.toBe('none')
+  const cursorAtBottom = await cursorRect(page)
+  expect(cursorAtBottom).not.toBeNull()
+  expect(cursorAtBottom!.bottom).toBeLessThanOrEqual(keyboardTop + 1)
+  expect(await terminalRows(page)).toBe(fullRows)
+  expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
+
+  // The keyboard is up and the terminal still receives input.
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused()
+  await page.keyboard.type('hi')
+  await expect.poll(() => harness.inputs.join('')).toBe('hi')
+
+  // Closing it also leaves the view where it was.
+  await setKeyboardHeight(page, 0)
+  await expect.poll(() => mainTransform(page)).toBe('none')
+  await page.waitForTimeout(200)
+  expect(await terminalBottom(page)).toBe(bottomBeforeKeyboard)
+  expect(await terminalRows(page)).toBe(fullRows)
+  expect(resizeCount(harness)).toBe(resizesBeforeKeyboard)
 })

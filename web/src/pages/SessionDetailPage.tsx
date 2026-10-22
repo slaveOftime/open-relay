@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
 import {
@@ -29,6 +29,7 @@ import StatusBadge from '@/components/StatusBadge'
 import { useAttachIdleAnimation } from '@/hooks/use-attach-idle-animation'
 import { useAttachReconnect } from '@/hooks/use-attach-reconnect'
 import { useSoftKeyboardInset } from '@/hooks/use-soft-keyboard-inset'
+import { softKeyboardShift } from '@/utils/soft-keyboard'
 import { buildAttachSocketOptions } from '@/components/attach/attach-socket-options'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
@@ -110,8 +111,9 @@ function SessionDetailPageContent() {
   const node = searchParams.get('node')
   const liveSession = useLiveSessionSummary(id, node)
   // The mobile keyboard is painted over the layout viewport, not included in
-  // it. Shift the body up by the covered strip so the terminal stays above the
-  // IME without changing its grid or sending a PTY resize on focus/blur.
+  // it. Shift the body only as far as the cursor needs so it stays above the
+  // IME without changing the terminal grid or sending a PTY resize on
+  // focus/blur. A cursor already above the keyboard leaves the view alone.
   const keyboardInset = useSoftKeyboardInset()
 
   const [session, setSession] = useState<SessionSummary | null>(null)
@@ -146,6 +148,7 @@ function SessionDetailPageContent() {
   const [tailLimitInput, setTailLimitInput] = useState('40')
   const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
   const [showMetadataDialog, setShowMetadataDialog] = useState(false)
+  const [keyboardShift, setKeyboardShift] = useState(0)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -181,6 +184,67 @@ function SessionDetailPageContent() {
   const replayUiLastCommitAtRef = useRef(0)
   const replayCommittedIdxRef = useRef(0)
   const previousLiveSessionRef = useRef<SessionSummary | null>(null)
+  // The shift that is actually painted, as opposed to the one being rendered:
+  // cursor events can arrive between a state update and its commit, and the
+  // geometry read must use the transform the browser currently has.
+  const appliedKeyboardShiftRef = useRef(0)
+  const keyboardShiftRafRef = useRef<number | null>(null)
+
+  const updateKeyboardShift = useCallback(() => {
+    const inset = keyboardInset
+    const term = termRef.current
+    if (inset <= 0 || !term) {
+      setKeyboardShift((current) => (current === 0 ? current : 0))
+      return
+    }
+
+    const cursor = term.getCursorViewport()
+    if (!cursor) {
+      setKeyboardShift((current) => (current === 0 ? current : 0))
+      return
+    }
+
+    const layoutHeight = document.documentElement.clientHeight || window.innerHeight
+    const next = softKeyboardShift({
+      keyboardInset: inset,
+      cursorRow: cursor.row,
+      rows: cursor.rows,
+      // The screen rect already includes the shift currently painted on the
+      // body; add it back so the calculation is independent of that shift.
+      terminalTop: cursor.top + appliedKeyboardShiftRef.current,
+      terminalHeight: cursor.height,
+      visibleBottom: layoutHeight - inset,
+    })
+    setKeyboardShift((current) => (current === next ? current : next))
+  }, [keyboardInset])
+
+  const scheduleKeyboardShift = useCallback(() => {
+    // With the keyboard down and no shift painted, cursor/scroll events cannot
+    // change anything; skip the frame work during ordinary output.
+    if (keyboardInset <= 0 && appliedKeyboardShiftRef.current === 0) return
+    if (keyboardShiftRafRef.current !== null) return
+    keyboardShiftRafRef.current = requestAnimationFrame(() => {
+      keyboardShiftRafRef.current = null
+      updateKeyboardShift()
+    })
+  }, [keyboardInset, updateKeyboardShift])
+
+  useEffect(() => {
+    updateKeyboardShift()
+  }, [updateKeyboardShift, mode])
+
+  useEffect(() => {
+    return () => {
+      if (keyboardShiftRafRef.current !== null) {
+        cancelAnimationFrame(keyboardShiftRafRef.current)
+        keyboardShiftRafRef.current = null
+      }
+    }
+  }, [])
+
+  useLayoutEffect(() => {
+    appliedKeyboardShiftRef.current = keyboardShift
+  }, [keyboardShift])
 
   const {
     isIdle: isAttachViewportIdle,
@@ -1262,6 +1326,7 @@ function SessionDetailPageContent() {
   }
 
   function handleTermResize(cols: number, rows: number) {
+    scheduleKeyboardShift()
     const pending = pendingResizeRef.current
     if (pending && pending.cols === cols && pending.rows === rows) return
     pendingResizeRef.current = { cols, rows }
@@ -1600,7 +1665,7 @@ function SessionDetailPageContent() {
           */}
           <div
             id="main-container"
-            style={keyboardInset > 0 ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
+            style={keyboardShift > 0 ? { transform: `translateY(-${keyboardShift}px)` } : undefined}
             className="h-full sm:flex sm:overflow-hidden"
           >
             {/* Terminal area */}
@@ -1622,10 +1687,12 @@ function SessionDetailPageContent() {
                   onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
                   onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
                   onResize={mode === 'attach' ? handleTermResize : undefined}
+                  onCursorMove={mode === 'attach' ? scheduleKeyboardShift : undefined}
                   onScrollBottomChange={
                     mode === 'attach'
                       ? (atBottom) => {
                           userAtBottomRef.current = atBottom
+                          scheduleKeyboardShift()
                         }
                       : undefined
                   }
