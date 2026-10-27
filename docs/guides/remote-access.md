@@ -131,7 +131,9 @@ the unified configured-peer inventory exposed by `oly node ls`.
 
 Desktop notifications, Web Push, and `notification_hook` alert the human when a session likely needs attention (after a 5s activity-suppression window and `notification_min_interval_seconds` debounce).
 
-For programs emitting OSC 7501 (`idle`, `working`, `blocked`, `done`, `error`), `working` suppresses heuristic guesses while `idle`/`blocked`/`done`/`error` set `input_needed` immediately and trigger `program_status` / `input_needed` notifications without re-notifying on ordinary redraws. See [OSC 7501 status and lifetime](./cli.md#agent-reported-status-osc-7501).
+Attaching, typing, mouse input, and resizing suppress automatic notifications during recent activity. A pause in typing does not notify for input-driven echoes/redraws or an existing program-status report the user has already seen or acted on. New independent output or a newer status report can notify after activity suppression; merely keeping an attachment open does not permanently mute the session. Candidates are rechecked for user activity before notification delivery.
+
+For programs emitting OSC 7501 (`idle`, `working`, `blocked`, `done`, `error`), `working` suppresses heuristic guesses while `idle`/`blocked`/`done`/`error` set `input_needed` immediately and trigger `program_status` / `input_needed` notifications for new reports, without re-notifying on ordinary redraws. Activity suppression affects notification delivery, not the reported `input_needed` hint. See [OSC 7501 status and lifetime](./cli.md#agent-reported-status-osc-7501).
 
 ```sh
 oly notify enable <id>

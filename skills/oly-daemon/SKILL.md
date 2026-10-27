@@ -105,7 +105,7 @@ Removed keys (`max_journal_bytes_per_session`, `max_output_log_bytes`, `max_jour
 
 ## 3) Prompt hints: `prompt_patterns`
 
-The monitor checks the last 15 rendered live-screen lines (ANSI stripped) once per second with 5s activity suppression and `notification_min_interval_seconds` debounce. OSC 7501 `program_status` reports take precedence over regex/silence heuristics (`working` suppresses attention; `idle`/`done`/`blocked`/`error` set `input_needed` immediately while running).
+The monitor checks the last 15 rendered live-screen lines (ANSI stripped) once per second with 5s activity suppression and `notification_min_interval_seconds` debounce. Attaching/input/resizing suppress automatic alerts; pausing does not notify for input-driven echoes/redraws or a retained status report already seen/acted on. Candidates are rechecked for new user activity before delivery. New independent output or a newer status report can notify after suppression; an open attachment alone is not a permanent mute. OSC 7501 `program_status` reports take precedence over regex/silence heuristics (`working` suppresses attention; `idle`/`done`/`blocked`/`error` set `input_needed` immediately while running, independently of notification delivery).
 
 - **Omitted `prompt_patterns`:** uses `DEFAULT_PROMPT_PATTERNS`.
 - **`"prompt_patterns": []`:** disables regex matching, while silence-based attention hints/notifications remain.

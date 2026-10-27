@@ -139,6 +139,8 @@ pub struct SilentCandidate {
     pub excerpt: String,
     pub program_status: Option<super::program_status::ProgramStatus>,
     pub output_epoch: Instant,
+    /// User activity captured with the output epoch; fences off-lock evaluation.
+    pub user_activity_epoch: Option<Instant>,
     pub silence_epoch: Instant,
     pub should_notify: bool,
     pub enabled_for_channels: bool,

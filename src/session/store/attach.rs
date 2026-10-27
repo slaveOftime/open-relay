@@ -411,7 +411,9 @@ impl SessionStore {
         let handle = self.lookup_runtime(id).await?;
 
         let (initial_total_bytes, byte_len) = {
-            let rt = handle.read();
+            // Queue input and record activity in one critical section so the
+            // notification monitor cannot commit between these two actions.
+            let mut rt = handle.write();
             // Observers never drive. `None` is the ungated operator path.
             if let Some(attachment_id) = attachment_id {
                 check_control(&rt, attachment_id)?;
@@ -420,7 +422,11 @@ impl SessionStore {
             let initial_total_bytes = rt.filtered_total_bytes;
             let byte_len = data.len();
             match rt.pty.try_write_input(data) {
-                Ok(()) => Ok((initial_total_bytes, byte_len)),
+                Ok(()) => {
+                    rt.mark_attach_activity();
+                    rt.last_input_at = Some(Instant::now());
+                    Ok((initial_total_bytes, byte_len))
+                }
                 Err(TrySendError::Full(_)) => {
                     debug!(
                         session_id = id,
@@ -439,13 +445,6 @@ impl SessionStore {
                 }
             }
         }?;
-
-        // Brief write lock: touch the activity timestamp fields.
-        {
-            let mut rt = handle.write();
-            rt.mark_attach_activity();
-            rt.last_input_at = Some(Instant::now());
-        }
 
         debug!(session_id = id, bytes = byte_len, "attach input forwarded");
 

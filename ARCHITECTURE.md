@@ -469,7 +469,13 @@ existing session engines are rebuilt: scrollback retention is captured at spawn.
 
 `src/notification/mod.rs` samples silent candidates once a second. Candidates
 use activity epochs and a rendered live-screen excerpt (`store/notify.rs`), not
-a historical byte-pattern scan. Regex prompt hints can trigger after activity
+a historical byte-pattern scan. Off-lock candidates carry both output/status and
+user-activity epochs, rechecked under the write lock before committing either
+notification delivery or input-needed hints. PTY input enqueue and activity
+recording share that lock. Input-driven echoes/redraws and retained status reports
+older than user interaction do not notify; newer reports still bypass echo
+heuristics. An open attachment alone does not permanently mute notifications.
+Regex prompt hints can trigger after activity
 suppression; silence remains a fallback even with `prompt_patterns: []`.
 The LLM trigger function is currently a stub. None of this establishes task
 completion or approval authority. Resume rules instead scan a completed,
