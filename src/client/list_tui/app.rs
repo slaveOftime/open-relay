@@ -1,7 +1,7 @@
 // App-level types and helpers: status filter, sort strategy, the
 // opened-terminal registry, the rate-state tracker, and the comparatively
 // tiny helpers (is_active_status, session_is_active, sort_sessions,
-// session_search_text, session_key, session_sort_label) used by both the
+// session_search_text, session_key) used by both the
 // App impl block and the renderer when deriving keys/status words/labels.
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -61,20 +61,21 @@ impl SortStrategy {
             Self::CreatedAsc => Self::ActiveFirst,
         }
     }
+
+    /// One stable ordering contract for the table and each tree folder.
+    fn compare(self, a: &SessionSummary, b: &SessionSummary) -> std::cmp::Ordering {
+        match self {
+            Self::ActiveFirst => session_is_active(b)
+                .cmp(&session_is_active(a))
+                .then_with(|| b.created_at.cmp(&a.created_at)),
+            Self::CreatedDesc => b.created_at.cmp(&a.created_at),
+            Self::CreatedAsc => a.created_at.cmp(&b.created_at),
+        }
+    }
 }
 
 pub fn sort_sessions(sessions: &mut [SessionSummary], strategy: SortStrategy) {
-    match strategy {
-        SortStrategy::ActiveFirst => sessions.sort_by(|a, b| {
-            session_is_active(b)
-                .cmp(&session_is_active(a))
-                .then_with(|| b.created_at.cmp(&a.created_at))
-        }),
-        SortStrategy::CreatedDesc => {
-            sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at))
-        }
-        SortStrategy::CreatedAsc => sessions.sort_by_key(|session| session.created_at),
-    }
+    sessions.sort_by(|a, b| strategy.compare(a, b));
 }
 
 impl StatusFilter {
@@ -178,25 +179,6 @@ pub fn session_key(session: &SessionSummary) -> String {
         || session.id.clone(),
         |node| format!("{node}\0{}", session.id),
     )
-}
-
-/// Display label used to sort sessions inside a folder. Mirrors what the
-/// tree-view renders: command + args + title. Title is appended last so
-/// sessions sharing a command line still bubble up in their own alpha
-/// order.
-pub fn session_sort_label(session: &SessionSummary) -> String {
-    let mut label = session.command.clone();
-    if !session.args.is_empty() {
-        label.push(' ');
-        label.push_str(&session.args.join(" "));
-    }
-    if let Some(title) = &session.title
-        && !title.is_empty()
-    {
-        label.push(' ');
-        label.push_str(title);
-    }
-    label
 }
 
 use std::{
@@ -911,18 +893,9 @@ impl App {
         }
     }
 
-    /// Sort every node's `subfolders` (by `name`) and `direct_sessions`
-    /// (by cmd + args + title). Both lists are stable-sorted so existing
-    /// display ties keep their insertion order.
+    /// Folder siblings stay alphabetical; sessions use the same active/time
+    /// ordering as the table. Stable sorts retain insertion order for ties.
     pub(super) fn sort_tree_nodes(&mut self) {
-        // Compare pre-lowercased labels: deriving the lowercase form inside
-        // the comparator measured as the dominant cost of this sort with
-        // thousands of sessions.
-        let labels: Vec<String> = (0..self.sessions.len())
-            .map(|index| session_sort_label(&self.sessions[index]).to_lowercase())
-            .collect();
-        // Snapshot folder names so the closures can borrow them immutably
-        // without re-borrowing the same `nodes` vector being mutated.
         let folder_names: Vec<String> = self
             .tree
             .nodes
@@ -930,12 +903,12 @@ impl App {
             .map(|node| node.name.to_lowercase())
             .collect();
         for node in &mut self.tree.nodes {
-            let mut children = node.subfolders.clone();
-            children.sort_by(|&a, &b| folder_names[a].cmp(&folder_names[b]));
-            node.subfolders = children;
-            let mut sessions = node.direct_sessions.clone();
-            sessions.sort_by(|&a, &b| labels[a].cmp(&labels[b]));
-            node.direct_sessions = sessions;
+            node.subfolders
+                .sort_by(|&a, &b| folder_names[a].cmp(&folder_names[b]));
+            node.direct_sessions.sort_by(|&a, &b| {
+                self.sort_strategy
+                    .compare(&self.sessions[a], &self.sessions[b])
+            });
         }
     }
 
@@ -1133,6 +1106,10 @@ impl App {
     }
 
     pub(super) fn cycle_sort_strategy(&mut self) {
+        // Tree entries refer to the old session indices. Capture node+ID
+        // before sorting, then restore the same focused session after rebuilding.
+        let tree_focus = self.tree_focused_session_key();
+        let tree_cursor = self.tree.cursor;
         self.sort_strategy = self.sort_strategy.next();
         let selected_key = self.sessions.get(self.selected).map(session_key);
         sort_sessions(&mut self.sessions, self.sort_strategy);
@@ -1149,6 +1126,7 @@ impl App {
             .and_then(|key| self.keys.iter().position(|cached| cached == &key))
             .unwrap_or(0);
         self.rebuild_visible();
+        self.restore_tree_session_focus(tree_focus, tree_cursor);
         self.set_action_message(Some(format!(
             "sorted by {} · Ctrl+O cycle",
             self.sort_strategy.label()
