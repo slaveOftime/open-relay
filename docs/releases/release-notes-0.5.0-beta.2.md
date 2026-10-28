@@ -95,7 +95,7 @@ See [Compatibility for 0.5](./compatibility-0.5.md) for the beta contract.
   requires.
 - npm: `beta` is `0.5.0-beta.2` and `latest` stays `0.3.3`, read from the
   registry document directly rather than from a client cache.
-- Artifact checks: in progress.
+- Artifact checks: not recorded for this beta.
 
 ### Manual checks — maintainer-reported
 

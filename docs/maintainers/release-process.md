@@ -19,8 +19,13 @@ and stable-only permission to push the Homebrew update to the default branch.
 
 ## 2. Prepare and merge a PR
 
-- Write versioned release notes: why upgrade, breaking changes, migration link,
-  known limits, and verification. Keep feature highlights separate from migration.
+- Write versioned release notes at
+  `docs/releases/release-notes-<version>.md` (for example,
+  `release-notes-0.5.0-beta.3.md`): why upgrade, breaking changes, migration
+  link, known limits, and verification. Keep feature highlights separate from
+  migration. The Release workflow publishes this file as the GitHub release
+  body, so commit it before tagging; a missing file fails the release job
+  before a GitHub release is created.
 - Keep `Cargo.toml` and the root `oly` entry in `Cargo.lock` at the same version.
   For a **stable** release, commit the intended version in both before tagging:
   `cargo publish --locked` rejects uncommitted version changes. A beta may use
@@ -56,9 +61,10 @@ git push origin refs/tags/v0.5.0-beta.3
 
 Do not move or reuse a published tag. No manual GitHub release creation is
 required: pushing the tag starts [the Release workflow](../../.github/workflows/release.yml).
-It creates/updates the GitHub release and generates commit-based notes.
-Creating or editing a GitHub release is **not a configured workflow trigger**;
-if using the website, explicitly run Actions → Release with an existing tag.
+It creates/updates the GitHub release from the tag's versioned notes file;
+commit-generated notes are not used. Creating or editing a GitHub release is
+**not** a configured workflow trigger; if using the website, explicitly run
+Actions → Release with an existing tag.
 
 ### What the automation changes
 
@@ -68,8 +74,12 @@ if using the website, explicitly run Actions → Release with an existing tag.
    Silicon, and Windows x64 (Windows tests run serially). Linux arm64 builds on
    a native `ubuntu-24.04-arm` runner, so the artifact is the binary the suite
    actually exercised; there is no cross toolchain to configure.
-3. `scripts/release-package.py` creates ZIPs and SHA-256 sidecars. The workflow
-   uploads them, then attaches `SHA256SUMS.txt`.
+3. `scripts/release-package.py` creates ZIPs and SHA-256 sidecars. After all
+   platform builds finish, one release job attaches the archives, their
+   checksums, and `SHA256SUMS.txt` to a single GitHub release. The body is
+   rendered by `scripts/release-notes.py` from
+   `docs/releases/release-notes-<version>.md`, with relative links pinned to
+   the tag.
 4. npm's version is set from the tag; the four built binaries are bundled and
    published to `beta` or `latest`.
 5. Stable tags also publish the crate and commit the Homebrew version/hashes.
@@ -95,11 +105,13 @@ Install the published package, inspect its UI/skills, and verify binary version
 and platform selection. For stable releases also verify crates.io and Homebrew;
 for beta releases confirm stable channels were left unchanged.
 
-Use `gh release edit <tag> --notes-file <notes-with-absolute-links.md>` to replace
-generated notes with the reviewed versioned notes. Relative repository links
-need conversion to GitHub URLs; do not link newly moved docs to an old tag that
-still has their old paths. Announce the channel, migration warning, and known
-limits only after verifying publication.
+The release body is the tag's versioned notes file, with relative repository
+links pinned to the tag. If a published body needs correction, render that
+tag's notes (`python3 scripts/release-notes.py <tag> --from-git --output
+body.md`) and update it with `gh release edit <tag> --notes-file body.md`.
+Do not leave relative links in a release body, and do not link newly moved docs
+to an old tag that still has their old paths. Announce the channel, migration
+warning, and known limits only after verifying publication.
 
 ## If publication fails
 

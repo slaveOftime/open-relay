@@ -89,18 +89,25 @@ See [Compatibility for 0.5](./compatibility-0.5.md) for the 0.5 contract.
 
 ## Verification
 
-This section records what was observed for this release and is updated once the
-tag's Release workflow finishes.
+This section records what was observed for this release.
 
-- Release commit: tag `v0.5.0` on the release-prep commit on `main`.
+- Release commit: tag `v0.5.0` on release-prep commit `1b465b0`.
 - Pre-tag documents contract: `python3 tests/docs_sync.py` passed (9/9) on the
   release-prep tree. `tests/release_workflow.py` requires a POSIX host and runs
   in `CI-DOCS`.
-- Release workflow: pending the tag push. A stable tag builds and tests all four
-  platforms, publishes npm `latest`, publishes the crate, and commits the
-  Homebrew version and checksums.
-- npm, crates.io, Homebrew, artifact checksum, and installed-package checks:
-  pending publication.
+- Release workflow
+  ([run 40623272928](https://github.com/slaveOftime/open-relay/actions/runs/40623272928)):
+  all four `build-release` jobs, `attach SHA256SUMS`,
+  `update-homebrew-formula`, `publish-npm`, and `publish-crates` succeeded.
+- npm: `latest` moved to `0.5.0`; `beta` stayed at `0.5.0-beta.3`.
+- crates.io: `0.5.0` is published and is the current newest version.
+- Homebrew: `Formula/oly.rb` on `main` is at `0.5.0` with updated macOS arm64
+  and Linux x64 checksums (commit `71ae07e`).
+- GitHub release: carries the four platform archives, their per-asset
+  `.sha256` sidecars, and the aggregated `SHA256SUMS.txt`.
+- Checksums: `SHA256SUMS.txt` matches the Homebrew formula for macOS arm64 and
+  Linux x64. Archive re-download verification was not completed on the
+  release-prep machine.
 
 ### Manual checks — maintainer-reported
 

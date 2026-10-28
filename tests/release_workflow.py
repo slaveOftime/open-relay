@@ -45,6 +45,14 @@ def block(text, key, indent):
     return "\n".join(line[indent + 2:] for line in match.group(1).splitlines())
 
 
+def release_notes_module():
+    script = Path(__file__).resolve().parents[1] / "scripts/release-notes.py"
+    spec = importlib.util.spec_from_file_location("release_notes", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_cargo_version_steps_use_shared_locked_transform(self):
         self.assertEqual(WORKFLOW.count('run: python3 scripts/release-version.py "$EFFECTIVE_REF"'), 2)
@@ -96,11 +104,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 result = subprocess.run(["cargo", "metadata", "--locked", "--offline", "--format-version", "1"], cwd=root, check=True, capture_output=True)
                 self.assertIn(f'"version":"{tag[1:]}"'.encode(), result.stdout)
 
-    def test_prerelease_uploads_never_promote_latest(self):
-        for name in ("Upload to GitHub Release", "Attach SHA256SUMS to release"):
-            self.assertIn("prerelease:", step(name))
-            self.assertIn("make_latest:", step(name))
-            self.assertIn("'false'", step(name))
+    def test_prerelease_release_never_promotes_latest(self):
+        release = step("Create GitHub release")
+        self.assertIn("prerelease:", release)
+        self.assertIn("make_latest:", release)
+        self.assertIn("'false'", release)
 
     def test_retry_actions_have_required_attempt_timeouts(self):
         for name in ("Publish to crates.io", "Bundle binaries + publish to npm"):
@@ -108,11 +116,93 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertRegex(step(name), r"timeout_(?:minutes|seconds): [1-9]\d*")
 
     def test_manual_release_uploads_target_requested_tag(self):
-        self.assertIn("tag_name: ${{ env.EFFECTIVE_REF }}", step("Upload to GitHub Release"))
+        self.assertIn("tag_name: ${{ env.EFFECTIVE_REF }}", step("Create GitHub release"))
+
+    def test_release_body_is_the_versioned_notes_file(self):
+        release = step("Create GitHub release")
+        self.assertIn("body_path: release-body.md", release)
+        self.assertIn("generate_release_notes: false", release)
+        self.assertNotIn("generate_release_notes: true", WORKFLOW)
+        # Release creation belongs to one job; per-matrix uploads are what
+        # appended the generated section four times.
+        self.assertNotIn("Upload to GitHub Release", WORKFLOW)
         self.assertIn(
-            "tag_name: ${{ github.event.inputs.tag || github.ref_name }}",
-            step("Attach SHA256SUMS to release"),
+            'scripts/release-notes.py "$EFFECTIVE_REF"',
+            step("Render release notes"),
         )
+
+    def test_release_notes_render_pins_relative_links_to_the_tag(self):
+        module = release_notes_module()
+        rendered = module.render(
+            "[guide](./whats-new-0.5.md)\n"
+            "[cli](../guides/cli.md#logs-views-waits-and-byte-continuation)\n"
+            "![shot](./img/shot.png)\n"
+            "[site](https://example.com/a)\n"
+            "[jump](#highlights) [mail](mailto:release@example.com)\n"
+            "```sh\n"
+            "[not a link](./ignored.md)\n"
+            "```\n",
+            Path("docs/releases/release-notes-0.5.0.md"),
+            "owner/repo",
+            "v0.5.0",
+        )
+        self.assertIn(
+            "[guide](https://github.com/owner/repo/blob/v0.5.0/docs/releases/whats-new-0.5.md)",
+            rendered,
+        )
+        self.assertIn(
+            "[cli](https://github.com/owner/repo/blob/v0.5.0/docs/guides/cli.md#logs-views-waits-and-byte-continuation)",
+            rendered,
+        )
+        self.assertIn(
+            "![shot](https://raw.githubusercontent.com/owner/repo/v0.5.0/docs/releases/img/shot.png)",
+            rendered,
+        )
+        self.assertIn("[site](https://example.com/a)", rendered)
+        self.assertIn("[jump](#highlights)", rendered)
+        self.assertIn("[mail](mailto:release@example.com)", rendered)
+        self.assertIn("[not a link](./ignored.md)", rendered)
+
+    def test_release_notes_reject_links_that_escape_the_repository(self):
+        module = release_notes_module()
+        with self.assertRaises(ValueError):
+            module.rewrite_target(
+                "../../../../etc/passwd",
+                Path("docs/releases/release-notes-0.5.0.md"),
+                "owner/repo",
+                "v0.5.0",
+                False,
+            )
+
+    def test_release_notes_renderer_requires_the_versioned_notes(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/release-notes.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(script), "v9.9.9", "--repo", "owner/repo"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(Path("docs/releases/release-notes-9.9.9.md")), result.stderr)
+        self.assertIn("commit it before tagging", result.stderr)
+
+    def test_checked_in_release_notes_have_no_relative_links(self):
+        module = release_notes_module()
+        root = Path(__file__).resolve().parents[1]
+        notes = sorted((root / "docs/releases").glob("release-notes-*.md"))
+        self.assertTrue(notes)
+        for note in notes:
+            tag = "v" + note.name[len("release-notes-"):-len(".md")]
+            with self.subTest(note=note.name):
+                rendered = module.render(
+                    note.read_text(encoding="utf-8"),
+                    note.relative_to(root),
+                    "owner/repo",
+                    tag,
+                )
+                self.assertNotIn("](./", rendered)
+                self.assertNotIn("](../", rendered)
 
     def test_concurrency_uses_effective_tag(self):
         self.assertIn(

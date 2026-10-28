@@ -122,30 +122,29 @@ jobs:
             ${{ matrix.asset_name }}.sha256
           retention-days: 1
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.EFFECTIVE_REF }}
-          files: |
-            ${{ matrix.asset_name }}
-            ${{ matrix.asset_name }}.sha256
-          generate_release_notes: true
-          # Prerelease tags publish as preview/beta releases, never as
-          # "latest".
-          prerelease: ${{ contains(env.EFFECTIVE_REF, '-') }}
-          name: ${{ contains(env.EFFECTIVE_REF, '-') && format('{0} (beta)', env.EFFECTIVE_REF) || env.EFFECTIVE_REF }}
-          make_latest: ${{ contains(env.EFFECTIVE_REF, '-') && 'false' || 'true' }}
-
-  attach-checksums:
-    name: attach SHA256SUMS
+  # One job owns the GitHub release. Creating it from each matrix build
+  # appended GitHub-generated notes to the same release four times; the body
+  # now comes from the tag's versioned notes file instead.
+  create-release:
+    name: create GitHub release
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
     permissions:
       # Explicit so the job holds only what it needs, regardless of what the
       # workflow-level default grants.
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -159,14 +158,31 @@ jobs:
           cat ./*.sha256 > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
 
-      - name: Attach SHA256SUMS to release
+      - name: Render release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fails when docs/releases/release-notes-<version>.md is missing and
+          # pins relative links to this tag so they work on the release page.
+          python3 scripts/release-notes.py "$EFFECTIVE_REF" \
+            --repo "$GITHUB_REPOSITORY" --output release-body.md
+          cat release-body.md
+
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: SHA256SUMS.txt
+          tag_name: ${{ env.EFFECTIVE_REF }}
+          name: ${{ contains(env.EFFECTIVE_REF, '-') && format('{0} (beta)', env.EFFECTIVE_REF) || env.EFFECTIVE_REF }}
+          body_path: release-body.md
           generate_release_notes: false
-          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
-          make_latest: ${{ contains(github.event.inputs.tag || github.ref_name, '-') && 'false' || 'true' }}
+          files: |
+            dist/*.zip
+            dist/*.sha256
+            SHA256SUMS.txt
+          # Prerelease tags publish as preview/beta releases, never as
+          # "latest".
+          prerelease: ${{ contains(env.EFFECTIVE_REF, '-') }}
+          make_latest: ${{ contains(env.EFFECTIVE_REF, '-') && 'false' || 'true' }}
 
   update-homebrew-formula:
     name: update-homebrew-formula
