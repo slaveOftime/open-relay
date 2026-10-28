@@ -22,6 +22,7 @@ struct CandidateSnapshot {
     rows: Vec<Vec<u8>>,
     program_status: Option<crate::session::program_status::ProgramStatus>,
     output_epoch: Instant,
+    user_activity_epoch: Option<Instant>,
     silence_epoch: Instant,
     should_notify: bool,
     enabled_for_channels: bool,
@@ -114,7 +115,15 @@ impl SessionStore {
                         }
                         None => false,
                     };
-                    let should_notify = program_status.is_some() || !activity_driven;
+                    // Explicit reports bypass the echo heuristic only when
+                    // they are newer than the user's interaction. A retained
+                    // idle/blocked report has already been seen/acted on; do
+                    // not alert again just because the user pauses typing.
+                    let should_notify = if program_status.is_some() {
+                        user_activity.is_none_or(|activity| last_output > activity)
+                    } else {
+                        !activity_driven
+                    };
 
                     // Suppress rapid repeat notifications. `last_notified_at` is
                     // normally later than `last_output`, so compare it with `now`;
@@ -129,7 +138,7 @@ impl SessionStore {
                     }
 
                     if rt.notified_output_epoch == Some(last_output) {
-                        trace!("silent becase no changed since last nofification");
+                        trace!("suppressed because the current epoch was already handled");
                         return None;
                     }
 
@@ -152,6 +161,7 @@ impl SessionStore {
                         rows,
                         program_status,
                         output_epoch: last_output,
+                        user_activity_epoch: user_activity,
                         silence_epoch,
                         should_notify,
                         enabled_for_channels: rt.notifications_enabled,
@@ -182,6 +192,7 @@ impl SessionStore {
                         excerpt: String::from_utf8_lossy(&excerpt_vec).into_owned(),
                         program_status: snap.program_status,
                         output_epoch: snap.output_epoch,
+                        user_activity_epoch: snap.user_activity_epoch,
                         silence_epoch: snap.silence_epoch,
                         should_notify: snap.should_notify,
                         enabled_for_channels: snap.enabled_for_channels,
@@ -198,22 +209,18 @@ impl SessionStore {
         })
     }
 
-    /// Records a successful notification for `session_id` at `output_epoch`.
-    /// Re-notification is suppressed until output advances to a new epoch.
-    /// Returns false if the candidate was superseded while its excerpt rendered.
-    pub fn mark_notified(
-        &self,
-        session_id: &str,
-        output_epoch: Instant,
-        notified_at: Instant,
-    ) -> bool {
+    /// Commits a notification for a still-current candidate.
+    /// Re-notification is suppressed until output/status advances to a new epoch.
+    /// Returns false if output or user activity changed during off-lock evaluation,
+    /// or another pass already handled this epoch.
+    pub fn mark_notified(&self, candidate: &SilentCandidate, notified_at: Instant) -> bool {
         let sessions = self.sessions.load();
-        if let Some(handle) = sessions.get(session_id) {
+        if let Some(handle) = sessions.get(&candidate.session_id) {
             let mut rt = handle.write();
-            if rt.effective_output_epoch() != output_epoch {
+            if !candidate.is_current(&rt) {
                 return false;
             }
-            rt.notified_output_epoch = Some(output_epoch);
+            rt.notified_output_epoch = Some(candidate.output_epoch);
             rt.last_notified_at = Some(notified_at);
             return true;
         }
@@ -221,19 +228,27 @@ impl SessionStore {
     }
 
     /// Marks a session as awaiting input without recording a delivered notification.
-    pub fn mark_input_required(&self, session_id: &str, output_epoch: Instant) {
+    pub fn mark_input_required(&self, candidate: &SilentCandidate) {
         let sessions = self.sessions.load();
-        if let Some(handle) = sessions.get(session_id) {
+        if let Some(handle) = sessions.get(&candidate.session_id) {
             let summary = {
                 let mut rt = handle.write();
-                if rt.effective_output_epoch() != output_epoch {
+                if !candidate.is_current(&rt) {
                     return;
                 }
-                rt.notified_output_epoch = Some(output_epoch);
+                rt.notified_output_epoch = Some(candidate.output_epoch);
                 rt.to_summary()
             };
             let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
         }
+    }
+}
+
+impl SilentCandidate {
+    fn is_current(&self, rt: &crate::session::runtime::SessionRuntime) -> bool {
+        rt.effective_output_epoch() == self.output_epoch
+            && rt.user_activity_epoch() == self.user_activity_epoch
+            && rt.notified_output_epoch != Some(self.output_epoch)
     }
 }
 
@@ -291,7 +306,7 @@ mod tests {
                 let candidate = &candidates[0];
                 assert!(candidate.should_notify);
                 assert!(candidate.program_status.is_some());
-                store.mark_notified("status1", candidate.output_epoch, Instant::now());
+                store.mark_notified(candidate, Instant::now());
                 rt.write().push_output(b"redraw", 6);
                 assert!(
                     store
@@ -327,7 +342,7 @@ mod tests {
             .candidates(Duration::from_secs(5), Duration::ZERO)
             .await;
         assert_eq!(candidates.len(), 1);
-        assert!(store.mark_notified("ready1", candidates[0].output_epoch, Instant::now()));
+        assert!(store.mark_notified(&candidates[0], Instant::now()));
         assert!(!signals.record_osc(b"7501", b"state=idle"));
         rt.write().publish_terminal_signals(signals.clone());
         rt.write().push_output(b"redraw", 6);
@@ -381,8 +396,227 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         signals.record_osc(b"7501", b"state=error");
         rt.write().publish_terminal_signals(signals);
-        assert!(!store.mark_notified("status2", candidates[0].output_epoch, Instant::now()));
+        assert!(!store.mark_notified(&candidates[0], Instant::now()));
         assert!(rt.read().notified_output_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn program_status_acknowledged_by_interaction_does_not_notify() {
+        // A retained idle/blocked report is not a new request for attention
+        // after the user has already opened the session or begun typing.
+        for state in ["idle", "blocked", "done", "error"] {
+            for input in [false, true] {
+                let rt = make_runtime("active1", SessionStatus::Running, "ready", None);
+                let now = Instant::now();
+                let mut signals = crate::session::pty::TerminalSignals::default();
+                signals.record_osc(b"7501", format!("state={state}").as_bytes());
+                signals.program_statuses.changed_at = Some(now - Duration::from_secs(30));
+                {
+                    let mut locked = rt.write();
+                    locked.publish_terminal_signals(signals);
+                    let activity = Some(now - Duration::from_secs(10));
+                    if input {
+                        locked.last_input_at = activity;
+                    } else {
+                        locked.last_attach_activity_at = activity;
+                    }
+                }
+                let store = store_with(vec![rt.clone()], make_test_db().await);
+                let candidates = store
+                    .candidates(Duration::from_secs(5), Duration::ZERO)
+                    .await;
+                assert_eq!(candidates.len(), 1);
+                assert!(!candidates[0].should_notify, "{state}, input={input}");
+                assert!(rt.read().input_needed(), "explicit status remains visible");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_invalidated_by_input_without_echo() {
+        let (rt, mut writer_rx) = make_runtime_writable("race1", SessionStatus::Running);
+        rt.write().last_output_epoch = Some(Instant::now() - Duration::from_secs(30));
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let candidates = store
+            .candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        assert_eq!(candidates.len(), 1);
+
+        store
+            .attach_input("race1", None, b"typing", false)
+            .await
+            .unwrap();
+        assert_eq!(writer_rx.try_recv().unwrap(), b"typing");
+        assert!(!store.mark_notified(&candidates[0], Instant::now()));
+        let mut events = store.event_tx().subscribe();
+        store.mark_input_required(&candidates[0]);
+        assert!(
+            events.try_recv().is_err(),
+            "stale attention update must not be emitted"
+        );
+        assert!(rt.read().notified_output_epoch.is_none());
+        assert!(rt.read().last_notified_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn candidate_invalidated_by_attach() {
+        let rt = make_runtime(
+            "race2",
+            SessionStatus::Running,
+            "ready",
+            Some(Duration::from_secs(30)),
+        );
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let candidates = store
+            .candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        store
+            .attach_register(
+                "race2",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::AttachRole::Controller,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!store.mark_notified(&candidates[0], Instant::now()));
+        store.mark_input_required(&candidates[0]);
+        assert!(rt.read().notified_output_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn candidate_tracks_activity_even_when_output_is_newer() {
+        let rt = make_runtime(
+            "race3",
+            SessionStatus::Running,
+            "ready",
+            Some(Duration::from_secs(10)),
+        );
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(30));
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let candidates = store
+            .candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        assert!(candidates[0].should_notify);
+        // The silence anchor remains the output epoch, but the captured
+        // activity must still fence a candidate evaluated against older input.
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(20));
+        assert!(!store.mark_notified(&candidates[0], Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn program_status_new_after_input_still_notifies_and_commits_once() {
+        let rt = make_runtime("newstatus", SessionStatus::Running, "ready", None);
+        let now = Instant::now();
+        let mut signals = crate::session::pty::TerminalSignals::default();
+        signals.record_osc(b"7501", b"state=done");
+        signals.program_statuses.changed_at = Some(now - Duration::from_secs(10));
+        {
+            let mut locked = rt.write();
+            locked.publish_terminal_signals(signals);
+            locked.last_input_at = Some(now - Duration::from_secs(11));
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let candidates = store
+            .candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].should_notify,
+            "a new explicit report bypasses echo suppression"
+        );
+        assert!(store.mark_notified(&candidates[0], now));
+        assert!(!store.mark_notified(&candidates[0], now));
+        let mut events = store.event_tx().subscribe();
+        store.mark_input_required(&candidates[0]);
+        assert!(
+            events.try_recv().is_err(),
+            "an already-handled candidate must not commit twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_suppresses_acknowledged_status_but_delivers_new_status() {
+        use crate::config::LiveConfig;
+        use crate::notification::{
+            channel::NotificationChannel, dispatcher::Notifier, event::NotificationEvent,
+        };
+        use std::sync::Arc;
+        use tokio::sync::{broadcast, mpsc};
+
+        struct RecordingChannel(mpsc::UnboundedSender<NotificationEvent>);
+        #[async_trait::async_trait]
+        impl NotificationChannel for RecordingChannel {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            async fn send(&self, event: &NotificationEvent) -> crate::error::Result<()> {
+                self.0.send(event.clone()).expect("channel receiver alive");
+                Ok(())
+            }
+        }
+
+        let rt = make_runtime("monitor1", SessionStatus::Running, "ready", None);
+        let now = Instant::now();
+        let mut signals = crate::session::pty::TerminalSignals::default();
+        signals.record_osc(b"7501", b"state=idle");
+        signals.program_statuses.changed_at = Some(now - Duration::from_secs(30));
+        {
+            let mut locked = rt.write();
+            locked.publish_terminal_signals(signals.clone());
+            // Simulate a pause after typing, past both suppression windows.
+            locked.last_input_at = Some(now - Duration::from_secs(20));
+        }
+        let store = Arc::new(store_with(vec![rt.clone()], make_test_db().await));
+        let mut session_events = store.event_tx().subscribe();
+        let (notification_tx, mut notifications) = broadcast::channel(8);
+        let (channel_tx, mut deliveries) = mpsc::unbounded_channel();
+        let notifier = Arc::new(arc_swap::ArcSwap::from_pointee(Notifier::with_channels(
+            vec![Box::new(RecordingChannel(channel_tx))],
+        )));
+        let mut config = make_test_config(1);
+        config.limits.silence_seconds = 1;
+        let monitor = tokio::spawn(crate::notification::run_notification_monitor(
+            notifier,
+            store.clone(),
+            LiveConfig::from_arc(Arc::new(config)),
+            store.event_tx().clone(),
+            notification_tx,
+        ));
+        // Await an observable monitor result, not merely the timer firing.
+        let update = tokio::time::timeout(Duration::from_secs(5), session_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(update, SessionEvent::SessionUpdated(_)));
+        assert!(
+            notifications.try_recv().is_err(),
+            "no supervisor notification while composing input"
+        );
+        assert!(
+            deliveries.try_recv().is_err(),
+            "no OS/push/hook delivery while composing input"
+        );
+        assert!(rt.read().last_notified_at.is_none());
+
+        signals.record_osc(b"7501", b"state=working");
+        rt.write().publish_terminal_signals(signals.clone());
+        signals.record_osc(b"7501", b"state=idle");
+        signals.program_statuses.changed_at = Some(now - Duration::from_secs(10));
+        rt.write().publish_terminal_signals(signals);
+        let event = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), deliveries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.session_ids, vec!["monitor1"]);
+        assert_eq!(delivered.session_ids, event.session_ids);
+        assert!(rt.read().last_notified_at.is_some());
+        monitor.abort();
+        assert!(monitor.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -496,7 +730,7 @@ mod tests {
         let first = store.candidates(suppression_window, min_interval).await;
         assert_eq!(first.len(), 1);
         assert!(!first[0].should_notify);
-        store.mark_input_required("abc1234", first[0].output_epoch);
+        store.mark_input_required(&first[0]);
 
         // Same epoch → nothing new to report.
         assert!(
@@ -585,11 +819,11 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(30)),
         );
-        let output_epoch = rt.read().effective_output_epoch();
         let store = store_with(vec![rt.clone()], make_test_db().await);
         let mut events = store.event_tx().subscribe();
+        let candidates = store.candidates(Duration::ZERO, Duration::ZERO).await;
 
-        store.mark_input_required("abc1234", output_epoch);
+        store.mark_input_required(&candidates[0]);
 
         let locked = rt.read();
         assert!(locked.input_needed());
@@ -758,11 +992,7 @@ mod tests {
             "never-output session past silence should be a candidate"
         );
 
-        store.mark_notified(
-            "abc1234",
-            candidates[0].output_epoch,
-            std::time::Instant::now(),
-        );
+        store.mark_notified(&candidates[0], Instant::now());
 
         let locked = rt.read();
         assert!(
@@ -808,11 +1038,8 @@ mod tests {
         // First call returns a candidate with an output epoch.
         let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
-        let id = &first[0].session_id;
-        let epoch = first[0].output_epoch;
-
         // Mark as notified at this output epoch.
-        store.mark_notified(id, epoch, Instant::now());
+        store.mark_notified(&first[0], Instant::now());
 
         // Second call: same output epoch → suppressed.
         let second = store.candidates(silence, min_interval).await;
@@ -836,9 +1063,7 @@ mod tests {
 
         let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
-        let id = &first[0].session_id;
-        let epoch = first[0].output_epoch;
-        store.mark_notified(id, epoch, Instant::now());
+        store.mark_notified(&first[0], Instant::now());
 
         // Simulate new output by advancing last_output_at on the runtime.
         {
@@ -871,9 +1096,7 @@ mod tests {
 
         let first = store.candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
-        let id = &first[0].session_id;
-        let epoch = first[0].output_epoch;
-        store.mark_notified(id, epoch, Instant::now());
+        store.mark_notified(&first[0], Instant::now());
 
         // Same output epoch -> suppressed.
         let suppressed = store.candidates(silence, min_interval).await;
@@ -896,10 +1119,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_notified_on_unknown_id_is_noop() {
-        let store = SessionStore::with_journal_byte_cap(900, 0, make_test_db().await);
-        // Should not panic.
-        let now = Instant::now();
-        store.mark_notified("does_not_exist", now, now);
+        let rt = make_runtime("missing1", SessionStatus::Running, "", None);
+        let store = store_with(vec![rt], make_test_db().await);
+        let mut candidates = store.candidates(Duration::ZERO, Duration::ZERO).await;
+        candidates[0].session_id = "does_not_exist".to_string();
+        assert!(!store.mark_notified(&candidates[0], Instant::now()));
     }
 
     #[tokio::test]
@@ -967,9 +1191,9 @@ mod tests {
             "Allow directory access?",
             Some(Duration::from_secs(5)),
         );
-        let output_epoch = runtime.read().effective_output_epoch();
         let store = store_with(vec![runtime], make_test_db().await);
-        store.mark_notified("prompt123", output_epoch, Instant::now());
+        let candidates = store.candidates(Duration::ZERO, Duration::ZERO).await;
+        store.mark_notified(&candidates[0], Instant::now());
         assert!(store.is_input_needed("prompt123"));
 
         store

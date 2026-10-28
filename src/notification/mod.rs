@@ -19,10 +19,10 @@ use crate::{
 };
 
 /// Periodically checks all running sessions for silence and emits local OS
-/// notifications once per output epoch. Silence alone is sufficient to
-/// trigger a notification unless the session's latest output is merely the
-/// PTY echoing what the user just typed, in which case the user is still
-/// composing input and only the "input required" flag is updated. Prompt
+/// notifications once per output/status epoch. Silence alone is sufficient to
+/// trigger a notification unless user activity has already acknowledged that
+/// state or the latest output is an input-driven echo/redraw. In those cases
+/// only the "input required" flag is updated. Prompt
 /// patterns are used to pick a better body line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
     notifier: SharedNotifier,
@@ -102,9 +102,9 @@ pub(super) async fn run_notification_monitor(
                 }
                 debug!(
                     session_id,
-                    "marking input required without notification because the session is only echoing user input"
+                    "marking input required without notification for user-acknowledged state or activity-driven output"
                 );
-                session_store.mark_input_required(&session_id, output_epoch);
+                session_store.mark_input_required(&candidate);
                 continue;
             }
 
@@ -154,8 +154,8 @@ pub(super) async fn run_notification_monitor(
                 )
             };
 
-            // Rendering runs off-lock: don't deliver a superseded report.
-            if !session_store.mark_notified(&session_id, output_epoch, Instant::now()) {
+            // Rendering runs off-lock: don't deliver after new output or user activity.
+            if !session_store.mark_notified(&candidate, Instant::now()) {
                 continue;
             }
 
