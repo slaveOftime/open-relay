@@ -1677,12 +1677,10 @@ fn tree_renders_session_id_immediately_after_icon() {
 }
 
 #[test]
-fn tree_orders_folders_then_sessions_alphabetically() {
+fn tree_orders_folders_alphabetically_and_sessions_by_selected_strategy() {
     let mut app = App::default();
-    // Five sessions split across two sibling folders under the same
-    // cwd-rooted parent. `session_at` only sets `id`+`cwd`, so we
-    // patch each session's `command` manually so the sort label has
-    // a unique alphabetic key per session.
+    // Folder siblings remain alphabetical; each folder's sessions follow
+    // active-first/newest order rather than a separate command-label sort.
     let mut sessions = vec![
         session_at("zeta", Some("/proj/zeta-target")),
         session_at("alpha", Some("/proj/zeta-target")),
@@ -1691,17 +1689,19 @@ fn tree_orders_folders_then_sessions_alphabetically() {
         session_at("banana", Some("/other-apple-leaves")),
     ];
     let commands = ["zeta", "alpha", "apple", "mango", "banana"];
-    for (session, cmd) in sessions.iter_mut().zip(commands.iter()) {
+    for ((session, cmd), day) in sessions
+        .iter_mut()
+        .zip(commands.iter())
+        .zip([1, 3, 2, 2, 1])
+    {
         session.command = (*cmd).to_string();
+        session.created_at += chrono::Duration::days(day);
     }
     app.replace_sessions(sessions);
     app.toggle_view_mode();
     expand_all_tree_folders(&mut app);
 
-    // Capture each visible row's display label. Folder rows use the
-    // folder's `name` (the last basename); session rows use the
-    // session's command — which is also the sort key, so the order
-    // of labels in the flat list reflects the sorted order directly.
+    // Capture folder names and session commands in visible order.
     let path_labels: Vec<String> = app
         .tree
         .nodes
@@ -1722,8 +1722,8 @@ fn tree_orders_folders_then_sessions_alphabetically() {
 
     // Verify folder-before-session ordering per parent: every session
     // row must come after its enclosing folder row, and within each
-    // parent, sessions must be alphabetically sorted. The walker also
-    // sorts folder names alphabetically across siblings.
+    // parent, sessions must be newest first. The walker also sorts folder
+    // names alphabetically across siblings.
     let other_idx = sequence
         .iter()
         .position(|label| *label == "other-apple-leaves")
@@ -1756,7 +1756,7 @@ fn tree_orders_folders_then_sessions_alphabetically() {
     );
 
     // Inside each folder, sessions follow the folder row and are
-    // themselves alphabetically ordered.
+    // themselves ordered by creation time (newest first).
     assert!(other_idx < apple_idx);
     assert!(other_idx < banana_idx);
     assert!(apple_idx < banana_idx);
@@ -4742,4 +4742,283 @@ fn program_status_palette_uses_five_distinct_non_neutral_colors() {
         );
         colors.push(color);
     }
+}
+
+fn tree_folder_session_ids(app: &App, cwd: &str, owner: Option<&str>) -> Vec<String> {
+    let normalized = cwd.replace('\\', "/").to_lowercase();
+    let node = app
+        .tree
+        .nodes
+        .iter()
+        .find(|node| {
+            node.node.as_deref() == owner
+                && node
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|path| path.replace('\\', "/").to_lowercase() == normalized)
+        })
+        .expect("folder exists");
+    node.direct_sessions
+        .iter()
+        .map(|&index| {
+            app.sessions[index]
+                .id
+                .split('@')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+fn tree_sort_fixture() -> Vec<SessionSummary> {
+    let mut items = Vec::new();
+    for owner in [None, Some("worker")] {
+        for cwd in ["/work/alpha", "/work/zeta", "/work/zeta/nested"] {
+            for (id, day, status, needs_input, title) in [
+                ("old-active", 1, "running", false, "Zulu"),
+                ("new-active", 3, "stopping", false, "Bravo"),
+                ("waiting", 2, "stopped", true, "Xray"),
+                ("new-stopped", 4, "stopped", false, "Alpha"),
+                ("old-failed", 0, "failed", false, "Charlie"),
+            ] {
+                let mut item = session_at(
+                    &format!("{id}@{}", cwd.rsplit('/').next().unwrap()),
+                    Some(cwd),
+                );
+                item.node = owner.map(str::to_string);
+                item.created_at += chrono::Duration::days(day);
+                item.status = status.into();
+                item.input_needed = needs_input;
+                item.title = Some(title.into());
+                item.command = title.to_lowercase();
+                item.notifications_enabled = false;
+                item.tags = vec!["keep".into()];
+                items.push(item);
+            }
+        }
+    }
+    items
+}
+
+#[test]
+fn ctrl_o_tree_sorts_sessions_in_each_folder_using_the_selected_strategy() {
+    for filtered in [false, true] {
+        let mut app = App::default();
+        let mut fixtures = tree_sort_fixture();
+        if filtered {
+            let mut excluded = session_at("excluded", Some("/work/alpha"));
+            excluded.created_at += chrono::Duration::days(10);
+            fixtures.push(excluded);
+        }
+        app.replace_sessions(fixtures);
+        app.toggle_view_mode();
+        if filtered {
+            for character in "keep".chars() {
+                app.push_filter(character);
+            }
+        }
+        expand_all_tree_folders(&mut app);
+        for (strategy, expected) in [
+            (
+                super::SortStrategy::ActiveFirst,
+                vec![
+                    "new-active",
+                    "waiting",
+                    "old-active",
+                    "new-stopped",
+                    "old-failed",
+                ],
+            ),
+            (
+                super::SortStrategy::CreatedDesc,
+                vec![
+                    "new-stopped",
+                    "new-active",
+                    "waiting",
+                    "old-active",
+                    "old-failed",
+                ],
+            ),
+            (
+                super::SortStrategy::CreatedAsc,
+                vec![
+                    "old-failed",
+                    "old-active",
+                    "waiting",
+                    "new-active",
+                    "new-stopped",
+                ],
+            ),
+            (
+                super::SortStrategy::ActiveFirst,
+                vec![
+                    "new-active",
+                    "waiting",
+                    "old-active",
+                    "new-stopped",
+                    "old-failed",
+                ],
+            ),
+        ] {
+            assert_eq!(app.sort_strategy, strategy);
+            if filtered {
+                assert_eq!(
+                    app.search_text,
+                    app.sessions
+                        .iter()
+                        .map(super::session_search_text)
+                        .collect::<Vec<_>>()
+                );
+                assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+                    super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "excluded")));
+            }
+            for owner in [None, Some("worker")] {
+                for cwd in ["/work/alpha", "/work/zeta", "/work/zeta/nested"] {
+                    assert_eq!(
+                        tree_folder_session_ids(&app, cwd, owner),
+                        expected,
+                        "strategy={strategy:?}, node={owner:?}, cwd={cwd}, filtered={filtered}"
+                    );
+                }
+            }
+            // The actual rendered rows must follow the same per-folder order.
+            for owner in [None, Some("worker")] {
+                let folder = app.tree.visible.iter().position(|entry| matches!(entry,
+                    super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].node.as_deref() == owner
+                        && app.tree.nodes[*node].cwd.as_deref() == Some("/work/alpha"))).unwrap();
+                let buffer = render_app_buffer(&mut app, 120, 80);
+                let rows = buffer_symbols(&buffer, 80);
+                let mut names = Vec::new();
+                for (row_offset, entry) in app
+                    .tree
+                    .visible
+                    .iter()
+                    .skip(folder + 1)
+                    .take(expected.len())
+                    .enumerate()
+                {
+                    let super::TreeEntry::Session { session, .. } = entry else {
+                        panic!("leaf folder should have session rows")
+                    };
+                    let title = app.sessions[*session].title.as_deref().unwrap();
+                    assert!(
+                        rows[2 + folder + 1 + row_offset].contains(title),
+                        "renderer must emit the sorted session at its tree row"
+                    );
+                    names.push(app.sessions[*session].id.split('@').next().unwrap());
+                }
+                assert_eq!(names, expected);
+            }
+            // Refresh arrival order must not restore the old alphabetical order.
+            let mut refreshed = tree_sort_fixture();
+            refreshed.reverse();
+            app.replace_sessions(refreshed);
+            assert_eq!(tree_folder_session_ids(&app, "/work/alpha", None), expected);
+            route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        }
+    }
+}
+
+#[test]
+fn ctrl_o_tree_keeps_focused_session_distinct_from_list_selection_and_node_twins() {
+    let mut app = App::default();
+    let items: Vec<_> = tree_sort_fixture()
+        .into_iter()
+        .filter(|item| item.cwd.as_deref() == Some("/work/alpha"))
+        .collect();
+    app.replace_sessions(items);
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+    app.selected = app
+        .sessions
+        .iter()
+        .position(|item| item.id == "new-stopped@alpha" && item.node.is_none())
+        .unwrap();
+    app.tree.cursor = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "old-active@alpha"
+            && app.sessions[*session].node.as_deref() == Some("worker"))
+        })
+        .unwrap();
+    for _ in 0..3 {
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        let focused = app.focused_session().expect("session remains in focus");
+        assert_eq!(focused.id, "old-active@alpha");
+        assert_eq!(focused.node.as_deref(), Some("worker"));
+        let selected = app.selected_session().unwrap();
+        assert_eq!(selected.id, "new-stopped@alpha");
+        assert!(selected.node.is_none());
+        assert_eq!(
+            app.keys,
+            app.sessions
+                .iter()
+                .map(super::session_key)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn ctrl_o_tree_preserves_folder_focus_manual_collapse_and_alphabetical_folders() {
+    let mut app = App::default();
+    app.replace_sessions(tree_sort_fixture());
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+    let folder = app.tree.visible.iter().position(|entry| matches!(entry,
+        super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].node.as_deref() == Some("worker")
+            && app.tree.nodes[*node].cwd.as_deref() == Some("/work/zeta"))).unwrap();
+    app.tree.cursor = folder;
+    app.toggle_tree_drill();
+    let collapsed = app.tree.collapsed.clone();
+    for _ in 0..3 {
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        let super::TreeEntry::Folder { node, depth } = app.tree.visible[app.tree.cursor] else {
+            panic!("folder focus must not turn into a session");
+        };
+        assert_eq!(app.tree.nodes[node].node.as_deref(), Some("worker"));
+        assert_eq!(app.tree.nodes[node].cwd.as_deref(), Some("/work/zeta"));
+        assert!(!app.tree.is_expanded(node, depth));
+        assert_eq!(app.tree.collapsed, collapsed);
+        for node in &app.tree.nodes {
+            let names: Vec<_> = node
+                .subfolders
+                .iter()
+                .map(|&i| app.tree.nodes[i].name.to_lowercase())
+                .collect();
+            assert!(
+                names.windows(2).all(|pair| pair[0] <= pair[1]),
+                "folders remain alphabetically sorted"
+            );
+        }
+    }
+}
+
+#[test]
+fn tree_session_sort_ties_stay_stable_and_metadata_updates_resort_the_folder() {
+    let mut app = App::default();
+    let mut first = session_at("first", Some("/work/project"));
+    first.title = Some("Zulu".into());
+    let mut second = session_at("second", Some("/work/project"));
+    second.title = Some("Alpha".into());
+    app.replace_sessions(vec![first.clone(), second]);
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+    for _ in 0..3 {
+        assert_eq!(
+            tree_folder_session_ids(&app, "/work/project", None),
+            ["first", "second"]
+        );
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+    }
+    first.status = "stopped".into();
+    app.apply_updated_summary(first);
+    assert_eq!(
+        tree_folder_session_ids(&app, "/work/project", None),
+        ["second", "first"]
+    );
 }

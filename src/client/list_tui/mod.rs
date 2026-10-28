@@ -30,7 +30,7 @@ pub(super) use runner::run;
 pub(super) use app::{
     App, OpenedTerminal, RateState, SortStrategy, StatusFilter, is_active_status,
     open_selected_inline, open_session_inline, session_is_active, session_key, session_search_text,
-    session_sort_label, sort_sessions,
+    sort_sessions,
 };
 #[cfg(test)]
 #[allow(unused_imports)]

@@ -80,10 +80,16 @@ Search terms are whitespace-split and ANDed:
 | `Enter` | Attach inline (or expand/collapse a folder in tree view) |
 | `Ctrl+Enter` | Attach in another terminal window |
 | `Ctrl+G` | Switch compact table / working-directory tree |
+| `Ctrl+O` | Cycle active-first / newest / oldest session ordering in both views |
 | `Ctrl+N` / `Ctrl+D` | New Session / Duplicate dialog (**Attach on start** checked by default; `Space` toggles) |
 | `Ctrl+U` | Edit title, tags, and notifications |
 | `Ctrl+K` | Stop the selected running session |
 | `Ctrl+C` | Exit dashboard |
+
+In tree view, sessions within each folder follow the selected `Ctrl+O` order:
+active or input-needed sessions first (newest within each group), newest first,
+or oldest first. Folder siblings stay alphabetical and appear before sessions;
+sorting preserves the focused session/folder and manual expansion choices.
 
 ## Full session inspection
 

@@ -66,6 +66,10 @@ oly start --detach --disable-notifications --title "task 1" --cwd /path/to/dir t
 - Put `oly` flags **before** `<cmd>` (`--detach`, `--disable-notifications`, `--title <t>`, `--cwd <dir>`, repeatable `--tag <t>`, `--node <name>`).
 - Save the returned `<ID>` and pass it explicitly on every call (omitting `<ID>` targets the most recently created session). Every child receives its own ID in `$OLY_SESSION_ID`.
 
+In `oly ls --follow`, `Ctrl+O` cycles active-first, newest, and oldest order.
+The table and sessions within each tree folder use the same ordering; tree
+folders stay alphabetical. Focus and manual folder expansion are preserved.
+
 ### 2) Monitor (wait-first, low-token)
 
 Prefer blocking `--wait` gates over polling loops, starting with `--tail 40`:
