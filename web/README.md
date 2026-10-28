@@ -96,4 +96,4 @@ see [Apps skill](../skills/oly-apps/SKILL.md). Never relax the control-plane CSP
 just to run arbitrary generated reports.
 
 - [Design](./DESIGN.md) — visual tokens, density, colors
-- [Compatibility](../docs/releases/compatibility-0.5.md) — beta contract
+- [Compatibility](../docs/releases/compatibility-0.5.md) — 0.5 contract

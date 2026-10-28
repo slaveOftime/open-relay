@@ -1,8 +1,8 @@
 # Compatibility for 0.5.x
 
-The beta tests a local-first interactive session supervisor, not a general
-agent framework, application sandbox, or multi-user authorization service.
-It is suitable for early adopters who can back up state and coordinate upgrades.
+0.5 is a local-first interactive session supervisor, not a general agent
+framework, application sandbox, or multi-user authorization service.
+It is suitable for operators who can back up state and coordinate upgrades.
 
 ## Supported user-facing contracts
 
@@ -27,8 +27,8 @@ It is suitable for early adopters who can back up state and coordinate upgrades.
 ## Node federation
 
 Pinned-identity federation uses the trust model below; setup is in
-[Remote access](../guides/remote-access.md#connect-machines). **Current redesign
-(first shipped in 0.5.0-beta.3):** `oly node` replaces top-level `oly join`
+[Remote access](../guides/remote-access.md#connect-machines). **Unified node
+management (first shipped in 0.5.0-beta.3):** `oly node` replaces top-level `oly join`
 and `oly node accept` without backward compatibility. Exact-version release
 notes describe historical behavior; follow the [migration steps](./migration-0.5.md#current-node-redesign)
 when moving from those builds. The cryptographic handshake is unchanged.
@@ -76,15 +76,16 @@ rollback requires restoring a pre-upgrade backup. Never use an old binary on a
 migrated database. Follow [Migration to 0.5](./migration-0.5.md).
 Private state includes identity keys, push keys, and session data.
 
-During beta we aim to retain readability of earlier **0.5 beta** recordings,
-but do not yet promise a frozen on-disk format. Any incompatible beta update must
-be called out in its release notes with an export/backup procedure before upgrade.
-Do not use beta state as the sole copy of irreplaceable work. Export the canonical
-filtered bytes and retain protected state backups; exports are not raw journals.
+Stable 0.5 reads recordings written by earlier **0.5 beta** releases. We do not
+yet promise a frozen on-disk format across future releases; any incompatible
+update must be called out in its release notes with an export/backup procedure
+before upgrade. Do not use one live state directory as the sole copy of
+irreplaceable work. Export the canonical filtered bytes and retain protected
+state backups; exports are not raw journals.
 
 Live PTYs survive client disconnect, not daemon crash/stop or host reboot. Group
 sync has a pending-unsynced window; displayed output is not automatically proof
-of fsync completion. No supported live journal byte cap is provided in this beta.
+of fsync completion. No supported live journal byte cap is provided in 0.5.
 
 ## Experimental/internal interfaces
 
@@ -153,11 +154,11 @@ contract:
 | Wrong-session, stale-incarnation, or past-end cursor | explicit cursor error naming the condition |
 | Delivered request rejected by the daemon | request-failure error; never reported as daemon-unavailable |
 
-## Before stable 0.5
+## Gates for 0.5.x releases
 
-Freeze the CLI/JSON/config contract deliberately; validate backup/upgrade/rollback
-on actual platform artifacts. Exercise node disable/remove, rotation, and
-restart persistence on those artifacts before claiming verified revocation.
-If bounded live history is added, define an explicit retained-start cursor and
-history-expiration behavior before deleting recorded prefixes. Do not add parallel
-recording/parser stacks just to retain old accidental behavior.
+Keep the CLI/JSON/config contract deliberate, and validate backup/upgrade/rollback
+on actual platform artifacts before claiming it. Exercise node disable/remove,
+rotation, and restart persistence on those artifacts before claiming verified
+revocation. If bounded live history is added, define an explicit retained-start
+cursor and history-expiration behavior before deleting recorded prefixes. Do not
+add parallel recording/parser stacks just to retain old accidental behavior.

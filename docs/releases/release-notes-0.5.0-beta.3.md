@@ -105,17 +105,16 @@ See [Compatibility for 0.5](./compatibility-0.5.md) for the beta contract.
 
 ## Verification
 
-This section is completed after the tag is pushed; entries below record only
-what was observed, and later results are added once they exist.
-
-- Release commit: the `v0.5.0-beta.3` tag on the release-prep commit on `main`
-  that carries these notes.
-- Pre-tag documents contract: `python3 tests/docs_sync.py` on the release-prep
-  tree. `tests/release_workflow.py` requires a POSIX host (bash, sha256sum) and
-  runs in `CI-DOCS` rather than locally.
-- Release workflow (`v0.5.0-beta.3`): pending the tag push. A beta tag skips
-  `publish-crates` and `update-homebrew-formula` and publishes npm on `beta`.
-- Artifact, checksum, and published-package checks: pending publication.
+- Release commit: tag `v0.5.0-beta.3` on release-prep commit `099a4d0`.
+- Release workflow
+  ([run 39105294538](https://github.com/slaveOftime/open-relay/actions/runs/39105294538)):
+  all four `build-release` jobs passed and `publish-npm` published.
+  `publish-crates` and `update-homebrew-formula` were skipped, as a beta tag
+  requires.
+- npm: `beta` moved to `0.5.0-beta.3` after registry propagation; `latest` stayed
+  `0.3.3`.
+- Archives: `SHA256SUMS.txt` listed all four platform assets. Full archive
+  checksum re-verification was not completed for this beta.
 
 ### Manual checks — maintainer-reported
 

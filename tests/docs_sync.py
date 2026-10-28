@@ -79,7 +79,8 @@ class DocsSyncTests(unittest.TestCase):
         self.assertNotIn("## Command reference", readme)
         for target in ("./docs/guides/cli.md", "./docs/guides/remote-access.md", "./docs/releases/migration-0.5.md"):
             self.assertIn(target, readme)
-        self.assertIn("npm install -g @slaveoftime/oly@beta", readme)
+        self.assertIn("npm install -g @slaveoftime/oly\n", readme)
+        self.assertNotIn("@slaveoftime/oly@beta", readme)
         self.assertIn("Node.js/npm", readme)
 
     def test_docs_index_covers_nested_documents(self):

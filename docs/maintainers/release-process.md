@@ -1,7 +1,7 @@
 # How to publish an oly release
 
 For maintainers. Upgrading an installation? Use [Migration to 0.5](../releases/migration-0.5.md).
-For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0-beta.3.md).
+For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0.md).
 
 ## 1. Choose the version and channel
 
@@ -40,7 +40,7 @@ gh pr checks <PR-number> --watch
 gh pr merge <PR-number> --merge --match-head-commit <verified-head-SHA>
 ```
 
-Before stable promotion, review [Compatibility for 0.5](../releases/compatibility-0.5.md#before-stable-05)
+Before promoting a 0.5.x release, review [Compatibility for 0.5](../releases/compatibility-0.5.md#gates-for-05x-releases)
 and update README channel/migration wording deliberately.
 
 ## 3. Tag the merged commit

@@ -61,16 +61,14 @@ The npm package bundles binaries for **Linux x64, Linux arm64, macOS Apple
 Silicon, and Windows x64**. No GitHub asset download is needed during
 installation.
 
-> **0.5.0-beta.3 is available:** a breaking preview, not the stable channel.
-> Stable installs still use the 0.3 line. Try `npm install -g @slaveoftime/oly@beta`
-> or the [GitHub prerelease](https://github.com/slaveOftime/open-relay/releases/tag/v0.5.0-beta.3).
-> Back up state and read the [migration guide](./docs/releases/migration-0.5.md) before upgrading.
-> See the [release notes and verification](./docs/releases/release-notes-0.5.0-beta.3.md).
+> **0.5.0 is available.** This is a breaking upgrade from 0.3: back up state and
+> read the [migration guide](./docs/releases/migration-0.5.md) before switching.
+> See the [release notes and verification](./docs/releases/release-notes-0.5.0.md).
 
 <details>
 <summary>Other installation options</summary>
 
-**Homebrew** (stable):
+**Homebrew**:
 
 ```sh
 brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
@@ -80,7 +78,7 @@ brew install slaveOftime/open-relay/oly
 **Prebuilt binaries:** download a platform archive from
 [GitHub Releases](https://github.com/slaveOftime/open-relay/releases).
 
-**Cargo** (stable):
+**Cargo**:
 
 ```sh
 cargo install oly

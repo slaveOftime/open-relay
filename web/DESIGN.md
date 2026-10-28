@@ -1,6 +1,6 @@
 # Open Relay frontend design system
 
-Version: beta
+Version: 0.5
 
 Open Relay uses a compact, dark, terminal-adjacent interface. The visual system should feel like a developer control plane: dense but readable, token-driven, and easy to retheme from a small set of HSL CSS variables.
 

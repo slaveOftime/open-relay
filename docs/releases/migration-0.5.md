@@ -1,10 +1,10 @@
 # Upgrade from 0.3.x to 0.5.x
 
-0.5 is currently a **breaking beta**. Back up state before upgrading.
+0.5 is a **breaking upgrade** from 0.3. Back up state before upgrading.
 For features, see [What's new in 0.5](./whats-new-0.5.md).
-This guide includes the **current node redesign**, first shipped in
-**0.5.0-beta.3**. Exact-version release notes remain historical; earlier betas do
-not contain this redesign.
+This guide includes the **unified node management** introduced in
+**0.5.0-beta.3** and shipped in **0.5.0**. Exact-version release notes remain
+historical; earlier betas do not contain this redesign.
 
 ## Breaking changes and required actions
 
@@ -27,9 +27,9 @@ not a live byte quota; keep backups outside the active state directory.
 
 ### Current node redesign
 
-These changes apply when moving to the redesigned checkout shipped in
-**0.5.0-beta.3**, **not retroactively to 0.5.0-beta.1 or beta.2**. There are no
-legacy command aliases.
+These changes apply when moving to the redesigned checkout first shipped in
+**0.5.0-beta.3** and included in **0.5.0**, **not retroactively to 0.5.0-beta.1
+or beta.2**. There are no legacy command aliases.
 
 | Previous interface | Replacement/action |
 |---|---|
@@ -89,9 +89,9 @@ views are lossy. Wait-for-exit succeeds even if the child failed; inspect
 2. Back up the **entire state directory while stopped**, to a fresh protected
    location outside active state. Keep the old binary. Never share one state
    directory between daemon versions.
-3. Install the published beta and confirm `oly --version` before opening state:
+3. Install 0.5.0 and confirm `oly --version` before opening state:
    ```sh
-   npm install -g @slaveoftime/oly@beta
+   npm install -g @slaveoftime/oly@0.5.0
    oly --version
    ```
 4. Start the new daemon, check `oly daemon status`, and test a fresh benign
@@ -125,5 +125,5 @@ and reinstall the old binary before restarting. Do not run 0.3 against a
 migrated database or expect it to read new journals. New sessions cannot be
 merged into the old backup, and live processes cannot be recovered by rollback.
 
-For beta compatibility guarantees and private protocol consumers, see
+For 0.5 compatibility guarantees and private protocol consumers, see
 [Compatibility for 0.5](./compatibility-0.5.md).

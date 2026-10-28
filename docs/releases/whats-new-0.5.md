@@ -1,8 +1,8 @@
 # What's new in 0.5.x
 
-0.5 is currently a beta for early adopters. This page covers features and
-improvements, **not upgrade instructions**. Read [Migration to 0.5](./migration-0.5.md)
-before switching existing state.
+0.5 is the first stable release of the redesigned supervisor. This page covers
+features and improvements, **not upgrade instructions**. Read
+[Migration to 0.5](./migration-0.5.md) before switching existing state.
 
 ## Recorded sessions and inspectable output
 
@@ -38,6 +38,8 @@ See [Logs and continuation](../guides/cli.md#logs-views-waits-and-byte-continuat
   bytes plus a journal/uploads/SQLite/logs breakdown, an always-on warning
   threshold, and an opt-in admission guard that refuses new sessions below the
   floor. It is not a quota and never kills an existing session.
+- Notifications re-check user activity, so typing or attaching does not alert you
+  about state you already acknowledged.
 - Bundled skills cover session supervision, workers, daemon configuration,
   and trusted apps.
 
@@ -47,6 +49,11 @@ See [CLI guide](../guides/cli.md) and [Agent skills](../../skills/oly/SKILL.md).
 
 - Concurrent controllers share a session; observers never send input or resize.
 - Improved paste boundaries, mouse input, scrollback, and mobile controls.
+- On Android, the terminal fits above the soft keyboard, keeps the cursor
+  visible, and sends IME text once instead of replaying the textarea.
+- Quick keys count repeated spaces as Space presses, with an in-app hint for the
+  composer rules. A clipboard file paste becomes one session upload instead of a
+  typed client path.
 - Windows named-pipe and console teardown fixes improve disconnect and final
   output handling.
 - Session groups are sticky and collapsible, and the list remembers its scroll
@@ -71,7 +78,7 @@ traffic replace the old federation credential paths. Verify public identities
 independently and upgrade nodes together. Federation has **no forward secrecy**;
 later seed compromise can expose recorded federation traffic.
 
-### Current node redesign (first shipped in 0.5.0-beta.3)
+### Unified node management (first shipped in 0.5.0-beta.3)
 
 - Unified `oly node add/ls/info/update/enable/disable/rm` manages both roles.
   Names identify the remote peer; outbound primary entries use `--as` for the
@@ -86,8 +93,9 @@ later seed compromise can expose recorded federation traffic.
 
 This replaces `oly join` and `oly node accept` without aliases. See
 [Migration](./migration-0.5.md#current-node-redesign) for script/state changes.
-It first shipped in **0.5.0-beta.3**; earlier betas keep the old commands, and
-exact-version release notes remain the record of each shipped scope.
+It first shipped in **0.5.0-beta.3** and is part of stable **0.5.0**; earlier
+betas keep the old commands, and exact-version release notes remain the record
+of each shipped scope.
 
 ## Platforms
 
@@ -97,5 +105,4 @@ Windows x64; the npm launcher selects one. Linux arm64 joined the matrix in
 
 See [Node setup](../guides/remote-access.md#connect-machines),
 [Compatibility](./compatibility-0.5.md), and
-[0.5.0-beta.3 release notes](./release-notes-0.5.0-beta.3.md) for shipped scope
-and verification.
+[0.5.0 release notes](./release-notes-0.5.0.md) for shipped scope and verification.
