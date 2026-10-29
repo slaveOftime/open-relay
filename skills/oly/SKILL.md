@@ -70,6 +70,17 @@ In `oly ls --follow`, `Ctrl+O` cycles active-first, newest, and oldest order.
 The table and sessions within each tree folder use the same ordering; tree
 folders stay alphabetical. Focus and manual folder expansion are preserved.
 
+`oly ls --follow --node-all` discovers connected secondary nodes each refresh.
+Disconnected nodes' sessions and groups automatically disappear from both
+table and tree views; new or reconnected nodes reappear. Explicit `--node`
+follow lists show only connected selected nodes and refresh on reconnect.
+Local-only follow lists are unchanged.
+
+Disappearance from the dashboard does not stop or delete secondary sessions.
+Transient node-inventory or session-RPC errors are not proof of disconnection:
+preserve last-known snapshots for nodes still listed as connected. This is
+follow-TUI behavior only; flags, APIs, and non-follow lists are unchanged.
+
 ### 2) Monitor (wait-first, low-token)
 
 Prefer blocking `--wait` gates over polling loops, starting with `--tail 40`:

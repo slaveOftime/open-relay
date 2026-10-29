@@ -3,7 +3,7 @@ use std::{any::Any, collections::HashSet, io, time::Duration};
 use chrono::Utc;
 use crossterm::event::{self, Event};
 
-use super::super::list::ListTarget;
+use super::super::list::{ListTarget, fetch_node_names, list_targets_for_all_nodes};
 use super::app::App;
 use super::app::open_session_inline;
 use super::constants::{REFRESH_TIMEOUT, STOP_GRACE_SECONDS};
@@ -111,6 +111,97 @@ pub fn is_transient_terminal_error(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
     )
+}
+
+/// Resolve follow-mode targets from the authoritative connected-secondary
+/// inventory, not previously displayed sessions. Explicit node scopes stay
+/// fixed, but disconnected peers disappear until they reconnect.
+pub async fn fetch_follow_refresh(
+    config: &AppConfig,
+    query: crate::protocol::ListQuery,
+    targets: &[ListTarget],
+    node_all: bool,
+) -> Result<SessionRefresh> {
+    fetch_follow_refresh_with(
+        targets,
+        node_all,
+        || fetch_node_names(config),
+        |targets| async move { fetch_sessions(config, query, &targets).await },
+    )
+    .await
+}
+
+pub(super) async fn fetch_follow_refresh_with<N, NF, S, SF>(
+    targets: &[ListTarget],
+    node_all: bool,
+    mut fetch_nodes: N,
+    fetch_target_sessions: S,
+) -> Result<SessionRefresh>
+where
+    N: FnMut() -> NF,
+    NF: std::future::Future<Output = Result<Vec<String>>>,
+    S: FnOnce(Vec<ListTarget>) -> SF,
+    SF: std::future::Future<Output = Result<SessionRefresh>>,
+{
+    // A local-only view does not need federation inventory or extra RPCs.
+    if !node_all && targets.iter().all(|target| target.node.is_none()) {
+        return fetch_target_sessions(targets.to_vec()).await;
+    }
+    let connected = fetch_nodes().await?.into_iter().collect::<HashSet<_>>();
+    let targets = if node_all {
+        list_targets_for_all_nodes(connected)
+    } else {
+        targets
+            .iter()
+            .filter(|target| {
+                target
+                    .node
+                    .as_ref()
+                    .is_none_or(|node| connected.contains(node))
+            })
+            .cloned()
+            .collect()
+    };
+    let mut refresh = fetch_target_sessions(targets).await?;
+    // A peer may disconnect between inventory and its session request. Do not
+    // classify a timeout/rejection by message text: recheck inventory and only
+    // drop cached data when the primary confirms the node is gone.
+    if refresh.failed_nodes.iter().any(Option::is_some) {
+        match fetch_nodes().await {
+            Ok(nodes) => {
+                let connected = nodes.into_iter().collect::<HashSet<_>>();
+                let disconnected = refresh
+                    .failed_nodes
+                    .iter()
+                    .filter_map(|node| {
+                        node.as_ref()
+                            .filter(|name| !connected.contains(*name))
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                refresh.sessions.retain(|session| {
+                    session
+                        .node
+                        .as_ref()
+                        .is_none_or(|node| connected.contains(node))
+                });
+                refresh
+                    .failed_nodes
+                    .retain(|node| node.as_ref().is_none_or(|node| connected.contains(node)));
+                // Disconnects are ordinary membership changes, not stale-data
+                // warnings. Keep warnings for local/connected-node failures.
+                refresh.failures.retain(|failure| {
+                    !disconnected.iter().any(|node| {
+                        failure
+                            .strip_prefix(node)
+                            .is_some_and(|tail| tail.starts_with(": "))
+                    })
+                });
+            }
+            Err(error) => refresh.failures.push(format!("node inventory: {error}")),
+        }
+    }
+    Ok(refresh)
 }
 
 pub async fn fetch_sessions(

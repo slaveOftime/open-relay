@@ -5022,3 +5022,432 @@ fn tree_session_sort_ties_stay_stable_and_metadata_updates_resort_the_folder() {
         ["second", "first"]
     );
 }
+
+fn follow_node_session(node: Option<&str>) -> SessionSummary {
+    let mut item = session("shared-id");
+    item.node = node.map(str::to_string);
+    item.title = Some(format!("{} session", node.unwrap_or("local")));
+    item.cwd = Some("/workspace/project".into());
+    item.notifications_enabled = false;
+    item
+}
+
+#[tokio::test]
+async fn follow_refresh_removes_disconnected_nodes_and_rediscovers_reconnections_in_both_views() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        for node_all in [false, true] {
+            let local = follow_node_session(None);
+            let remote = follow_node_session(Some("worker-a"));
+            let targets = vec![
+                ListTarget { node: None },
+                ListTarget {
+                    node: Some("worker-a".into()),
+                },
+            ];
+            let mut app = App {
+                show_node: true,
+                ..Default::default()
+            };
+            app.replace_sessions(vec![local.clone(), remote.clone()]);
+            app.view_mode = view;
+            app.selected = app
+                .sessions
+                .iter()
+                .position(|item| item.node.is_some())
+                .unwrap();
+            expand_all_tree_folders(&mut app);
+            app.tree.cursor = app
+                .tree
+                .visible
+                .iter()
+                .position(|entry| {
+                    matches!(entry,
+                super::TreeEntry::Session { session, .. } if app.sessions[*session].node.is_some())
+                })
+                .unwrap();
+            assert!(render_app(&mut app, 120, 20).contains("worker-a"));
+            let refresh = fetch_follow_refresh_with(
+                &targets,
+                node_all,
+                || ready(Ok(Vec::new())),
+                |targets| {
+                    assert_eq!(
+                        targets,
+                        vec![ListTarget { node: None }],
+                        "only current connected targets may be queried"
+                    );
+                    ready(Ok(SessionRefresh {
+                        sessions: vec![local.clone()],
+                        failed_nodes: HashSet::new(),
+                        failures: Vec::new(),
+                    }))
+                },
+            )
+            .await;
+            app.set_action_message(Some("operator feedback".into()));
+            apply_refresh(&mut app, &list_query(100), refresh);
+            assert_eq!(app.sessions.len(), 1);
+            assert!(app.sessions[0].node.is_none());
+            assert!(app.rates.contains_key("shared-id"));
+            assert!(!app.rates.contains_key("worker-a\0shared-id"));
+            assert_eq!(app.message.as_deref(), Some("operator feedback"));
+            let screen = render_app(&mut app, 120, 20);
+            assert!(
+                !screen.contains("worker-a"),
+                "disconnected rows/groups must disappear: {screen}"
+            );
+            assert!(screen.contains("local session"));
+            assert!(app.focused_session().is_none_or(|item| item.node.is_none()));
+            let refresh = fetch_follow_refresh_with(
+                &targets,
+                node_all,
+                || ready(Ok(vec!["worker-a".into()])),
+                |targets| {
+                    assert_eq!(targets.len(), 2);
+                    ready(Ok(SessionRefresh {
+                        sessions: vec![local.clone(), remote.clone()],
+                        failed_nodes: HashSet::new(),
+                        failures: Vec::new(),
+                    }))
+                },
+            )
+            .await;
+            apply_refresh(&mut app, &list_query(100), refresh);
+            expand_all_tree_folders(&mut app);
+            assert_eq!(app.sessions.len(), 2);
+            assert!(
+                render_app(&mut app, 120, 20).contains("worker-a"),
+                "reconnected peers must return without restarting the TUI"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn follow_refresh_explicit_remote_scope_becomes_empty_until_that_peer_reconnects() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    let targets = vec![ListTarget {
+        node: Some("worker-a".into()),
+    }];
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        let mut app = App::default();
+        app.replace_sessions(vec![follow_node_session(Some("worker-a"))]);
+        app.view_mode = view;
+        let refresh = fetch_follow_refresh_with(
+            &targets,
+            false,
+            || ready(Ok(vec!["other-peer".into()])),
+            |targets| {
+                assert!(
+                    targets.is_empty(),
+                    "disconnected scoped node must not be queried; other peers must not be included"
+                );
+                ready(Ok(SessionRefresh {
+                    sessions: Vec::new(),
+                    failed_nodes: HashSet::new(),
+                    failures: Vec::new(),
+                }))
+            },
+        )
+        .await;
+        apply_refresh(&mut app, &list_query(100), refresh);
+        assert!(app.sessions.is_empty());
+        assert!(app.tree.visible.is_empty());
+        assert!(app.rates.is_empty());
+        assert!(!render_app(&mut app, 120, 10).contains("worker-a"));
+    }
+}
+
+#[tokio::test]
+async fn follow_refresh_rechecks_membership_when_a_peer_disconnects_during_session_fetch() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    use std::cell::Cell;
+    for node_all in [false, true] {
+        let calls = Cell::new(0);
+        let targets = vec![
+            ListTarget { node: None },
+            ListTarget {
+                node: Some("worker-a".into()),
+            },
+        ];
+        let refresh = fetch_follow_refresh_with(
+            &targets,
+            node_all,
+            || {
+                let count = calls.get();
+                calls.set(count + 1);
+                ready(Ok(if count == 0 {
+                    vec!["worker-a".into()]
+                } else {
+                    Vec::new()
+                }))
+            },
+            |targets| {
+                assert_eq!(targets.len(), 2);
+                ready(Ok(SessionRefresh {
+                    sessions: vec![follow_node_session(None)],
+                    failed_nodes: HashSet::from([Some("worker-a".into())]),
+                    failures: vec!["worker-a: node not connected: worker-a".into()],
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(
+            refresh.failed_nodes.is_empty(),
+            "confirmed disconnect must not keep the stale-data fallback alive"
+        );
+        assert!(
+            refresh.warning().is_none(),
+            "ordinary disconnects must not stay in the footer"
+        );
+        let mut app = App::default();
+        app.replace_sessions(vec![
+            follow_node_session(None),
+            follow_node_session(Some("worker-a")),
+        ]);
+        apply_refresh(&mut app, &list_query(100), Ok(refresh));
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].node.is_none());
+    }
+}
+
+#[tokio::test]
+async fn follow_refresh_retains_failed_connected_nodes_but_removes_disconnected_ones() {
+    use super::refresh::fetch_follow_refresh_with;
+    use futures_util::future::ready;
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    let refresh = fetch_follow_refresh_with(
+        &[],
+        true,
+        || {
+            let count = calls.get();
+            calls.set(count + 1);
+            ready(Ok(if count == 0 {
+                vec!["worker-a".into(), "worker-b".into()]
+            } else {
+                vec!["worker-b".into()]
+            }))
+        },
+        |_| {
+            ready(Ok(SessionRefresh {
+                sessions: Vec::new(),
+                failed_nodes: HashSet::from([
+                    None,
+                    Some("worker-a".into()),
+                    Some("worker-b".into()),
+                ]),
+                failures: vec![
+                    "local: temporary timeout".into(),
+                    "worker-a: disconnected".into(),
+                    "worker-b: temporary timeout".into(),
+                ],
+            }))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refresh.failed_nodes,
+        HashSet::from([None, Some("worker-b".into())])
+    );
+    assert_eq!(
+        refresh.failures,
+        ["local: temporary timeout", "worker-b: temporary timeout"]
+    );
+    let mut app = App::default();
+    app.replace_sessions(vec![
+        follow_node_session(None),
+        follow_node_session(Some("worker-a")),
+        follow_node_session(Some("worker-b")),
+    ]);
+    apply_refresh(&mut app, &list_query(100), Ok(refresh));
+    assert_eq!(app.sessions.len(), 2);
+    assert!(
+        app.sessions
+            .iter()
+            .all(|item| item.node.as_deref() != Some("worker-a"))
+    );
+    assert!(
+        app.sessions
+            .iter()
+            .any(|item| item.node.as_deref() == Some("worker-b"))
+    );
+}
+
+#[tokio::test]
+async fn follow_refresh_inventory_errors_are_not_evidence_of_disconnection() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    let targets = vec![ListTarget {
+        node: Some("worker-a".into()),
+    }];
+    let requested = std::cell::Cell::new(false);
+    let mut app = App::default();
+    app.replace_sessions(vec![follow_node_session(Some("worker-a"))]);
+    let refresh = fetch_follow_refresh_with(
+        &targets,
+        false,
+        || ready(Err(AppError::Protocol("inventory unavailable".into()))),
+        |_| {
+            requested.set(true);
+            ready(Err(AppError::Protocol("unexpected session request".into())))
+        },
+    )
+    .await;
+    assert!(!requested.get());
+    apply_refresh(&mut app, &list_query(100), refresh);
+    assert_eq!(app.sessions.len(), 1);
+    assert_eq!(app.sessions[0].node.as_deref(), Some("worker-a"));
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .contains("inventory unavailable")
+    );
+}
+
+#[tokio::test]
+async fn follow_refresh_failed_inventory_recheck_keeps_connected_node_snapshot_and_local_updates() {
+    use super::refresh::fetch_follow_refresh_with;
+    use futures_util::future::ready;
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    let mut local = follow_node_session(None);
+    local.title = Some("updated local".into());
+    let refresh = fetch_follow_refresh_with(
+        &[],
+        true,
+        || {
+            let count = calls.get();
+            calls.set(count + 1);
+            ready(if count == 0 {
+                Ok(vec!["worker-a".into()])
+            } else {
+                Err(AppError::Protocol("inventory recheck unavailable".into()))
+            })
+        },
+        |_| {
+            ready(Ok(SessionRefresh {
+                sessions: vec![local],
+                failed_nodes: HashSet::from([Some("worker-a".into())]),
+                failures: vec!["worker-a: timed out".into()],
+            }))
+        },
+    )
+    .await
+    .unwrap();
+    let mut app = App::default();
+    app.replace_sessions(vec![
+        follow_node_session(None),
+        follow_node_session(Some("worker-a")),
+    ]);
+    apply_refresh(&mut app, &list_query(100), Ok(refresh));
+    assert_eq!(app.sessions.len(), 2);
+    assert!(
+        app.sessions
+            .iter()
+            .any(|item| item.title.as_deref() == Some("updated local"))
+    );
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .contains("inventory recheck unavailable")
+    );
+}
+
+#[tokio::test]
+async fn follow_refresh_local_only_needs_no_node_inventory() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    use std::cell::Cell;
+    let called = Cell::new(false);
+    let refresh = fetch_follow_refresh_with(
+        &[ListTarget { node: None }],
+        false,
+        || {
+            called.set(true);
+            ready(Err(AppError::Protocol("unneeded inventory".into())))
+        },
+        |targets| {
+            assert_eq!(targets, vec![ListTarget { node: None }]);
+            ready(Ok(SessionRefresh {
+                sessions: vec![follow_node_session(None)],
+                failed_nodes: HashSet::new(),
+                failures: Vec::new(),
+            }))
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!called.get());
+    assert_eq!(refresh.sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn follow_refresh_all_nodes_discovers_new_peers_without_expanding_explicit_scope() {
+    use super::refresh::fetch_follow_refresh_with;
+    use crate::client::list::ListTarget;
+    use futures_util::future::ready;
+    for node_all in [false, true] {
+        let targets = vec![
+            ListTarget { node: None },
+            ListTarget {
+                node: Some("worker-a".into()),
+            },
+        ];
+        let refresh = fetch_follow_refresh_with(
+            &targets,
+            node_all,
+            || {
+                ready(Ok(vec![
+                    "new-peer".into(),
+                    "worker-a".into(),
+                    "new-peer".into(),
+                ]))
+            },
+            |requested| {
+                let expected = if node_all {
+                    vec![
+                        ListTarget { node: None },
+                        ListTarget {
+                            node: Some("new-peer".into()),
+                        },
+                        ListTarget {
+                            node: Some("worker-a".into()),
+                        },
+                    ]
+                } else {
+                    targets.clone()
+                };
+                assert_eq!(
+                    requested, expected,
+                    "discovery is sorted/deduplicated and explicit scopes stay fixed"
+                );
+                ready(Ok(SessionRefresh {
+                    sessions: requested
+                        .iter()
+                        .map(|target| follow_node_session(target.node.as_deref()))
+                        .collect(),
+                    failed_nodes: HashSet::new(),
+                    failures: Vec::new(),
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refresh.sessions.len(), if node_all { 3 } else { 2 });
+    }
+}

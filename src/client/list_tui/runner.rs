@@ -7,7 +7,7 @@ use std::{
 use crossterm::event::{Event, KeyEventKind};
 use futures_util::FutureExt;
 
-use super::super::list::{ListTarget, fetch_node_names, list_targets_for_all_nodes};
+use super::super::list::ListTarget;
 use super::app::App;
 use super::app::open_selected_inline;
 use super::constants::{
@@ -15,8 +15,9 @@ use super::constants::{
 };
 use super::keys::{AppAction, route_key};
 use super::refresh::{
-    SessionRefresh, apply_refresh, drain_pending_events, fetch_sessions, panic_payload_message,
-    read_terminal_event, remove_sessions, start_clone, stop_session, update_session,
+    SessionRefresh, apply_refresh, drain_pending_events, fetch_follow_refresh,
+    panic_payload_message, read_terminal_event, remove_sessions, start_clone, stop_session,
+    update_session,
 };
 use super::terminal::TuiTerminal;
 use super::view::render;
@@ -37,25 +38,6 @@ pub async fn run(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>) 
             panic_payload_message(payload.as_ref())
         ))),
     }
-}
-
-async fn fetch_follow_refresh(
-    config: &AppConfig,
-    query: crate::protocol::ListQuery,
-    targets: &[ListTarget],
-    node_all: bool,
-    known_nodes: Vec<String>,
-) -> Result<SessionRefresh> {
-    let targets = if node_all {
-        let mut nodes = fetch_node_names(config).await?;
-        nodes.extend(known_nodes);
-        nodes.sort();
-        nodes.dedup();
-        list_targets_for_all_nodes(nodes)
-    } else {
-        targets.to_vec()
-    };
-    fetch_sessions(config, query, &targets).await
 }
 
 async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>) -> Result<()> {
@@ -81,8 +63,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         [target] => target.node.as_deref(),
         _ => None,
     };
-    let refresh =
-        fetch_follow_refresh(config, query.clone(), &targets, args.node_all, Vec::new()).await;
+    let refresh = fetch_follow_refresh(config, query.clone(), &targets, args.node_all).await;
     crate::metrics::mark("tui: sessions fetched");
     match refresh {
         Ok(refresh) => {
@@ -142,16 +123,9 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
             let query = query.clone();
             let targets = targets.clone();
             let node_all = args.node_all;
-            let known_nodes = app
-                .sessions
-                .iter()
-                .filter_map(|session| session.node.clone())
-                .collect();
             tokio::spawn(async move {
                 let _ = tx
-                    .send(
-                        fetch_follow_refresh(&config, query, &targets, node_all, known_nodes).await,
-                    )
+                    .send(fetch_follow_refresh(&config, query, &targets, node_all).await)
                     .await;
             });
         }
