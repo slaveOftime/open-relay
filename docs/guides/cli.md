@@ -75,6 +75,18 @@ Search terms are whitespace-split and ANDed:
 - **Scoped terms** use `id:`, `title:`, `tag:`/`tags:`, `cmd:`/`command:` (matches command or args), `args:`, or `cwd:`. Unknown prefixes and Windows drive paths (`C:\...`) are treated as bare terms.
 - `oly ls` defaults to `--limit 10` (`100` with `--follow`). `--node-all` requires `--follow` and cannot combine with `--json`.
 
+In `oly ls --follow --node-all`, each refresh discovers connected secondary
+nodes. Disconnected nodes' sessions and groups automatically disappear from
+both table and tree views; new or reconnected nodes reappear. Explicit
+`--node`-scoped follow lists likewise show only connected selected nodes and
+refresh when they reconnect. Local-only follow lists are unchanged.
+
+This removes entries from the dashboard only; it does not stop or delete
+sessions on the secondary. Transient node-inventory or session-RPC errors
+are not proof of disconnection: last-known snapshots are preserved for nodes
+still listed as connected. This behavior is limited to the follow TUI; flags,
+APIs, and non-follow lists are unchanged.
+
 | Dashboard key | Action |
 |---|---|
 | `Enter` | Attach inline (or expand/collapse a folder in tree view) |
