@@ -6,7 +6,9 @@ import { test, expect, type Page } from '@playwright/test'
  * The toggle lives in the session info bar (sm+ only) and folds the panel to
  * zero width: the terminal reclaims the space and no rail is left behind.
  * Below sm the panel is a drawer and the key bar's toggle is the only control,
- * so this spec pins both halves. It runs on the desktop Chromium project and
+ * so this spec pins both halves. Expanding either half also focuses the text
+ * input, so the soft keyboard comes up for the fallback composer at once.
+ * It runs on the desktop Chromium project and
  * the iPhone WebKit profile, so each test sets the viewport it needs instead of
  * trusting the project default.
  */
@@ -127,6 +129,8 @@ test('the info bar toggle hides the panel and the terminal takes the space back'
 
   await expect(inputLabel).toBeVisible()
   await expect.poll(() => terminalWidth(page)).toBeLessThan(collapsedWidth - 100)
+  // Expanding the desktop panel focuses the composer too.
+  await expect(page.locator('textarea[placeholder*="Type text here"]')).toBeFocused()
 })
 
 test('the info bar toggle stays out of the mobile layout', async ({ page }) => {
@@ -137,4 +141,22 @@ test('the info bar toggle stays out of the mobile layout', async ({ page }) => {
   // Below sm the panel is a drawer; the key bar's toggle is the control.
   await expect(page.getByRole('button', { name: 'Hide input panel' })).toBeHidden()
   await expect(page.getByRole('button', { name: 'Open input panel' })).toBeVisible()
+})
+
+test('expanding the mobile drawer focuses the text input for the keyboard', async ({ page }) => {
+  await stageAttach(page)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/session/${SESSION_ID}?mode=attach`)
+
+  // The composer textarea is the fallback input path: expanding the panel
+  // must put the caret there so the soft keyboard comes up at once.
+  const composer = page.locator('textarea[placeholder*="Type text here"]')
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  await expect(composer).toBeFocused()
+
+  // Collapsing and expanding again re-arms the focus, not just the first time.
+  // The toggle keeps its label in both states, so it is the same button.
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  await expect(composer).toBeFocused()
 })

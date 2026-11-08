@@ -119,6 +119,13 @@ export default function AttachPanel({
   const [previewPath, setPreviewPath] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
+  // Whether the panel was expanded at the last check, so an expand that
+  // happens after mount can focus the text input without stealing focus on
+  // the mount that merely restores a persisted open drawer.
+  const wasExpandedRef = useRef(drawerOpen && !collapsed)
+  // Same, for the desktop collapse the parent owns: initialized from the
+  // prop so the mount itself never counts as an expand.
+  const wasCollapsedRef = useRef(collapsed)
   const customInputValueRef = useRef(customInput)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
@@ -284,6 +291,15 @@ export default function AttachPanel({
     const nextOpen = !drawerOpen
     setDrawerOpen(nextOpen)
 
+    if (nextOpen) {
+      // Focus inside the tap gesture itself: mobile browsers only raise the
+      // soft keyboard for a focus that happens while the press is still being
+      // handled, which the re-render effect below cannot guarantee. The
+      // textarea is still in the layout (the drawer only collapses its
+      // height), so it can take focus before its box opens.
+      customInputRef.current?.focus({ preventScroll: true })
+    }
+
     if (!nextOpen) {
       for (const timeoutId of drawerScrollTimeoutsRef.current) {
         window.clearTimeout(timeoutId)
@@ -307,6 +323,32 @@ export default function AttachPanel({
       drawerScrollTimeoutsRef.current.push(timeoutId)
     }
   }, [drawerOpen, scrollDrawerIntoView])
+
+  // An expand puts the caret in the text input so the soft keyboard comes
+  // up for the fallback composer at once, instead of after a second tap on
+  // the field. `autoFocus` cannot do this: it fires on mount only, and the
+  // panel stays mounted while the drawer folds. The drawer toggle also
+  // focuses synchronously inside the tap (see `toggleDrawer`); this covers
+  // the two expands that do not go through it: the desktop collapse the
+  // parent owns, and a drawer restored open for a session switch. A mount
+  // that restores a persisted open drawer is not an expand and keeps the
+  // focus it had.
+  useEffect(() => {
+    const expanded = drawerOpen && !collapsed
+    const wasExpanded = wasExpandedRef.current
+    wasExpandedRef.current = expanded
+    if (expanded && !wasExpanded) {
+      customInputRef.current?.focus({ preventScroll: true })
+    }
+  }, [drawerOpen, collapsed])
+
+  useEffect(() => {
+    const wasCollapsed = wasCollapsedRef.current
+    wasCollapsedRef.current = collapsed
+    if (wasCollapsed && !collapsed) {
+      customInputRef.current?.focus({ preventScroll: true })
+    }
+  }, [collapsed])
 
   function clearPendingSingleClick() {
     if (sendClickTimeoutRef.current !== null) {
