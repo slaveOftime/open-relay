@@ -287,6 +287,18 @@ export default function AttachPanel({
       ...sendTarget,
     })
   }
+  function collapseDrawer() {
+    setDrawerOpen(false)
+    for (const timeoutId of drawerScrollTimeoutsRef.current) {
+      window.clearTimeout(timeoutId)
+    }
+    drawerScrollTimeoutsRef.current = []
+    // The folded drawer has no visible field: blur so the soft keyboard goes
+    // down with it instead of staying attached to the collapsed textarea
+    // (and the busy heartbeat stops with the blur).
+    customInputRef.current?.blur()
+  }
+
   function toggleDrawer() {
     const nextOpen = !drawerOpen
     setDrawerOpen(nextOpen)
@@ -301,10 +313,7 @@ export default function AttachPanel({
     }
 
     if (!nextOpen) {
-      for (const timeoutId of drawerScrollTimeoutsRef.current) {
-        window.clearTimeout(timeoutId)
-      }
-      drawerScrollTimeoutsRef.current = []
+      collapseDrawer()
     }
   }
 
@@ -360,7 +369,10 @@ export default function AttachPanel({
   function handleSendButtonClick() {
     clearPendingSingleClick()
     sendClickTimeoutRef.current = window.setTimeout(() => {
+      // The send is done: fold the drawer back so the terminal and its output
+      // are what the user is looking at again, instead of an empty composer.
       handleCustomSend(false)
+      collapseDrawer()
       sendClickTimeoutRef.current = null
     }, 250)
   }
@@ -368,6 +380,7 @@ export default function AttachPanel({
   function handleSendButtonDoubleClick() {
     clearPendingSingleClick()
     handleCustomSend(true)
+    collapseDrawer()
   }
 
   function startBusyHeartbeat() {
@@ -533,6 +546,7 @@ export default function AttachPanel({
                   <Button
                     type="button"
                     variant="ghost"
+                    aria-label="Send text"
                     className="absolute bottom-2 right-2 p-1"
                     disabled={!customInput.trim()}
                     onClick={handleSendButtonClick}

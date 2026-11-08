@@ -7,7 +7,8 @@ import { test, expect, type Page } from '@playwright/test'
  * zero width: the terminal reclaims the space and no rail is left behind.
  * Below sm the panel is a drawer and the key bar's toggle is the only control,
  * so this spec pins both halves. Expanding either half also focuses the text
- * input, so the soft keyboard comes up for the fallback composer at once.
+ * input, so the soft keyboard comes up for the fallback composer at once, and
+ * sending from the mobile drawer folds it back again.
  * It runs on the desktop Chromium project and
  * the iPhone WebKit profile, so each test sets the viewport it needs instead of
  * trusting the project default.
@@ -159,4 +160,37 @@ test('expanding the mobile drawer focuses the text input for the keyboard', asyn
   await page.getByRole('button', { name: 'Open input panel' }).click()
   await page.getByRole('button', { name: 'Open input panel' }).click()
   await expect(composer).toBeFocused()
+})
+
+test('sending from the mobile drawer collapses it again', async ({ page }) => {
+  await stageAttach(page)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/session/${SESSION_ID}?mode=attach`)
+
+  const composer = page.locator('textarea[placeholder*="Type text here"]')
+  const send = page.getByRole('button', { name: 'Send text' })
+  // The drawer is the composer's clipped ancestor: folded, it is 0 tall.
+  const drawerHeight = () =>
+    page.evaluate(() => {
+      const field = document.querySelector('textarea[placeholder*="Type text here"]')
+      const drawer = field?.closest('div.overflow-hidden')
+      return drawer ? Math.round(drawer.getBoundingClientRect().height) : -1
+    })
+
+  // A single click sends the text, then folds the drawer back.
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  await composer.fill('hello')
+  await send.click()
+  await expect.poll(drawerHeight).toBe(0)
+  await expect(composer).toHaveValue('')
+  await expect(composer).not.toBeFocused()
+
+  // A double click sends with Enter and folds the drawer back too.
+  await page.getByRole('button', { name: 'Open input panel' }).click()
+  await expect(composer).toBeFocused()
+  await composer.fill('world')
+  await send.dblclick()
+  await expect.poll(drawerHeight).toBe(0)
+  await expect(composer).toHaveValue('')
+  await expect(composer).not.toBeFocused()
 })
