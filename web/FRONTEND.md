@@ -232,6 +232,14 @@ primary accent.
   data once, sweep silent residue before xterm samples the next key) and
   defers its post-composition clear past xterm's 0ms read of the textarea;
   `e2e/attach-soft-keyboard.spec.ts` holds the report.
+- **A suggestion is a replacement, not a new word.** Accepting a soft
+  keyboard's suggestion (`ref` -> `refactor`), or pressing space to accept
+  the word as typed (`go`), arrives as `insertReplacementText`, where the
+  plain-insertion path would append the word to itself (`refrefactor`,
+  `gogo`). The repair tracks the text it has sent and sends only the
+  erase-and-retype delta for a replacement (shared prefix kept, differing
+  tail erased with backspaces), so the terminal line ends up equal to the
+  suggestion; the tracked text resets on Enter.
 
 ## Avoid
 

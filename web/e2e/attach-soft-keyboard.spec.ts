@@ -174,6 +174,65 @@ test('each soft key sends its own character exactly once', async ({ page }) => {
   await client.detach()
 })
 
+/** One IME replacement: a suggestion tap or an autocorrection of the word
+ * already sent. No keydown precedes a tap on the suggestion strip, so the
+ * event is dispatched on its own. */
+async function softReplacement(page: Page, data: string): Promise<void> {
+  await page.evaluate((text) => {
+    const textarea = document.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement
+    textarea.dispatchEvent(
+      new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertReplacementText',
+        data: text,
+      })
+    )
+  }, data)
+}
+
+test('a tapped suggestion extends the typed word instead of appending it', async ({ page }) => {
+  const inputs: string[] = []
+  await openAttach(page, inputs)
+  const client = await page.context().newCDPSession(page)
+
+  for (const text of ['r', 'e', 'f']) {
+    const before = inputs.length
+    await softKey(client, text)
+    await expect.poll(() => inputs.length).toBe(before + 1)
+  }
+
+  // The reported `refrefactor`: the accepted suggestion must only extend the
+  // word already sent (`actor`), never arrive as a second full word.
+  await softReplacement(page, 'refactor')
+  await expect.poll(() => inputs.length).toBe(4)
+  expect(inputs).toEqual(['r', 'e', 'f', 'actor'])
+  expect(await textareaValue(page)).toBe('')
+
+  await client.detach()
+})
+
+test('space accepting the suggestion as typed does not send the word again', async ({ page }) => {
+  const inputs: string[] = []
+  await openAttach(page, inputs)
+  const client = await page.context().newCDPSession(page)
+
+  for (const text of ['g', 'o']) {
+    const before = inputs.length
+    await softKey(client, text)
+    await expect.poll(() => inputs.length).toBe(before + 1)
+  }
+
+  // The reported `gogo`: pressing space arrives as a replacement carrying
+  // the word as typed, followed by the space itself.
+  await softReplacement(page, 'go')
+  await softKey(client, ' ')
+  await expect.poll(() => inputs.length).toBe(3)
+  expect(inputs).toEqual(['g', 'o', ' '])
+
+  await client.detach()
+})
+
 test('a composition commits once and gives the textarea back', async ({ page }) => {
   const inputs: string[] = []
   await openAttach(page, inputs)

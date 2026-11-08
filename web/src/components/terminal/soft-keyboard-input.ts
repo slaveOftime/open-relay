@@ -22,7 +22,18 @@
  *   2. A keydown sweeps residue a keyboard left behind silently (the
  *      auto-paired quote never fires an event) before xterm samples the
  *      textarea for that key, so the replay has no base to grow from.
- *   3. Composition stays with xterm: it reads the textarea from a 0ms timer
+ *   3. An `insertReplacementText` is *not* a new insertion: it is the IME
+ *      replacing the word already sent with an accepted suggestion or an
+ *      autocorrection (`ref` -> `refactor`; pressing space to accept `go`
+ *      also arrives this way). Sending the replacement as typed text appends
+ *      it to the word it replaces (`refrefactor`, `gogo`). The module tracks
+ *      the text it has sent and, for a replacement, sends only the
+ *      erase-and-retype delta between the tracked word and the replacement:
+ *      backspaces for the part that differs (the terminal is an append-only
+ *      stream, so a replacement is emulated as delete-then-type) plus the
+ *      replacement's remaining suffix (`actor` for `ref` -> `refactor`,
+ *      nothing for `go` -> `go`).
+ *   4. Composition stays with xterm: it reads the textarea from a 0ms timer
  *      after `compositionend`, so the sweep is skipped while composing and the
  *      post-composition clear is queued from a listener registered after
  *      xterm's — i.e. after xterm's timer.
@@ -123,8 +134,49 @@ export interface SoftKeyboardInsertion {
 export function softKeyboardText(event: SoftKeyboardInsertion): string | null {
   if (!event.cancelable || !event.softKeyPending) return null
   if (event.isComposing || event.compositionFinalizing) return null
-  if (event.inputType !== 'insertText' && event.inputType !== 'insertReplacementText') return null
+  // `insertReplacementText` is handled separately below: it replaces the word
+  // already sent, so sending its data as a plain insertion would append it.
+  if (event.inputType !== 'insertText') return null
   return event.data || null
+}
+
+/**
+ * The word at the end of the text sent so far: the part an IME replacement
+ * (an accepted suggestion or an autocorrection) is replacing. Any whitespace
+ * ends the word, so a replacement after a space has nothing to replace.
+ */
+export function trailingWord(sentText: string): string {
+  const match = /[^\s]+$/.exec(sentText)
+  return match ? match[0] : ''
+}
+
+/**
+ * The keystrokes that turn `previousWord` into `replacement` on an
+ * append-only terminal: backspaces for the differing tail, then the rest of
+ * the replacement. The shared prefix is left alone, so `ref` -> `refactor`
+ * sends only `actor` and `go` -> `go` (space accepting the suggestion)
+ * sends nothing.
+ */
+export function softKeyboardReplacementText(previousWord: string, replacement: string): string {
+  if (!previousWord) return replacement
+  let same = 0
+  while (
+    same < previousWord.length &&
+    same < replacement.length &&
+    previousWord[same] === replacement[same]
+  ) {
+    same++
+  }
+  // Never split a surrogate pair between the erase and the retype.
+  if (
+    same > 0 &&
+    previousWord.charCodeAt(same - 1) >= 0xd800 &&
+    previousWord.charCodeAt(same - 1) <= 0xdbff
+  ) {
+    same--
+  }
+  const erase = [...previousWord.slice(same)].length
+  return '\x7f'.repeat(erase) + replacement.slice(same)
 }
 
 /**
@@ -144,6 +196,10 @@ export function attachSoftKeyboardInput(
   let composing = false
   let compositionFinalizing = false
   let softKeyPending = false
+  // The text this repair has sent and not yet seen erased or submitted: the
+  // base an `insertReplacementText` replaces. Cleared on Enter, because the
+  // next line starts a new word.
+  let sentText = ''
   let finalizeTimer: ReturnType<typeof setTimeout> | undefined
 
   const clearResidue = (): void => {
@@ -151,6 +207,9 @@ export function attachSoftKeyboardInput(
   }
 
   const handleKeyDown = (event: Event): void => {
+    const key = (event as KeyboardEvent).key
+    // A submitted line ends the word a replacement could target.
+    if (key === 'Enter') sentText = ''
     // While composing, and until xterm's post-composition timer has read the
     // textarea, the contents belong to the IME and are off limits.
     if (composing || compositionFinalizing) return
@@ -175,6 +234,33 @@ export function attachSoftKeyboardInput(
 
   const handleBeforeInput = (event: Event): void => {
     const input = event as InputEvent
+    // Keep the tracked text in step with deletions we do not intercept, so a
+    // later replacement erases only what is still there.
+    if (
+      input.inputType === 'deleteContentBackward' &&
+      sentText &&
+      !composing &&
+      !compositionFinalizing
+    ) {
+      sentText = [...sentText].slice(0, -1).join('')
+    }
+    if (
+      input.inputType === 'insertReplacementText' &&
+      input.cancelable &&
+      !input.isComposing &&
+      !compositionFinalizing &&
+      input.data
+    ) {
+      // The IME is replacing the tracked word with a suggestion or a
+      // correction. A tap on the suggestion strip may arrive without a
+      // keydown, so this does not wait for `softKeyPending`.
+      input.preventDefault()
+      const previousWord = trailingWord(sentText)
+      const delta = softKeyboardReplacementText(previousWord, input.data)
+      sentText = sentText.slice(0, sentText.length - previousWord.length) + input.data
+      if (delta) terminal.input(delta)
+      return
+    }
     const data = softKeyboardText({
       inputType: input.inputType,
       data: input.data,
@@ -188,6 +274,8 @@ export function attachSoftKeyboardInput(
     // timer then reads no change and sends nothing.
     input.preventDefault()
     terminal.input(data)
+    // A submitted line ends the word a replacement could target.
+    sentText = /[\r\n]/.test(data) ? '' : sentText + data
   }
 
   const handleCompositionStart = (): void => {
@@ -207,7 +295,12 @@ export function attachSoftKeyboardInput(
     finalizeTimer = setTimeout(() => {
       finalizeTimer = undefined
       compositionFinalizing = false
-      if (!composing) clearResidue()
+      if (!composing) {
+        // xterm has just read and sent the composed text; remember it as the
+        // base a following replacement could target.
+        sentText += textarea.value
+        clearResidue()
+      }
     }, 0)
   }
 

@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   attachSoftKeyboardInput,
   hasSoftKeyboardInput,
+  softKeyboardReplacementText,
   softKeyboardText,
+  trailingWord,
   type SoftKeyboardTarget,
   type SoftKeyboardTerminal,
   type SoftKeyboardTextArea,
@@ -195,8 +197,10 @@ describe('softKeyboardText', () => {
     expect(softKeyboardText(pending)).toBe('d')
   })
 
-  it('sends a replacement edit too, so xterm never has to diff one', () => {
-    expect(softKeyboardText({ ...pending, inputType: 'insertReplacementText' })).toBe('d')
+  it('leaves a replacement edit to the replacement path, not the insertion path', () => {
+    // A replacement is not typed text: the word it replaces is already
+    // sent, so sending its data here would append it (`refrefactor`).
+    expect(softKeyboardText({ ...pending, inputType: 'insertReplacementText' })).toBeNull()
   })
 
   it('leaves a key the native keyboard path already sent alone', () => {
@@ -219,6 +223,46 @@ describe('softKeyboardText', () => {
   })
 })
 
+describe('trailingWord', () => {
+  it('returns the word at the end of the tracked text', () => {
+    expect(trailingWord('echo ref')).toBe('ref')
+    expect(trailingWord('ref')).toBe('ref')
+  })
+
+  it('returns nothing after whitespace or on empty text', () => {
+    expect(trailingWord('echo ')).toBe('')
+    expect(trailingWord('go\r\n')).toBe('')
+    expect(trailingWord('')).toBe('')
+  })
+})
+
+describe('softKeyboardReplacementText', () => {
+  it('sends only the suffix past the shared prefix', () => {
+    // `ref` -> `refactor`: the reported `refrefactor` came from sending the
+    // whole replacement on top of the word already sent.
+    expect(softKeyboardReplacementText('ref', 'refactor')).toBe('actor')
+  })
+
+  it('sends nothing when space accepts the word as typed', () => {
+    // `go` -> `go`: the reported `gogo` came from sending the accepted
+    // suggestion again before the space.
+    expect(softKeyboardReplacementText('go', 'go')).toBe('')
+  })
+
+  it('erases only the differing tail of a correction', () => {
+    expect(softKeyboardReplacementText('teh', 'the')).toBe('\x7f\x7fhe')
+    expect(softKeyboardReplacementText('brpwn', 'brown')).toBe('\x7f\x7f\x7fown')
+  })
+
+  it('types the whole replacement when nothing was tracked', () => {
+    expect(softKeyboardReplacementText('', 'refactor')).toBe('refactor')
+  })
+
+  it('does not split a surrogate pair at the erase boundary', () => {
+    expect(softKeyboardReplacementText('\u{1f600}x', '\u{1f600}y')).toBe('\x7fy')
+  })
+})
+
 describe('attachSoftKeyboardInput', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -235,6 +279,114 @@ describe('attachSoftKeyboardInput', () => {
     expect(terminal.inputs).toEqual(['d'])
     expect(insertion.defaultPrevented).toBe(true)
     expect(terminal.textarea.value).toBe('')
+  })
+
+  it('turns an accepted suggestion into only the erased-and-retyped delta', () => {
+    const { terminal, container } = attach()
+
+    for (const ch of 'ref') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    const replacement = new FakeInputEvent({
+      inputType: 'insertReplacementText',
+      data: 'refactor',
+    })
+    container.dispatch(replacement)
+
+    // `ref` was already sent; the suggestion adds only `actor` — never the
+    // `refrefactor` the reported behaviour produced.
+    expect(terminal.inputs).toEqual(['r', 'e', 'f', 'actor'])
+    expect(replacement.defaultPrevented).toBe(true)
+    expect(terminal.textarea.value).toBe('')
+  })
+
+  it('sends nothing when space accepts the suggestion as typed', () => {
+    const { terminal, container } = attach()
+
+    for (const ch of 'go') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    const replacement = new FakeInputEvent({
+      inputType: 'insertReplacementText',
+      data: 'go',
+    })
+    container.dispatch(replacement)
+    container.dispatch(imeKeyDown())
+    container.dispatch(insertText(' '))
+
+    // The reported `gogo`: the accepted `go` must not be sent a second time
+    // before the space that accepted it.
+    expect(terminal.inputs).toEqual(['g', 'o', ' '])
+    expect(replacement.defaultPrevented).toBe(true)
+  })
+
+  it('erases and retypes a correction whose tail differs', () => {
+    const { terminal, container } = attach()
+
+    for (const ch of 'teh') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'the' }))
+
+    expect(terminal.inputs).toEqual(['t', 'e', 'h', '\x7f\x7fhe'])
+  })
+
+  it('takes a suggestion tap without a keydown, and still tracks what followed', () => {
+    const { terminal, container } = attach()
+
+    for (const ch of 'ref') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    // No keydown precedes a tap on the suggestion strip.
+    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'refactor' }))
+    container.dispatch(imeKeyDown())
+    container.dispatch(insertText('x'))
+
+    expect(terminal.inputs).toEqual(['r', 'e', 'f', 'actor', 'x'])
+  })
+
+  it('starts a fresh word after Enter, so a replacement cannot reach back', () => {
+    const { terminal, container } = attach()
+
+    for (const ch of 'go') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    container.dispatch(hardwareKeyDown('Enter', 13))
+    for (const ch of 'ref') {
+      container.dispatch(imeKeyDown())
+      container.dispatch(insertText(ch))
+    }
+    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'refactor' }))
+
+    expect(terminal.inputs).toEqual(['g', 'o', 'r', 'e', 'f', 'actor'])
+  })
+
+  it('leaves a replacement it cannot cancel, and one during a composition, to xterm', () => {
+    const { terminal, container } = attach()
+
+    container.dispatch(imeKeyDown())
+    const uncancelable = new FakeInputEvent({
+      inputType: 'insertReplacementText',
+      data: 'refactor',
+      cancelable: false,
+    })
+    container.dispatch(uncancelable)
+    expect(uncancelable.defaultPrevented).toBe(false)
+
+    container.dispatch(composition('compositionstart'))
+    const composing = new FakeInputEvent({
+      inputType: 'insertReplacementText',
+      data: 'refactor',
+      isComposing: true,
+    })
+    container.dispatch(composing)
+    expect(composing.defaultPrevented).toBe(false)
+    expect(terminal.inputs).toEqual([])
   })
 
   it('drops residue a keyboard left behind silently before the next key diff', () => {
