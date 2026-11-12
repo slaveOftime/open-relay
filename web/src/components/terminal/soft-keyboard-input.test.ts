@@ -3,9 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   attachSoftKeyboardInput,
   hasSoftKeyboardInput,
-  softKeyboardReplacementText,
-  softKeyboardText,
-  trailingWord,
+  softKeyboardEdit,
   type SoftKeyboardTarget,
   type SoftKeyboardTerminal,
   type SoftKeyboardTextArea,
@@ -25,6 +23,7 @@ const DESKTOP_UA =
 class FakeEvent {
   readonly type: string
   defaultPrevented = false
+  immediatePropagationStopped = false
 
   constructor(type: string) {
     this.type = type
@@ -33,17 +32,23 @@ class FakeEvent {
   preventDefault(): void {
     this.defaultPrevented = true
   }
+
+  stopImmediatePropagation(): void {
+    this.immediatePropagationStopped = true
+  }
 }
 
 /** A soft-key keydown by default: Android's `keyCode: 229` placeholder. */
 class FakeKeyboardEvent extends FakeEvent {
   readonly key: string
   readonly keyCode: number
+  readonly charCode: number
 
-  constructor(init: { type: string; key?: string; keyCode?: number }) {
+  constructor(init: { type: string; key?: string; keyCode?: number; charCode?: number }) {
     super(init.type)
     this.key = init.key ?? 'Unidentified'
     this.keyCode = init.keyCode ?? 229
+    this.charCode = init.charCode ?? 0
   }
 }
 
@@ -54,12 +59,13 @@ class FakeInputEvent extends FakeEvent {
   readonly cancelable: boolean
 
   constructor(init: {
+    type?: string
     inputType?: string
     data?: string | null
     isComposing?: boolean
     cancelable?: boolean
   }) {
-    super('beforeinput')
+    super(init.type ?? 'input')
     this.inputType = init.inputType ?? 'insertText'
     this.data = init.data ?? null
     this.isComposing = init.isComposing ?? false
@@ -102,6 +108,7 @@ class FakeEventTarget implements SoftKeyboardTarget {
   /** Deliver `event` to this target's listeners, in registration order. */
   dispatch(event: FakeEvent): void {
     for (const { listener } of [...(this.registrations.get(event.type) ?? [])]) {
+      if (event.immediatePropagationStopped) break
       listener(event as unknown as Event)
     }
   }
@@ -112,7 +119,36 @@ class FakeEventTarget implements SoftKeyboardTarget {
 }
 
 class FakeTextarea extends FakeEventTarget implements SoftKeyboardTextArea {
-  value = ''
+  selectionStart = 0
+  selectionEnd = 0
+  private current = ''
+
+  get value(): string {
+    return this.current
+  }
+
+  set value(next: string) {
+    this.current = next
+    this.selectionStart = next.length
+    this.selectionEnd = next.length
+  }
+
+  /** Type at the caret, as a soft key does. */
+  type(text: string): void {
+    const start = this.selectionStart
+    const end = this.selectionEnd
+    this.value = this.current.slice(0, start) + text + this.current.slice(end)
+    // A real textarea leaves the caret after the inserted text, not at the
+    // end of the value (the auto-pair case depends on that).
+    const caret = start + text.length
+    this.selectionStart = caret
+    this.selectionEnd = caret
+  }
+
+  /** Replace the whole value, as an IME suggestion or autocorrection does. */
+  replace(text: string): void {
+    this.value = text
+  }
 }
 
 class FakeTerminal implements SoftKeyboardTerminal {
@@ -153,6 +189,32 @@ function composition(type: string): FakeEvent {
   return new FakeEvent(type)
 }
 
+/** One soft key: placeholder keydown, the IME's edit, the input event. */
+function softKey(
+  fixture: Fixture,
+  text: string,
+  inputType = 'insertText',
+  data: string | null = text
+): FakeInputEvent {
+  fixture.container.dispatch(imeKeyDown())
+  fixture.terminal.textarea.type(text)
+  const input = new FakeInputEvent({ inputType, data })
+  fixture.container.dispatch(input)
+  return input
+}
+
+/** An IME replacement: the field's value is rewritten in place. */
+function replaceText(
+  fixture: Fixture,
+  value: string,
+  inputType = 'insertReplacementText'
+): FakeInputEvent {
+  fixture.terminal.textarea.replace(value)
+  const input = new FakeInputEvent({ inputType, data: value })
+  fixture.container.dispatch(input)
+  return input
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.useRealTimers()
@@ -183,83 +245,44 @@ describe('hasSoftKeyboardInput', () => {
   })
 })
 
-describe('softKeyboardText', () => {
-  const pending = {
-    inputType: 'insertText',
-    data: 'd',
-    isComposing: false,
-    cancelable: true,
-    softKeyPending: true,
-    compositionFinalizing: false,
-  }
-
-  it('sends the incoming text for a soft key', () => {
-    expect(softKeyboardText(pending)).toBe('d')
+describe('softKeyboardEdit', () => {
+  it('sends only what was appended', () => {
+    expect(softKeyboardEdit('', 'd')).toEqual({ erase: 0, insert: 'd' })
+    expect(softKeyboardEdit('ab', 'abc')).toEqual({ erase: 0, insert: 'c' })
   })
 
-  it('leaves a replacement edit to the replacement path, not the insertion path', () => {
-    // A replacement is not typed text: the word it replaces is already
-    // sent, so sending its data here would append it (`refrefactor`).
-    expect(softKeyboardText({ ...pending, inputType: 'insertReplacementText' })).toBeNull()
+  it('sends nothing when the value did not change', () => {
+    expect(softKeyboardEdit('go', 'go')).toBeNull()
+    expect(softKeyboardEdit('', '')).toBeNull()
   })
 
-  it('leaves a key the native keyboard path already sent alone', () => {
-    expect(softKeyboardText({ ...pending, softKeyPending: false })).toBeNull()
-  })
-
-  it('leaves composition and the read after it to xterm', () => {
-    expect(softKeyboardText({ ...pending, isComposing: true })).toBeNull()
-    expect(softKeyboardText({ ...pending, compositionFinalizing: true })).toBeNull()
-  })
-
-  it('ignores edits that insert no text', () => {
-    expect(softKeyboardText({ ...pending, inputType: 'insertCompositionText' })).toBeNull()
-    expect(softKeyboardText({ ...pending, inputType: 'deleteContentBackward' })).toBeNull()
-    expect(softKeyboardText({ ...pending, data: null })).toBeNull()
-  })
-
-  it('never takes over an edit it cannot cancel', () => {
-    expect(softKeyboardText({ ...pending, cancelable: false })).toBeNull()
-  })
-})
-
-describe('trailingWord', () => {
-  it('returns the word at the end of the tracked text', () => {
-    expect(trailingWord('echo ref')).toBe('ref')
-    expect(trailingWord('ref')).toBe('ref')
-  })
-
-  it('returns nothing after whitespace or on empty text', () => {
-    expect(trailingWord('echo ')).toBe('')
-    expect(trailingWord('go\r\n')).toBe('')
-    expect(trailingWord('')).toBe('')
-  })
-})
-
-describe('softKeyboardReplacementText', () => {
-  it('sends only the suffix past the shared prefix', () => {
+  it('extends a typed word with only the suggestion suffix', () => {
     // `ref` -> `refactor`: the reported `refrefactor` came from sending the
     // whole replacement on top of the word already sent.
-    expect(softKeyboardReplacementText('ref', 'refactor')).toBe('actor')
-  })
-
-  it('sends nothing when space accepts the word as typed', () => {
-    // `go` -> `go`: the reported `gogo` came from sending the accepted
-    // suggestion again before the space.
-    expect(softKeyboardReplacementText('go', 'go')).toBe('')
+    expect(softKeyboardEdit('ref', 'refactor')).toEqual({ erase: 0, insert: 'actor' })
   })
 
   it('erases only the differing tail of a correction', () => {
-    expect(softKeyboardReplacementText('teh', 'the')).toBe('\x7f\x7fhe')
-    expect(softKeyboardReplacementText('brpwn', 'brown')).toBe('\x7f\x7f\x7fown')
+    expect(softKeyboardEdit('teh', 'the')).toEqual({ erase: 2, insert: 'he' })
+    expect(softKeyboardEdit('brpwn', 'brown')).toEqual({ erase: 3, insert: 'own' })
   })
 
-  it('types the whole replacement when nothing was tracked', () => {
-    expect(softKeyboardReplacementText('', 'refactor')).toBe('refactor')
+  it('erases past a shared suffix before retyping it', () => {
+    // A correction before a committed space cannot reach the changed word by
+    // backspacing only the changed letters: the space and the tail sit after
+    // it, so they are erased and retyped too.
+    expect(softKeyboardEdit('teh ', 'the ')).toEqual({ erase: 3, insert: 'he ' })
+    expect(softKeyboardEdit('teh cat', 'the cat')).toEqual({ erase: 6, insert: 'he cat' })
   })
 
-  it('does not split a surrogate pair at the erase boundary', () => {
-    expect(softKeyboardReplacementText('\u{1f600}x', '\u{1f600}y')).toBe('\x7fy')
+  it('turns a deletion into backspaces', () => {
+    expect(softKeyboardEdit('abc', 'ab')).toEqual({ erase: 1, insert: '' })
+    expect(softKeyboardEdit('abc', '')).toEqual({ erase: 3, insert: '' })
+  })
+
+  it('counts code points, never splitting a surrogate pair', () => {
+    expect(softKeyboardEdit('\u{1f600}x', '\u{1f600}y')).toEqual({ erase: 1, insert: 'y' })
+    expect(softKeyboardEdit('\u{1f600}x', '\u{1f600}')).toEqual({ erase: 1, insert: '' })
   })
 })
 
@@ -269,228 +292,408 @@ describe('attachSoftKeyboardInput', () => {
     vi.stubGlobal('navigator', { userAgent: ANDROID_UA, maxTouchPoints: 5 })
   })
 
-  it('sends a soft-key insertion once and leaves the textarea empty', () => {
-    const { terminal, container } = attach()
+  it('lets the IME fill the textarea and sends each edit once', () => {
+    const fixture = attach()
+    const { terminal, container } = fixture
 
-    container.dispatch(imeKeyDown())
-    const insertion = insertText('d')
-    container.dispatch(insertion)
+    softKey(fixture, 'd')
+    softKey(fixture, 'e')
 
-    expect(terminal.inputs).toEqual(['d'])
-    expect(insertion.defaultPrevented).toBe(true)
-    expect(terminal.textarea.value).toBe('')
+    expect(terminal.inputs).toEqual(['d', 'e'])
+    expect(terminal.textarea.value).toBe('de')
+    // The field is the IME's buffer: it keeps the text it typed.
+    expect(container.registrationsFor('input').map((r) => r.capture)).toEqual([true])
   })
 
-  it('turns an accepted suggestion into only the erased-and-retyped delta', () => {
-    const { terminal, container } = attach()
+  it('keeps the soft-key keydown and keypress from xterm', () => {
+    const fixture = attach()
+    const keydown = imeKeyDown()
+    const keypress = new FakeKeyboardEvent({ type: 'keypress', key: 'd', charCode: 100 })
 
-    for (const ch of 'ref') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
-    const replacement = new FakeInputEvent({
-      inputType: 'insertReplacementText',
-      data: 'refactor',
-    })
-    container.dispatch(replacement)
+    fixture.container.dispatch(keydown)
+    fixture.container.dispatch(keypress)
+
+    // xterm's append-only diff and its keypress path must both stand down.
+    expect(keydown.immediatePropagationStopped).toBe(true)
+    expect(keypress.immediatePropagationStopped).toBe(true)
+  })
+
+  it('leaves a soft keydown to xterm while a composition is in flight', () => {
+    const fixture = attach()
+    fixture.container.dispatch(composition('compositionstart'))
+
+    // xterm's CompositionHelper needs the placeholder to finalize the
+    // composition, and does not schedule its textarea diff for it.
+    const keydown = imeKeyDown()
+    fixture.container.dispatch(keydown)
+
+    expect(keydown.immediatePropagationStopped).toBe(false)
+  })
+
+  it('keeps the input event from xterm, which would send it a second time', () => {
+    const fixture = attach()
+    const insertion = softKey(fixture, 'd')
+
+    expect(insertion.immediatePropagationStopped).toBe(true)
+    expect(fixture.terminal.inputs).toEqual(['d'])
+  })
+
+  it('turns a tapped suggestion into only the erased-and-retyped delta', () => {
+    const fixture = attach()
+
+    for (const ch of 'ref') softKey(fixture, ch)
+    const replacement = replaceText(fixture, 'refactor')
 
     // `ref` was already sent; the suggestion adds only `actor` — never the
     // `refrefactor` the reported behaviour produced.
-    expect(terminal.inputs).toEqual(['r', 'e', 'f', 'actor'])
-    expect(replacement.defaultPrevented).toBe(true)
-    expect(terminal.textarea.value).toBe('')
+    expect(fixture.terminal.inputs).toEqual(['r', 'e', 'f', 'actor'])
+    expect(replacement.immediatePropagationStopped).toBe(true)
+    expect(fixture.terminal.textarea.value).toBe('refactor')
   })
 
   it('sends nothing when space accepts the suggestion as typed', () => {
-    const { terminal, container } = attach()
+    const fixture = attach()
 
-    for (const ch of 'go') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
-    const replacement = new FakeInputEvent({
-      inputType: 'insertReplacementText',
-      data: 'go',
-    })
-    container.dispatch(replacement)
-    container.dispatch(imeKeyDown())
-    container.dispatch(insertText(' '))
+    for (const ch of 'go') softKey(fixture, ch)
+    replaceText(fixture, 'go')
+    softKey(fixture, ' ')
 
     // The reported `gogo`: the accepted `go` must not be sent a second time
     // before the space that accepted it.
-    expect(terminal.inputs).toEqual(['g', 'o', ' '])
-    expect(replacement.defaultPrevented).toBe(true)
+    expect(fixture.terminal.inputs).toEqual(['g', 'o', ' '])
+    expect(fixture.terminal.textarea.value).toBe('go ')
   })
 
-  it('erases and retypes a correction whose tail differs', () => {
-    const { terminal, container } = attach()
+  it('sends a comma after a suggestion exactly once', () => {
+    const fixture = attach()
 
-    for (const ch of 'teh') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
-    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'the' }))
+    for (const ch of 'ref') softKey(fixture, ch)
+    replaceText(fixture, 'refactor')
+    softKey(fixture, ',')
 
-    expect(terminal.inputs).toEqual(['t', 'e', 'h', '\x7f\x7fhe'])
+    expect(fixture.terminal.inputs).toEqual(['r', 'e', 'f', 'actor', ','])
+    expect(fixture.terminal.textarea.value).toBe('refactor,')
   })
 
-  it('takes a suggestion tap without a keydown, and still tracks what followed', () => {
-    const { terminal, container } = attach()
+  it('erases and retypes an autocorrection before a committed space', () => {
+    const fixture = attach()
 
-    for (const ch of 'ref') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
+    for (const ch of 'teh ') softKey(fixture, ch)
+    replaceText(fixture, 'the ')
+
+    expect(fixture.terminal.inputs).toEqual(['t', 'e', 'h', ' ', '\x7f\x7f\x7fhe '])
+    expect(fixture.terminal.textarea.value).toBe('the ')
+  })
+
+  it('takes a suggestion tap without a keydown', () => {
+    const fixture = attach()
+
+    for (const ch of 'ref') softKey(fixture, ch)
     // No keydown precedes a tap on the suggestion strip.
-    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'refactor' }))
-    container.dispatch(imeKeyDown())
-    container.dispatch(insertText('x'))
+    replaceText(fixture, 'refactor')
+    softKey(fixture, 'x')
 
-    expect(terminal.inputs).toEqual(['r', 'e', 'f', 'actor', 'x'])
+    expect(fixture.terminal.inputs).toEqual(['r', 'e', 'f', 'actor', 'x'])
+    expect(fixture.terminal.textarea.value).toBe('refactorx')
   })
 
-  it('starts a fresh word after Enter, so a replacement cannot reach back', () => {
-    const { terminal, container } = attach()
+  it('sends a silent textarea change once, not on every later key', () => {
+    const fixture = attach()
+    // What an auto-paired quote looks like: the pair appears in the field
+    // without an input event. The next diff picks it up exactly once; the old
+    // bug re-sent the whole buffer on every later key.
+    fixture.terminal.textarea.value = '""'
+    fixture.terminal.textarea.selectionStart = 1
+    fixture.terminal.textarea.selectionEnd = 1
 
-    for (const ch of 'go') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
-    container.dispatch(hardwareKeyDown('Enter', 13))
-    for (const ch of 'ref') {
-      container.dispatch(imeKeyDown())
-      container.dispatch(insertText(ch))
-    }
-    container.dispatch(new FakeInputEvent({ inputType: 'insertReplacementText', data: 'refactor' }))
+    softKey(fixture, 'd')
+    softKey(fixture, 'x')
 
-    expect(terminal.inputs).toEqual(['g', 'o', 'r', 'e', 'f', 'actor'])
+    // The auto-pair left the caret before the closing quote, so the next key
+    // is a minimal edit: erase the quote, type the character and the quote
+    // back — not a replay of the line.
+    expect(fixture.terminal.inputs).toEqual(['"d"', '\x7fx"'])
+    expect(fixture.terminal.textarea.value).toBe('"dx"')
   })
 
-  it('leaves a replacement it cannot cancel, and one during a composition, to xterm', () => {
-    const { terminal, container } = attach()
+  it('sends one backspace when the field holds text to delete', () => {
+    const fixture = attach()
 
-    container.dispatch(imeKeyDown())
-    const uncancelable = new FakeInputEvent({
-      inputType: 'insertReplacementText',
-      data: 'refactor',
-      cancelable: false,
+    for (const ch of 'abc') softKey(fixture, ch)
+    const before = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'deleteContentBackward',
+      data: null,
     })
-    container.dispatch(uncancelable)
-    expect(uncancelable.defaultPrevented).toBe(false)
+    fixture.container.dispatch(before)
+    expect(before.defaultPrevented).toBe(false)
 
-    container.dispatch(composition('compositionstart'))
-    const composing = new FakeInputEvent({
-      inputType: 'insertReplacementText',
-      data: 'refactor',
-      isComposing: true,
+    // The browser applies the deletion, then reports it.
+    fixture.terminal.textarea.value = 'ab'
+    fixture.container.dispatch(
+      new FakeInputEvent({ inputType: 'deleteContentBackward', data: null })
+    )
+
+    expect(fixture.terminal.inputs).toEqual(['a', 'b', 'c', '\x7f'])
+    expect(fixture.terminal.textarea.value).toBe('ab')
+  })
+
+  it('sends a backspace when an empty field has nothing to delete', () => {
+    const fixture = attach()
+    const deletion = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'deleteContentBackward',
+      data: null,
     })
-    container.dispatch(composing)
-    expect(composing.defaultPrevented).toBe(false)
-    expect(terminal.inputs).toEqual([])
+
+    fixture.container.dispatch(deletion)
+
+    expect(deletion.defaultPrevented).toBe(true)
+    expect(fixture.terminal.inputs).toEqual(['\x7f'])
   })
 
-  it('drops residue a keyboard left behind silently before the next key diff', () => {
-    const { terminal, container } = attach()
-    // What an auto-paired quote looks like to xterm: the pair appears in the
-    // textarea without any event, so a later diff can no longer find its old
-    // value and would replay the whole buffer (the `"""d"` report).
-    terminal.textarea.value = '""'
+  it('leaves a backspace in a non-empty field to the browser', () => {
+    const fixture = attach()
 
-    container.dispatch(imeKeyDown())
+    for (const ch of 'ab') softKey(fixture, ch)
+    // The caret is at the start of a non-empty field: there is nothing before
+    // it to delete, and sending a backspace would erase the terminal's last
+    // character, which the field still contains.
+    fixture.terminal.textarea.selectionStart = 0
+    fixture.terminal.textarea.selectionEnd = 0
+    const deletion = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'deleteContentBackward',
+      data: null,
+    })
+    fixture.container.dispatch(deletion)
 
-    expect(terminal.textarea.value).toBe('')
+    expect(deletion.defaultPrevented).toBe(false)
+    expect(fixture.terminal.inputs).toEqual(['a', 'b'])
   })
 
-  it('stands down once a keypress shows the native keyboard path owns the key', () => {
-    const { terminal, container } = attach()
+  it('sends a forward delete when the field is empty', () => {
+    const fixture = attach()
+    const deletion = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'deleteContentForward',
+      data: null,
+    })
 
-    container.dispatch(imeKeyDown())
-    container.dispatch(composition('keypress'))
-    const insertion = insertText('z')
-    container.dispatch(insertion)
+    fixture.container.dispatch(deletion)
 
-    expect(terminal.inputs).toEqual([])
-    expect(insertion.defaultPrevented).toBe(false)
+    expect(deletion.defaultPrevented).toBe(true)
+    expect(fixture.terminal.inputs).toEqual(['\x1b[3~'])
   })
 
-  it('leaves a hardware key’s insertion to the keypress path', () => {
-    const { terminal, container } = attach()
+  it('leaves a forward delete in a non-empty field to the browser', () => {
+    const fixture = attach()
 
-    container.dispatch(hardwareKeyDown('a', 65))
-    const insertion = insertText('a')
-    container.dispatch(insertion)
+    for (const ch of 'ab') softKey(fixture, ch)
+    const deletion = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'deleteContentForward',
+      data: null,
+    })
+    fixture.container.dispatch(deletion)
 
-    expect(terminal.inputs).toEqual([])
-    expect(insertion.defaultPrevented).toBe(false)
+    expect(deletion.defaultPrevented).toBe(false)
+    expect(fixture.terminal.inputs).toEqual(['a', 'b'])
   })
 
-  it('leaves a non-cancelable insertion to xterm’s own diff', () => {
-    const { terminal, container } = attach()
+  it('sends a soft Enter as carriage return and clears the mirror', () => {
+    const fixture = attach()
 
-    container.dispatch(imeKeyDown())
-    const insertion = new FakeInputEvent({ data: 'd', cancelable: false })
-    container.dispatch(insertion)
+    for (const ch of 'go') softKey(fixture, ch)
+    const lineBreak = new FakeInputEvent({
+      type: 'beforeinput',
+      inputType: 'insertLineBreak',
+      data: null,
+    })
+    fixture.container.dispatch(lineBreak)
 
-    // The browser inserted it natively; xterm's diff timer sends it.
-    expect(insertion.defaultPrevented).toBe(false)
-    expect(terminal.inputs).toEqual([])
+    expect(lineBreak.defaultPrevented).toBe(true)
+    expect(fixture.terminal.inputs).toEqual(['g', 'o', '\r'])
+    expect(fixture.terminal.textarea.value).toBe('')
+
+    softKey(fixture, 'r')
+    expect(fixture.terminal.inputs).toEqual(['g', 'o', '\r', 'r'])
   })
 
-  it('never touches the textarea during a composition', () => {
-    const { terminal, container } = attach()
-    container.dispatch(composition('compositionstart'))
-    terminal.textarea.value = 'ni'
+  it('normalises a newline that arrives in an input event', () => {
+    const fixture = attach()
 
-    container.dispatch(imeKeyDown())
-    const update = insertText('ni', 'insertCompositionText')
-    container.dispatch(update)
+    softKey(fixture, 'a\nb')
 
-    expect(terminal.textarea.value).toBe('ni')
-    expect(terminal.inputs).toEqual([])
-    expect(update.defaultPrevented).toBe(false)
+    expect(fixture.terminal.inputs).toEqual(['a\rb'])
+    expect(fixture.terminal.textarea.value).toBe('')
+
+    softKey(fixture, 'c')
+    expect(fixture.terminal.inputs).toEqual(['a\rb', 'c'])
   })
 
-  it('clears only after xterm’s deferred read of the composed text', () => {
+  it('starts a fresh word after a key xterm handles, so a replacement cannot reach back', () => {
+    const fixture = attach()
+
+    for (const ch of 'go') softKey(fixture, ch)
+    fixture.container.dispatch(hardwareKeyDown('Enter', 13))
+    expect(fixture.terminal.textarea.value).toBe('')
+
+    for (const ch of 'ref') softKey(fixture, ch)
+    replaceText(fixture, 'refactor')
+
+    expect(fixture.terminal.inputs).toEqual(['g', 'o', 'r', 'e', 'f', 'actor'])
+  })
+
+  it('keeps the IME buffer through a modifier keydown', () => {
+    const fixture = attach()
+
+    for (const ch of 're') softKey(fixture, ch)
+    fixture.container.dispatch(hardwareKeyDown('Shift', 16))
+    expect(fixture.terminal.textarea.value).toBe('re')
+
+    softKey(fixture, 'f')
+    expect(fixture.terminal.inputs).toEqual(['r', 'e', 'f'])
+  })
+
+  it('does not send the input copy of a character xterm already sent from keypress', () => {
+    const fixture = attach()
+
+    fixture.container.dispatch(hardwareKeyDown('a', 65))
+    const keypress = new FakeKeyboardEvent({
+      type: 'keypress',
+      key: 'a',
+      keyCode: 97,
+      charCode: 97,
+    })
+    fixture.container.dispatch(keypress)
+    expect(keypress.immediatePropagationStopped).toBe(false)
+
+    // Some browsers still fire the field's input event for the same key.
+    fixture.terminal.textarea.type('a')
+    fixture.container.dispatch(insertText('a'))
+    expect(fixture.terminal.inputs).toEqual([])
+
+    // The mirror is still aligned: the next IME character is the only send.
+    softKey(fixture, 'b')
+    expect(fixture.terminal.inputs).toEqual(['b'])
+  })
+
+  it('leaves a composition to xterm and adopts its committed text afterwards', () => {
     const terminal = new FakeTerminal()
     const container = new FakeEventTarget()
-    const textarea = terminal.textarea
-    let readValue: string | null = null
-    // Model xterm's own listener and its 0ms read: registered while the
-    // terminal opened, before the repair attaches.
-    textarea.addEventListener('compositionend', () => {
+    let start = 0
+    // Model xterm's own listeners and its 0ms read of the committed text:
+    // registered while the terminal opened, before the repair attaches. xterm
+    // records the field length at compositionstart and sends only the text
+    // after it, so a word already in the field is not replayed.
+    terminal.textarea.addEventListener('compositionstart', () => {
+      start = terminal.textarea.value.length
+    })
+    terminal.textarea.addEventListener('compositionend', () => {
       setTimeout(() => {
-        readValue = textarea.value
+        const committed = terminal.textarea.value.substring(start)
+        if (committed) terminal.inputs.push(committed)
       }, 0)
     })
     attachSoftKeyboardInput(terminal, container)
-    textarea.value = '你好'
+    const fixture = { terminal, container, detach: () => {} }
 
-    textarea.dispatch(composition('compositionend'))
-    // Nothing is cleared while xterm's timer is still pending, not even by a
-    // keydown for the following character.
-    container.dispatch(imeKeyDown())
-    expect(textarea.value).toBe('你好')
+    for (const ch of 'hi') softKey(fixture, ch)
+    expect(terminal.inputs).toEqual(['h', 'i'])
+
+    // The IME composes after the word already typed: the field holds both.
+    container.dispatch(composition('compositionstart'))
+    terminal.textarea.dispatch(composition('compositionstart'))
+    terminal.textarea.value = 'hi你好'
+    container.dispatch(insertText('hi你好', 'insertCompositionText'))
+    expect(terminal.inputs).toEqual(['h', 'i'])
+
+    terminal.textarea.dispatch(composition('compositionend'))
+    // Nothing is cleared while xterm's read is still pending.
+    expect(terminal.textarea.value).toBe('hi你好')
 
     vi.runAllTimers()
 
-    expect(readValue).toBe('你好')
-    expect(textarea.value).toBe('')
+    expect(terminal.inputs).toEqual(['h', 'i', '你好'])
+    expect(terminal.textarea.value).toBe('hi你好')
+
+    // The commit is xterm's send; the next soft key adds only its own text.
+    container.dispatch(imeKeyDown())
+    terminal.textarea.type('x')
+    container.dispatch(insertText('x'))
+    expect(terminal.inputs).toEqual(['h', 'i', '你好', 'x'])
+    expect(terminal.textarea.value).toBe('hi你好x')
+  })
+
+  it('does not touch the field while a composition is in progress', () => {
+    const fixture = attach()
+    fixture.container.dispatch(composition('compositionstart'))
+    fixture.terminal.textarea.value = 'ni'
+
+    const update = insertText('ni', 'insertCompositionText')
+    fixture.container.dispatch(update)
+
+    expect(fixture.terminal.textarea.value).toBe('ni')
+    expect(fixture.terminal.inputs).toEqual([])
+    expect(update.defaultPrevented).toBe(false)
+  })
+
+  it('adopts the empty field xterm leaves on blur', () => {
+    const terminal = new FakeTerminal()
+    const container = new FakeEventTarget()
+    terminal.textarea.addEventListener('blur', () => {
+      terminal.textarea.value = ''
+    })
+    attachSoftKeyboardInput(terminal, container)
+    terminal.textarea.value = 'abc'
+
+    terminal.textarea.dispatch(composition('blur'))
+    expect(terminal.textarea.value).toBe('')
+
+    container.dispatch(imeKeyDown())
+    terminal.textarea.type('a')
+    container.dispatch(insertText('a'))
+
+    expect(terminal.inputs).toEqual(['a'])
+  })
+
+  it('adopts the empty field xterm leaves after a paste', () => {
+    const terminal = new FakeTerminal()
+    const container = new FakeEventTarget()
+    terminal.textarea.addEventListener('paste', () => {
+      terminal.inputs.push('pasted')
+      terminal.textarea.value = ''
+    })
+    attachSoftKeyboardInput(terminal, container)
+    terminal.textarea.value = 'abc'
+
+    terminal.textarea.dispatch(composition('paste'))
+    expect(terminal.textarea.value).toBe('')
+
+    container.dispatch(imeKeyDown())
+    terminal.textarea.type('a')
+    container.dispatch(insertText('a'))
+
+    expect(terminal.inputs).toEqual(['pasted', 'a'])
   })
 
   it('captures on the container so it runs before xterm’s textarea handlers', () => {
     const { terminal, container } = attach()
 
     expect(container.registrationsFor('keydown').map((r) => r.capture)).toEqual([true])
+    expect(container.registrationsFor('keypress').map((r) => r.capture)).toEqual([true])
+    expect(container.registrationsFor('input').map((r) => r.capture)).toEqual([true])
     expect(container.registrationsFor('beforeinput').map((r) => r.capture)).toEqual([true])
     expect(container.registrationsFor('compositionstart').map((r) => r.capture)).toEqual([true])
-    // The composition clear must not be captured: only registration order can
+    // The composition read must not be captured: only registration order can
     // put it after xterm's own listener on the same element.
     expect(terminal.textarea.registrationsFor('compositionend').map((r) => r.capture)).toEqual([
       false,
     ])
   })
 
-  it('detaches every listener and cancels a pending clear', () => {
+  it('detaches every listener and cancels a pending composition read', () => {
     const fixture = attach()
     const { terminal, container } = fixture
     const textarea = terminal.textarea
@@ -500,31 +703,30 @@ describe('attachSoftKeyboardInput', () => {
     fixture.detach()
     vi.runAllTimers()
     container.dispatch(imeKeyDown())
-    const insertion = insertText('d')
-    container.dispatch(insertion)
+    textarea.type('d')
+    container.dispatch(insertText('d'))
 
-    expect(textarea.value).toBe('你好')
-    expect(insertion.defaultPrevented).toBe(false)
+    expect(textarea.value).toBe('你好d')
     expect(terminal.inputs).toEqual([])
     expect(container.registrationsFor('keydown')).toEqual([])
-    expect(container.registrationsFor('beforeinput')).toEqual([])
+    expect(container.registrationsFor('input')).toEqual([])
     expect(container.registrationsFor('compositionstart')).toEqual([])
     expect(textarea.registrationsFor('compositionend')).toEqual([])
+    expect(textarea.registrationsFor('blur')).toEqual([])
+    expect(textarea.registrationsFor('paste')).toEqual([])
   })
 
   it('never attaches on a platform without a soft keyboard', () => {
     vi.stubGlobal('navigator', { userAgent: DESKTOP_UA, maxTouchPoints: 0 })
-    const { terminal, container, detach } = attach()
-    terminal.textarea.value = '""'
+    const fixture = attach()
+    fixture.terminal.textarea.value = '""'
 
-    container.dispatch(imeKeyDown())
-    const insertion = insertText('d')
-    container.dispatch(insertion)
+    softKey(fixture, 'd')
 
-    expect(container.registrationsFor('keydown')).toEqual([])
-    expect(terminal.textarea.value).toBe('""')
-    expect(insertion.defaultPrevented).toBe(false)
-    detach()
+    expect(fixture.container.registrationsFor('keydown')).toEqual([])
+    expect(fixture.terminal.textarea.value).toBe('""d')
+    expect(fixture.terminal.inputs).toEqual([])
+    fixture.detach()
   })
 
   it('never attaches in screen-reader mode', () => {

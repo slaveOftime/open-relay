@@ -225,21 +225,32 @@ primary accent.
   unchanged, and types through the shift.
 - **A hidden textarea is not an append-only log.** xterm reads a soft keyboard
   by diffing `.xterm-helper-textarea`, and the diff (`newValue.replace(oldValue, '')`)
-  only handles appends: an auto-paired quote, or a correction that edits in
-  place, makes it miss and re-send the whole buffer on every later key — the
-  reported `"""d"` on Android. `components/terminal/soft-keyboard-input.ts`
-  keeps the textarea empty on touch platforms (cancel the insertion, send its
-  data once, sweep silent residue before xterm samples the next key) and
-  defers its post-composition clear past xterm's 0ms read of the textarea;
-  `e2e/attach-soft-keyboard.spec.ts` holds the report.
-- **A suggestion is a replacement, not a new word.** Accepting a soft
-  keyboard's suggestion (`ref` -> `refactor`), or pressing space to accept
-  the word as typed (`go`), arrives as `insertReplacementText`, where the
-  plain-insertion path would append the word to itself (`refrefactor`,
-  `gogo`). The repair tracks the text it has sent and sends only the
-  erase-and-retype delta for a replacement (shared prefix kept, differing
-  tail erased with backspaces), so the terminal line ends up equal to the
-  suggestion; the tracked text resets on Enter.
+  only handles appends: an auto-paired quote, a correction that edits in
+  place, or an accepted suggestion makes it miss and re-send the whole buffer
+  on every later key — the reported `"""d"` on Android. Keeping the field
+  empty stops the replay but fights the IME: Gboard suggests against the
+  field's contents, so a field that never receives the letters drifts out of
+  sync and later suggestions, whitespace, and `,` duplicate the word or leave
+  the IME waiting for text that is not there (the reported "stuck until
+  delete"). `components/terminal/soft-keyboard-input.ts` now lets the IME own
+  the field and mirrors its value diffs: every non-composition `input` is
+  translated into backspaces past the shared prefix plus the replacement tail,
+  so `ref` -> `refactor` sends `actor` and `teh` -> `the` sends `\x7f\x7fhe`.
+  The field keeps the line, which is what the suggestion strip reads. Soft-key
+  keydown/keypress and input events are kept from xterm (its diff and
+  `_inputEvent` would send the same edit again); a hardware key stays with
+  xterm and its keypress character suppresses the duplicate input copy. Keys
+  xterm handles clear the mirror, a soft Enter is sent as `\r`, and a
+  backspace in an empty field is sent explicitly. Composition
+  stays with xterm and its 0ms post-`compositionend` read, after which the
+  field is adopted as the new mirror. `e2e/attach-soft-keyboard.spec.ts` holds
+  the report.
+- **A replacement diff must erase the shared suffix too.** The terminal cursor
+  sits after everything already sent, so an edit before the end cannot be
+  reached by backspacing only the changed letters. `teh ` -> `the ` is three
+  backspaces and `he ` — erase the changed `eh` _and_ the committed space,
+  then retype both — not two backspaces and `he`. Counting code points rather
+  than UTF-16 units keeps a surrogate pair on one side of the erase boundary.
 
 ## Avoid
 

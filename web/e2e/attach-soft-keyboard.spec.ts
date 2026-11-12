@@ -7,9 +7,14 @@ import { devices, expect, test, type CDPSession, type Page } from '@playwright/t
  * `"""d"`. Android IMEs send their characters through the hidden textarea, and
  * xterm's diff of that textarea (`newValue.replace(oldValue, '')`) only handles
  * append-only edits; a keyboard that edits in place (an auto-paired quote, a
- * correction) makes the diff miss, and xterm replays the whole buffer on every
- * later key. `components/terminal/soft-keyboard-input.ts` keeps the textarea
- * empty, and these tests pin what the mocked attach socket actually receives.
+ * correction, an accepted suggestion) makes the diff miss, and xterm replays
+ * the whole buffer on every later key.
+ *
+ * `components/terminal/soft-keyboard-input.ts` now lets the IME own the
+ * textarea and mirrors its value diffs into terminal input: the field keeps
+ * the typed word, so the IME's suggestions keep replacing the right text, and
+ * each edit is translated into backspaces plus the replacement tail. These
+ * tests pin what the mocked attach socket actually receives.
  *
  * The events come from CDP's `Input` domain, which is Chromium-only — the
  * `mobile-safari` project skips this file rather than faking the shapes.
@@ -132,16 +137,36 @@ function textareaValue(page: Page): Promise<string> {
   })
 }
 
+/**
+ * One IME replacement: a suggestion tap or an autocorrection rewrites the
+ * field's value. No keydown precedes a tap on the suggestion strip, so the
+ * edit is reported on its own.
+ */
+async function softReplacement(page: Page, data: string): Promise<void> {
+  await page.evaluate((text) => {
+    const textarea = document.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement
+    textarea.value = text
+    textarea.setSelectionRange(text.length, text.length)
+    textarea.dispatchEvent(
+      new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertReplacementText',
+        data: text,
+      })
+    )
+  }, data)
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-test('a keyboard edit xterm cannot diff never replays the textarea', async ({ page }) => {
+test('a keyboard edit xterm cannot diff is sent once, never replayed', async ({ page }) => {
   const inputs: string[] = []
   await openAttach(page, inputs)
   const client = await page.context().newCDPSession(page)
 
-  // What an auto-paired quote looks like to xterm: the pair appears in the
-  // textarea with no event at all. Before the repair, the diff for the next
-  // key could not find its old value and re-sent the whole buffer.
+  // What an auto-paired quote looks like: the pair appears in the field with
+  // no event at all. The next diff must send it exactly once; before the
+  // repair, every later key re-sent the whole buffer.
   await page.evaluate(() => {
     const textarea = document.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement
     textarea.value = '""'
@@ -150,14 +175,22 @@ test('a keyboard edit xterm cannot diff never replays the textarea', async ({ pa
 
   await softKey(client, 'd')
   await expect.poll(() => inputs.length).toBe(1)
+  expect(inputs).toEqual(['"d"'])
 
-  expect(inputs).toEqual(['d'])
-  expect(await textareaValue(page)).toBe('')
+  // The auto-pair left the caret before the closing quote, so the next key
+  // is a minimal edit — erase the quote, type the character and the quote
+  // back — not a replay of the line.
+  await softKey(client, 'x')
+  await expect.poll(() => inputs.length).toBe(2)
+  expect(inputs).toEqual(['"d"', '\x7fx"'])
+  expect(await textareaValue(page)).toBe('"dx"')
 
   await client.detach()
 })
 
-test('each soft key sends its own character exactly once', async ({ page }) => {
+test('each soft key sends its own character exactly once and keeps the buffer', async ({
+  page,
+}) => {
   const inputs: string[] = []
   await openAttach(page, inputs)
   const client = await page.context().newCDPSession(page)
@@ -169,27 +202,12 @@ test('each soft key sends its own character exactly once', async ({ page }) => {
   }
 
   expect(inputs).toEqual(['a', 'b', '"', 'd', 'x'])
-  expect(await textareaValue(page)).toBe('')
+  // The field is the IME's buffer now: it keeps the line it typed so a
+  // suggestion can replace the right word.
+  expect(await textareaValue(page)).toBe('ab"dx')
 
   await client.detach()
 })
-
-/** One IME replacement: a suggestion tap or an autocorrection of the word
- * already sent. No keydown precedes a tap on the suggestion strip, so the
- * event is dispatched on its own. */
-async function softReplacement(page: Page, data: string): Promise<void> {
-  await page.evaluate((text) => {
-    const textarea = document.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement
-    textarea.dispatchEvent(
-      new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        inputType: 'insertReplacementText',
-        data: text,
-      })
-    )
-  }, data)
-}
 
 test('a tapped suggestion extends the typed word instead of appending it', async ({ page }) => {
   const inputs: string[] = []
@@ -207,7 +225,7 @@ test('a tapped suggestion extends the typed word instead of appending it', async
   await softReplacement(page, 'refactor')
   await expect.poll(() => inputs.length).toBe(4)
   expect(inputs).toEqual(['r', 'e', 'f', 'actor'])
-  expect(await textareaValue(page)).toBe('')
+  expect(await textareaValue(page)).toBe('refactor')
 
   await client.detach()
 })
@@ -229,11 +247,34 @@ test('space accepting the suggestion as typed does not send the word again', asy
   await softKey(client, ' ')
   await expect.poll(() => inputs.length).toBe(3)
   expect(inputs).toEqual(['g', 'o', ' '])
+  expect(await textareaValue(page)).toBe('go ')
 
   await client.detach()
 })
 
-test('a composition commits once and gives the textarea back', async ({ page }) => {
+test('a comma after a suggestion is sent exactly once', async ({ page }) => {
+  const inputs: string[] = []
+  await openAttach(page, inputs)
+  const client = await page.context().newCDPSession(page)
+
+  for (const text of ['r', 'e', 'f']) {
+    const before = inputs.length
+    await softKey(client, text)
+    await expect.poll(() => inputs.length).toBe(before + 1)
+  }
+
+  await softReplacement(page, 'refactor')
+  await expect.poll(() => inputs.length).toBe(4)
+
+  await softKey(client, ',')
+  await expect.poll(() => inputs.length).toBe(5)
+  expect(inputs).toEqual(['r', 'e', 'f', 'actor', ','])
+  expect(await textareaValue(page)).toBe('refactor,')
+
+  await client.detach()
+})
+
+test('a composition commits once and leaves its text in the buffer', async ({ page }) => {
   const inputs: string[] = []
   await openAttach(page, inputs)
   const client = await page.context().newCDPSession(page)
@@ -250,12 +291,47 @@ test('a composition commits once and gives the textarea back', async ({ page }) 
   await expect.poll(() => inputs.length).toBe(1)
   expect(inputs).toEqual(['你好'])
 
-  // The repair may only clear the textarea after xterm's deferred read: a
-  // following soft key must add its own character, not replay the commit.
-  await expect.poll(() => textareaValue(page)).toBe('')
+  // xterm's deferred read owns the commit; the mirror adopts it afterwards,
+  // so a following soft key adds only its own character.
+  await expect.poll(() => textareaValue(page)).toBe('你好')
   await softKey(client, 'x')
   await expect.poll(() => inputs.length).toBe(2)
   expect(inputs).toEqual(['你好', 'x'])
+  expect(await textareaValue(page)).toBe('你好x')
+
+  await client.detach()
+})
+
+test('a composition after typed text commits only the composed word', async ({ page }) => {
+  const inputs: string[] = []
+  await openAttach(page, inputs)
+  const client = await page.context().newCDPSession(page)
+
+  for (const text of ['h', 'i']) {
+    const before = inputs.length
+    await softKey(client, text)
+    await expect.poll(() => inputs.length).toBe(before + 1)
+  }
+
+  // The field already holds a word when the IME starts composing. xterm
+  // records the field length at compositionstart, so its deferred read sends
+  // only the composed text, never the word that was already typed.
+  await client.send('Input.imeSetComposition', { text: '你', selectionStart: 1, selectionEnd: 1 })
+  await client.send('Input.imeSetComposition', {
+    text: '你好',
+    selectionStart: 2,
+    selectionEnd: 2,
+  })
+  await client.send('Input.insertText', { text: '你好' })
+
+  await expect.poll(() => inputs.length).toBe(3)
+  expect(inputs).toEqual(['h', 'i', '你好'])
+  expect(await textareaValue(page)).toBe('hi你好')
+
+  await softKey(client, 'x')
+  await expect.poll(() => inputs.length).toBe(4)
+  expect(inputs).toEqual(['h', 'i', '你好', 'x'])
+  expect(await textareaValue(page)).toBe('hi你好x')
 
   await client.detach()
 })
